@@ -127,6 +127,15 @@ void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
     params.ctas_per_group = ctas_per_group;
     params.max_seq_len = static_cast<uint32_t>(max_seq_len);
 
+    // Zero RadixRowState before launch. The kernel's multi-CTA radix path
+    // uses `state->arrival_counter` as a grid-wide barrier via `red_release`
+    // / `wait_ge`, but the only initializer (in CTA 0, behind a CTA-local
+    // `__syncthreads`) doesn't synchronize across SMs. The workspace is
+    // reused across launches, so without this memset CTAs 1..N-1 increment
+    // the stale counter from the prior call before CTA 0 zeros it, and the
+    // barrier protocol falls apart.
+    cudaMemsetAsync(params.row_states, 0, state_bytes, stream);
+
   #define LAUNCH_PERSISTENT(VS)                                               \
     do {                                                                      \
       auto kernel = &P::persistent_topk_kernel<VS>;                           \
