@@ -12,12 +12,24 @@ pytest -s -v tests/evals/gsm8k/test_gsm8k_correctness.py \
 import shlex
 
 import pytest
+import regex as re
 import yaml
 
 from tests.utils import RemoteOpenAIServer
 from vllm.platforms import current_platform
 
 from .gsm8k_eval import evaluate_gsm8k
+
+
+def _required_world_size(server_args: list[str]) -> int:
+    """Return tp * pp parsed from server args (defaults to 1 each)."""
+    joined = " ".join(server_args)
+    tp = pp = 1
+    if m := re.search(r"(?<!\S)(?:--tensor-parallel-size|-tp)[\s=](\d+)", joined):
+        tp = int(m.group(1))
+    if m := re.search(r"(?<!\S)(?:--pipeline-parallel-size|-pp)[\s=](\d+)", joined):
+        pp = int(m.group(1))
+    return tp * pp
 
 
 def run_gsm8k_eval(eval_config: dict, server_url: str) -> dict:
@@ -83,6 +95,14 @@ def test_gsm8k_correctness(config_filename):
             "--disable-uvicorn-access-log",
         ]
     )
+
+    required = _required_world_size(server_args)
+    available = current_platform.device_count()
+    if required > available:
+        pytest.skip(
+            f"Config requires {required} GPU(s) but only {available} "
+            f"available; this config likely belongs in a multi-GPU step"
+        )
 
     env_dict = eval_config.get("env", None)
 
