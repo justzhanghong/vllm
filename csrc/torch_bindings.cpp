@@ -202,6 +202,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor workspace, int k, int max_seq_len) -> ()");
   ops.impl("persistent_topk", torch::kCUDA, &persistent_topk);
 
+#ifndef USE_ROCM
+  ops.def(
+      "fp8_mqa_logits_cuda(Tensor q, Tensor k, Tensor k_scales, "
+      "Tensor weights, Tensor cu_seqlen_ks, Tensor cu_seqlen_ke, "
+      "Tensor! logits) -> ()");
+  ops.impl("fp8_mqa_logits_cuda", torch::kCUDA, &fp8_mqa_logits_cuda);
+
+  ops.def(
+      "fp8_mqa_logits_cuda_v5(Tensor q, Tensor k, Tensor k_scales, "
+      "Tensor weights, Tensor cu_seqlen_ks, Tensor cu_seqlen_ke, "
+      "Tensor! logits) -> ()");
+  ops.impl("fp8_mqa_logits_cuda_v5", torch::kCUDA, &fp8_mqa_logits_cuda_v5);
+#endif
+
   // Layernorm-quant
   // Apply Root Mean Square (RMS) Normalization to the input tensor.
   ops.def(

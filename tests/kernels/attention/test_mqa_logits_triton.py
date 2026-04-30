@@ -8,6 +8,8 @@ import torch
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.ops.mqa_logits_triton import (
+    fp8_mqa_logits_cuda,
+    fp8_mqa_logits_cuda_v5,
     fp8_mqa_logits_triton,
     fp8_paged_mqa_logits_triton,
 )
@@ -67,6 +69,28 @@ def _fp8_mqa_logits_ref(
     mask = (arange >= cu_seqlen_ks[:, None]) & (arange < cu_seqlen_ke[:, None])
     score = torch.einsum("mhd,nd->hmn", q, k).float() * scale
     logits = (score.relu() * weights.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
+    return logits.masked_fill(~mask, float("-inf"))
+
+
+def _fp8_mqa_logits_ref_head_loop(
+    q: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+) -> torch.Tensor:
+    k_fp8, scale = kv
+    seq_len_kv = k_fp8.shape[0]
+    k = k_fp8.to(torch.bfloat16)
+    q = q.to(torch.bfloat16)
+    logits = torch.zeros(
+        (q.shape[0], seq_len_kv), dtype=torch.float32, device=q.device
+    )
+    for h in range(q.shape[1]):
+        score = (q[:, h, :] @ k.T).float() * scale[None, :]
+        logits += score.relu() * weights[:, h, None]
+    arange = torch.arange(0, seq_len_kv, device=q.device)[None, :]
+    mask = (arange >= cu_seqlen_ks[:, None]) & (arange < cu_seqlen_ke[:, None])
     return logits.masked_fill(~mask, float("-inf"))
 
 
@@ -135,6 +159,32 @@ _ATOL = 1.0
 _RTOL = 0.2
 
 
+def _has_fp8_mqa_logits_cuda() -> bool:
+    if not current_platform.is_cuda():
+        return False
+
+
+def _has_fp8_mqa_logits_cuda_v5() -> bool:
+    if not current_platform.is_cuda():
+        return False
+    try:
+        from vllm import _custom_ops as _custom_ops  # noqa: F401
+
+        return hasattr(torch.ops, "_C") and hasattr(
+            torch.ops._C, "fp8_mqa_logits_cuda_v5"
+        )
+    except Exception:
+        return False
+    try:
+        from vllm import _custom_ops as _custom_ops  # noqa: F401
+
+        return hasattr(torch.ops, "_C") and hasattr(
+            torch.ops._C, "fp8_mqa_logits_cuda"
+        )
+    except Exception:
+        return False
+
+
 @pytest.mark.parametrize("M,N", [(64, 64), (128, 256), (256, 512)])
 @pytest.mark.parametrize("num_heads", [16, 32])
 @pytest.mark.parametrize("partial_mask", [False, True])
@@ -170,6 +220,134 @@ def test_fp8_mqa_logits_triton_matches_torch(M, N, num_heads, partial_mask):
         torch.testing.assert_close(
             out_triton[finite],
             out_torch[finite],
+            atol=_ATOL,
+            rtol=_RTOL,
+        )
+
+
+@pytest.mark.skipif(
+    not _has_fp8_mqa_logits_cuda(),
+    reason="CUDA fp8 MQA logits custom op is unavailable",
+)
+@pytest.mark.parametrize(
+    "M,N,num_heads,partial_mask",
+    [
+        (64, 64, 16, False),
+        (128, 256, 32, True),
+        (1024, 8192, 32, True),
+    ],
+)
+def test_fp8_mqa_logits_cuda_matches_torch_and_triton(
+    M, N, num_heads, partial_mask
+):
+    torch.manual_seed(0)
+    head_dim = 128
+    device = "cuda"
+
+    q_bf16 = torch.randn(M, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+    k_bf16 = torch.randn(N, head_dim, dtype=torch.bfloat16, device=device)
+    weights = torch.randn(M, num_heads, dtype=torch.float32, device=device)
+    q_fp8 = q_bf16.to(torch.float8_e4m3fn)
+    k_fp8, k_scales = _quantize_k_per_row(k_bf16)
+
+    if partial_mask:
+        ks = torch.arange(M, dtype=torch.int32, device=device) % max(1, N // 4)
+        ke = ks + torch.randint(
+            1, max(2, N // 2), (M,), dtype=torch.int32, device=device
+        )
+        ke = torch.minimum(ke, torch.tensor(N, dtype=torch.int32, device=device))
+    else:
+        ks = torch.zeros(M, dtype=torch.int32, device=device)
+        ke = torch.full((M,), N, dtype=torch.int32, device=device)
+
+    out_torch = _fp8_mqa_logits_ref_head_loop(
+        q_fp8, (k_fp8, k_scales), weights, ks, ke
+    )
+    out_triton = fp8_mqa_logits_triton(q_fp8, (k_fp8, k_scales), weights, ks, ke)
+    out_cuda = fp8_mqa_logits_cuda(
+        q_fp8, (k_fp8, k_scales), weights, ks, ke, fallback=False
+    )
+
+    inf_torch = torch.isinf(out_torch) & (out_torch < 0)
+    assert torch.equal(inf_torch, torch.isinf(out_cuda) & (out_cuda < 0))
+    assert torch.equal(
+        torch.isinf(out_triton) & (out_triton < 0),
+        torch.isinf(out_cuda) & (out_cuda < 0),
+    )
+
+    finite = ~inf_torch
+    if finite.any():
+        torch.testing.assert_close(
+            out_cuda[finite],
+            out_torch[finite],
+            atol=_ATOL,
+            rtol=_RTOL,
+        )
+        torch.testing.assert_close(
+            out_cuda[finite],
+            out_triton[finite],
+            atol=_ATOL,
+            rtol=_RTOL,
+        )
+
+
+@pytest.mark.skipif(
+    not _has_fp8_mqa_logits_cuda_v5(),
+    reason="CUDA fp8 MQA logits v5 custom op is unavailable",
+)
+@pytest.mark.parametrize(
+    "M,N,num_heads,partial_mask",
+    [
+        (64, 64, 16, False),
+        (128, 256, 32, True),
+        (1024, 8192, 32, True),
+    ],
+)
+def test_fp8_mqa_logits_cuda_v5_matches_cuda_and_triton(
+    M, N, num_heads, partial_mask
+):
+    torch.manual_seed(0)
+    head_dim = 128
+    device = "cuda"
+
+    q_bf16 = torch.randn(M, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+    k_bf16 = torch.randn(N, head_dim, dtype=torch.bfloat16, device=device)
+    weights = torch.randn(M, num_heads, dtype=torch.float32, device=device)
+    q_fp8 = q_bf16.to(torch.float8_e4m3fn)
+    k_fp8, k_scales = _quantize_k_per_row(k_bf16)
+
+    if partial_mask:
+        ks = torch.arange(M, dtype=torch.int32, device=device) % max(1, N // 4)
+        ke = ks + torch.randint(
+            1, max(2, N // 2), (M,), dtype=torch.int32, device=device
+        )
+        ke = torch.minimum(ke, torch.tensor(N, dtype=torch.int32, device=device))
+    else:
+        ks = torch.zeros(M, dtype=torch.int32, device=device)
+        ke = torch.full((M,), N, dtype=torch.int32, device=device)
+
+    out_triton = fp8_mqa_logits_triton(q_fp8, (k_fp8, k_scales), weights, ks, ke)
+    out_cuda = fp8_mqa_logits_cuda(
+        q_fp8, (k_fp8, k_scales), weights, ks, ke, fallback=False
+    )
+    out_cuda_v5 = fp8_mqa_logits_cuda_v5(
+        q_fp8, (k_fp8, k_scales), weights, ks, ke, fallback=False
+    )
+
+    inf_triton = torch.isinf(out_triton) & (out_triton < 0)
+    assert torch.equal(inf_triton, torch.isinf(out_cuda_v5) & (out_cuda_v5 < 0))
+
+    finite = ~inf_triton
+    if finite.any():
+        torch.testing.assert_close(
+            out_cuda_v5[finite],
+            out_cuda[finite],
+            atol=1e-3,
+            rtol=1e-4,
+        )
+        torch.testing.assert_close(
+            out_cuda_v5[finite],
+            out_triton[finite],
             atol=_ATOL,
             rtol=_RTOL,
         )
