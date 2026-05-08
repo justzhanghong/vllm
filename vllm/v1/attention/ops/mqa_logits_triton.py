@@ -18,7 +18,10 @@ so the per-row dequant scale is applied at full precision.
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+
+logger = init_logger(__name__)
 
 # Paged decode config sweep. `num_warps=4` dominated in A100/SM80 bench
 # across {2,4,8}×{2,4}; the sub-optimal warps=2/8 picks were 1.5–1.7× slower
@@ -413,6 +416,129 @@ def fp8_mqa_logits_triton(
         BLOCK_D=BLOCK_D,
     )
     return logits
+
+
+def fp8_mqa_logits_cuda(
+    q: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    *,
+    fallback: bool = True,
+) -> torch.Tensor:
+    """CUDA/cuBLAS v4 replacement for the prefill fp8 MQA logits path.
+
+    The tensor contract matches :func:`fp8_mqa_logits_triton`. If the compiled
+    CUDA op is unavailable or raises and ``fallback`` is true, the original
+    Triton implementation is used.
+    """
+    return _fp8_mqa_logits_cuda_op(
+        "fp8_mqa_logits_cuda",
+        q,
+        kv,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        fallback=fallback,
+    )
+
+
+def fp8_mqa_logits_cuda_v5(
+    q: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    *,
+    fallback: bool = True,
+) -> torch.Tensor:
+    """Grouped CUDA/cuBLAS v5 replacement for the prefill fp8 MQA logits path."""
+    return _fp8_mqa_logits_cuda_op(
+        "fp8_mqa_logits_cuda_v5",
+        q,
+        kv,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        fallback=fallback,
+    )
+
+
+def fp8_mqa_logits_cuda_v7(
+    q: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    *,
+    fallback: bool = True,
+) -> torch.Tensor:
+    """Grouped CUDA/cuBLAS v7 path with an optional 8-head accumulation group."""
+    return _fp8_mqa_logits_cuda_op(
+        "fp8_mqa_logits_cuda_v7",
+        q,
+        kv,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        fallback=fallback,
+    )
+
+
+def _fp8_mqa_logits_cuda_op(
+    op_name: str,
+    q: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    *,
+    fallback: bool,
+) -> torch.Tensor:
+    k_fp8, k_scales = kv
+    k_scales = k_scales.reshape(-1)
+
+    M = q.shape[0]
+    N = k_fp8.shape[0]
+    logits = torch.empty(
+        (M, N),
+        dtype=torch.float32,
+        device=q.device,
+    )
+
+    try:
+        if not q.is_cuda:
+            raise RuntimeError("q is not a CUDA tensor")
+        if q.dtype != torch.float8_e4m3fn or k_fp8.dtype != torch.float8_e4m3fn:
+            raise RuntimeError(
+                "fp8_mqa_logits_cuda requires CUDA float8_e4m3fn q/k tensors"
+            )
+        # Importing _custom_ops loads the _C extension for direct test usage,
+        # where sparse_attn_indexer.py may not have imported it yet.
+        from vllm import _custom_ops as _custom_ops  # noqa: F401
+
+        if not hasattr(torch.ops, "_C") or not hasattr(torch.ops._C, op_name):
+            raise RuntimeError(f"torch.ops._C.{op_name} is unavailable")
+        getattr(torch.ops._C, op_name)(
+            q,
+            k_fp8,
+            k_scales,
+            weights,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            logits,
+        )
+        return logits
+    except Exception as err:
+        if not fallback:
+            raise
+        logger.warning_once(
+            "%s failed; falling back to Triton: %s", op_name, err
+        )
+        return fp8_mqa_logits_triton(
+            q, (k_fp8, k_scales), weights, cu_seqlen_ks, cu_seqlen_ke
+        )
 
 
 def warmup_fp8_mqa_logits_triton(

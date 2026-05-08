@@ -26,6 +26,9 @@ from vllm.v1.attention.backends.mla.indexer import (
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.attention.ops.mqa_logits_triton import (
+    fp8_mqa_logits_cuda,
+    fp8_mqa_logits_cuda_v5,
+    fp8_mqa_logits_cuda_v7,
     fp8_mqa_logits_triton,
     fp8_paged_mqa_logits_triton,
 )
@@ -149,13 +152,57 @@ def sparse_attn_indexer(
                     clean_logits=False,
                 )
             else:
-                logits = fp8_mqa_logits_triton(
-                    q_fp8[chunk.token_start : chunk.token_end],
-                    (k_fp8, k_scale.view(torch.float32).flatten()),
-                    weights[chunk.token_start : chunk.token_end],
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                )
+                mqa_backend = envs.VLLM_SPARSE_INDEXER_MQA_LOGITS_BACKEND
+                q_chunk = q_fp8[chunk.token_start : chunk.token_end]
+                w_chunk = weights[chunk.token_start : chunk.token_end]
+                k_scales = k_scale.view(torch.float32).flatten()
+                if mqa_backend == "triton":
+                    logger.info_once(
+                        "Sparse indexer prefill MQA logits backend: Triton"
+                    )
+                    logits = fp8_mqa_logits_triton(
+                        q_chunk,
+                        (k_fp8, k_scales),
+                        w_chunk,
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                    )
+                elif mqa_backend == "cuda_v5":
+                    logger.info_once(
+                        "Sparse indexer prefill MQA logits backend: CUDA/cuBLAS v5"
+                    )
+                    logits = fp8_mqa_logits_cuda_v5(
+                        q_chunk,
+                        (k_fp8, k_scales),
+                        w_chunk,
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        fallback=False,
+                    )
+                elif mqa_backend == "cuda_v7":
+                    logger.info_once(
+                        "Sparse indexer prefill MQA logits backend: CUDA/cuBLAS v7"
+                    )
+                    logits = fp8_mqa_logits_cuda_v7(
+                        q_chunk,
+                        (k_fp8, k_scales),
+                        w_chunk,
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        fallback=False,
+                    )
+                else:
+                    logger.info_once(
+                        "Sparse indexer prefill MQA logits backend: CUDA/cuBLAS"
+                    )
+                    logits = fp8_mqa_logits_cuda(
+                        q_chunk,
+                        (k_fp8, k_scales),
+                        w_chunk,
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        fallback=mqa_backend == "auto",
+                    )
             num_rows = logits.shape[0]
 
             topk_indices = topk_indices_buffer[

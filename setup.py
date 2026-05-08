@@ -986,6 +986,14 @@ def get_requirements() -> list[str]:
 
 ext_modules = []
 
+skip_sm90_optional_exts = os.environ.get(
+    "VLLM_SKIP_SM90_OPTIONAL_EXTS", "").strip().lower() in ("1", "true")
+
+
+def cuda_version_at_least(version: str) -> bool:
+    return bool(CUDA_HOME and get_nvcc_cuda_version() >= Version(version))
+
+
 if _is_cuda() or _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._moe_C"))
     ext_modules.append(CMakeExtension(name="vllm.cumem_allocator"))
@@ -998,8 +1006,8 @@ if _is_hip():
 
 if _is_cuda():
     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
-    if envs.VLLM_USE_PRECOMPILED or (
-        CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
+    if not skip_sm90_optional_exts and (
+        envs.VLLM_USE_PRECOMPILED or cuda_version_at_least("12.3")
     ):
         # FA3 requires CUDA 12.3 or later
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
@@ -1008,8 +1016,8 @@ if _is_cuda():
     ext_modules.append(
         CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa4_cutedsl_C", optional=True)
     )
-    if envs.VLLM_USE_PRECOMPILED or (
-        CUDA_HOME and get_nvcc_cuda_version() >= Version("12.9")
+    if not skip_sm90_optional_exts and (
+        envs.VLLM_USE_PRECOMPILED or cuda_version_at_least("12.9")
     ):
         # FlashMLA requires CUDA 12.9 or later
         # Optional since this doesn't get built (produce an .so file) when
@@ -1018,8 +1026,8 @@ if _is_cuda():
         ext_modules.append(
             CMakeExtension(name="vllm._flashmla_extension_C", optional=True)
         )
-    if envs.VLLM_USE_PRECOMPILED or (
-        CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
+    if not skip_sm90_optional_exts and (
+        envs.VLLM_USE_PRECOMPILED or cuda_version_at_least("12.3")
     ):
         # DeepGEMM requires CUDA 12.3+ (SM90/SM100)
         # Optional since it won't build on unsupported architectures

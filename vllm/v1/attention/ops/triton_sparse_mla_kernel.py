@@ -9,6 +9,7 @@ online-softmax rescaling — pattern from `triton_decode_attention.py`.
 """
 
 import functools
+import os
 
 import torch
 
@@ -21,7 +22,7 @@ _BLOCK_DPE = 64
 _BLOCK_DV = 512
 _DIM_QK = _BLOCK_DMODEL + _BLOCK_DPE  # 576
 
-_BLOCK_H = 16
+_BLOCK_H = 32
 # Smallest BLOCK_N the autotune sweep offers; only used for the topk-divisibility
 # check at dispatch time.
 _MIN_BLOCK_N = 16
@@ -484,11 +485,15 @@ def triton_sparse_mla_attention(
     num_head_groups = triton.cdiv(num_heads_q, min(_BLOCK_H, kv_group_num))
 
     if num_kv_splits is None or num_kv_splits == 0:
-        if sm_count is None:
-            sm_count = num_compute_units(q.device.index)
-        num_kv_splits = _choose_num_kv_splits(
-            num_tokens, num_head_groups, index_topk, sm_count
-        )
+        force_splits = os.getenv("VLLM_SPARSE_MLA_FORCE_KV_SPLITS")
+        if force_splits:
+            num_kv_splits = int(force_splits)
+        else:
+            if sm_count is None:
+                sm_count = num_compute_units(q.device.index)
+            num_kv_splits = _choose_num_kv_splits(
+                num_tokens, num_head_groups, index_topk, sm_count
+            )
 
     out = torch.empty(
         (num_tokens, num_heads_q, _BLOCK_DV),

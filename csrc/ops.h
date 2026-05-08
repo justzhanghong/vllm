@@ -120,6 +120,29 @@ void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
                      torch::Tensor& output, torch::Tensor& workspace, int64_t k,
                      int64_t max_seq_len);
 
+#ifndef USE_ROCM
+void fp8_mqa_logits_cuda(const torch::Tensor& q, const torch::Tensor& k,
+                         const torch::Tensor& k_scales,
+                         const torch::Tensor& weights,
+                         const torch::Tensor& cu_seqlen_ks,
+                         const torch::Tensor& cu_seqlen_ke,
+                         torch::Tensor& logits);
+
+void fp8_mqa_logits_cuda_v5(const torch::Tensor& q, const torch::Tensor& k,
+                            const torch::Tensor& k_scales,
+                            const torch::Tensor& weights,
+                            const torch::Tensor& cu_seqlen_ks,
+                            const torch::Tensor& cu_seqlen_ke,
+                            torch::Tensor& logits);
+
+void fp8_mqa_logits_cuda_v7(const torch::Tensor& q, const torch::Tensor& k,
+                            const torch::Tensor& k_scales,
+                            const torch::Tensor& weights,
+                            const torch::Tensor& cu_seqlen_ks,
+                            const torch::Tensor& cu_seqlen_ke,
+                            torch::Tensor& logits);
+#endif
+
 void rms_norm_static_fp8_quant(torch::Tensor& out, torch::Tensor& input,
                                torch::Tensor& weight, torch::Tensor& scale,
                                double epsilon);
