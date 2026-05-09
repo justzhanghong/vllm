@@ -8,9 +8,13 @@ import torch
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.ops.mqa_logits_triton import (
+    fp8_mqa_dequant_k_cuda,
+    fp8_mqa_dequant_q_cuda,
     fp8_mqa_logits_cuda,
     fp8_mqa_logits_cuda_v5,
     fp8_mqa_logits_cuda_v7,
+    fp8_mqa_logits_cuda_v7_bf16_qk,
+    fp8_mqa_logits_cuda_v7_fused_triton,
     fp8_mqa_logits_triton,
     fp8_paged_mqa_logits_triton,
 )
@@ -182,6 +186,10 @@ def _has_fp8_mqa_logits_cuda_v5() -> bool:
 
 def _has_fp8_mqa_logits_cuda_v7() -> bool:
     return _has_custom_op("fp8_mqa_logits_cuda_v7")
+
+
+def _has_fp8_mqa_logits_cuda_v7_bf16_qk() -> bool:
+    return _has_custom_op("fp8_mqa_logits_cuda_v7_bf16_qk")
 
 
 @pytest.mark.parametrize("M,N", [(64, 64), (128, 256), (256, 512)])
@@ -411,6 +419,83 @@ def test_fp8_mqa_logits_cuda_v7_matches_cuda_v5_and_triton(
             out_triton[finite],
             atol=_ATOL,
             rtol=_RTOL,
+        )
+
+
+@pytest.mark.skipif(
+    not _has_fp8_mqa_logits_cuda_v7_bf16_qk(),
+    reason="CUDA fp8 MQA logits v7 bf16-qk custom op is unavailable",
+)
+@pytest.mark.parametrize(
+    "M,N,partial_mask",
+    [
+        (64, 64, False),
+        (128, 256, True),
+        (256, 1024, True),
+    ],
+)
+def test_fp8_mqa_logits_cuda_v7_fused_triton_matches_bf16_qk(
+    M, N, partial_mask
+):
+    torch.manual_seed(0)
+    num_heads = 32
+    head_dim = 128
+    device = "cuda"
+
+    q_bf16_src = torch.randn(
+        M, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    k_bf16_src = torch.randn(N, head_dim, dtype=torch.bfloat16, device=device)
+    weights = torch.randn(M, num_heads, dtype=torch.float32, device=device)
+    q_fp8 = q_bf16_src.to(torch.float8_e4m3fn)
+    k_fp8, k_scales = _quantize_k_per_row(k_bf16_src)
+
+    if partial_mask:
+        ks = torch.arange(M, dtype=torch.int32, device=device) % max(1, N // 4)
+        ke = ks + torch.randint(
+            1, max(2, N // 2), (M,), dtype=torch.int32, device=device
+        )
+        ke = torch.minimum(ke, torch.tensor(N, dtype=torch.int32, device=device))
+    else:
+        ks = torch.zeros(M, dtype=torch.int32, device=device)
+        ke = torch.full((M,), N, dtype=torch.int32, device=device)
+
+    q_bf16 = torch.empty(
+        (num_heads, M, head_dim), dtype=torch.bfloat16, device=device
+    )
+    k_bf16 = torch.empty((N, head_dim), dtype=torch.bfloat16, device=device)
+    fp8_mqa_dequant_q_cuda(q_fp8, q_bf16)
+    fp8_mqa_dequant_k_cuda(k_fp8, k_scales, k_bf16)
+
+    out_ref = fp8_mqa_logits_cuda_v7_bf16_qk(
+        q_bf16,
+        k_bf16,
+        weights,
+        ks,
+        ke,
+        actual_n=N,
+        fallback=False,
+    )
+    out_fused = fp8_mqa_logits_cuda_v7_fused_triton(
+        q_fp8,
+        k_bf16,
+        weights,
+        ks,
+        ke,
+        actual_n=N,
+        fallback=False,
+    )
+
+    inf_ref = torch.isinf(out_ref) & (out_ref < 0)
+    assert torch.equal(inf_ref, torch.isinf(out_fused) & (out_fused < 0))
+
+    finite = ~inf_ref
+    if finite.any():
+        torch.testing.assert_close(
+            out_fused[finite],
+            out_ref[finite],
+            atol=1e-3,
+            rtol=1e-4,
         )
 
 

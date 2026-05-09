@@ -35,6 +35,8 @@ from vllm.v1.attention.ops.mqa_logits_triton import (
     fp8_mqa_logits_cuda_v7,
     fp8_mqa_logits_cuda_v7_bf16_k,
     fp8_mqa_logits_cuda_v7_bf16_qk,
+    fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton,
+    fp8_mqa_logits_cuda_v7_fused_triton,
     fp8_mqa_logits_triton,
     fp8_paged_mqa_logits_triton,
 )
@@ -164,10 +166,17 @@ def sparse_attn_indexer(
             predequant_k
             and os.getenv("VLLM_MQA_CUDA_V7_PREDEQUANT_Q", "0") == "1"
         )
+        fused_triton = (
+            predequant_k
+            and os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON", "0") == "1"
+        )
         q_workspace = (
             predequant_k
             and not predequant_q
-            and os.getenv("VLLM_MQA_CUDA_V7_Q_WORKSPACE", "0") == "1"
+            and (
+                fused_triton
+                or os.getenv("VLLM_MQA_CUDA_V7_Q_WORKSPACE", "0") == "1"
+            )
         )
         use_predequant_workspace = (
             predequant_k
@@ -224,7 +233,10 @@ def sparse_attn_indexer(
         logits_workspace: torch.Tensor | None = None
         reuse_logits = (
             predequant_k
-            and os.getenv("VLLM_MQA_CUDA_V7_REUSE_LOGITS", "0") == "1"
+            and (
+                fused_triton
+                or os.getenv("VLLM_MQA_CUDA_V7_REUSE_LOGITS", "0") == "1"
+            )
         )
         if reuse_logits:
             pad_logits_n = os.getenv("VLLM_MQA_CUDA_V7_PAD_N", "0") == "1"
@@ -324,12 +336,62 @@ def sparse_attn_indexer(
                         fallback=False,
                     )
                 elif mqa_backend == "cuda_v7":
-                    logger.info_once(
-                        "Sparse indexer prefill MQA logits backend: CUDA/cuBLAS v7"
-                    )
+                    if fused_triton:
+                        logger.info_once(
+                            "Sparse indexer prefill MQA logits backend: "
+                            "CUDA/cuBLAS v7 + fused Triton logits"
+                        )
+                    else:
+                        logger.info_once(
+                            "Sparse indexer prefill MQA logits backend: "
+                            "CUDA/cuBLAS v7"
+                        )
                     if predequant_k:
                         assert k_bf16_full is not None
-                        if predequant_q:
+                        if fused_triton:
+                            if predequant_q:
+                                assert q_bf16_full is not None
+                                logits = fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton(
+                                    q_bf16_full[
+                                        :,
+                                        chunk.token_start : chunk.token_end,
+                                        :,
+                                    ],
+                                    k_bf16_full,
+                                    w_chunk,
+                                    chunk.cu_seqlen_ks,
+                                    chunk.cu_seqlen_ke,
+                                    actual_n=chunk.active_seq_lens,
+                                    logits_out=logits_workspace,
+                                )
+                            else:
+                                q_bf16_out = None
+                                if q_workspace:
+                                    assert q_bf16_workspace is not None
+                                    q_bf16_out = q_bf16_workspace.as_strided(
+                                        (
+                                            q_fp8.shape[1],
+                                            q_chunk.shape[0],
+                                            q_fp8.shape[2],
+                                        ),
+                                        (
+                                            q_chunk.shape[0] * q_fp8.shape[2],
+                                            q_fp8.shape[2],
+                                            1,
+                                        ),
+                                    )
+                                logits = fp8_mqa_logits_cuda_v7_fused_triton(
+                                    q_chunk,
+                                    k_bf16_full,
+                                    w_chunk,
+                                    chunk.cu_seqlen_ks,
+                                    chunk.cu_seqlen_ke,
+                                    actual_n=chunk.active_seq_lens,
+                                    q_bf16_out=q_bf16_out,
+                                    logits_out=logits_workspace,
+                                    fallback=False,
+                                )
+                        elif predequant_q:
                             assert q_bf16_full is not None
                             logits = fp8_mqa_logits_cuda_v7_bf16_qk(
                                 q_bf16_full[
@@ -408,7 +470,40 @@ def sparse_attn_indexer(
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
 
-            if current_platform.is_xpu():
+            if (
+                current_platform.is_cuda()
+                and chunk.num_reqs == 1
+                and os.getenv("VLLM_SPARSE_INDEXER_PREFILL_DECODE_TOPK", "0")
+                == "1"
+            ):
+                torch.ops._C.top_k_per_row_decode(
+                    logits,
+                    1,
+                    chunk.cu_seqlen_ke,
+                    topk_indices,
+                    num_rows,
+                    logits.stride(0),
+                    logits.stride(1),
+                    topk_tokens,
+                )
+            elif (
+                current_platform.is_cuda()
+                and chunk.num_reqs == 1
+                and os.getenv("VLLM_SPARSE_INDEXER_PREFILL_PERSISTENT_TOPK", "0")
+                == "1"
+            ):
+                (topk_workspace,) = workspace_manager.get_simultaneous(
+                    ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+                )
+                torch.ops._C.persistent_topk(
+                    logits,
+                    chunk.cu_seqlen_ke,
+                    topk_indices,
+                    topk_workspace,
+                    topk_tokens,
+                    attn_metadata_narrowed.max_seq_len,
+                )
+            elif current_platform.is_xpu():
                 xpu_ops.top_k_per_row_prefill(  # type: ignore[attr-defined]
                     logits,
                     chunk.cu_seqlen_ks,

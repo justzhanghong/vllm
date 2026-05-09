@@ -516,6 +516,202 @@ def fp8_mqa_dequant_q_cuda(
     )
 
 
+@triton.jit
+def _mqa_bf16_fused_logits_kernel(
+    q_ptr,
+    k_ptr,
+    w_ptr,
+    ks_ptr,
+    ke_ptr,
+    out_ptr,
+    stride_q_h,
+    stride_q_m,
+    stride_k_n,
+    stride_w_m,
+    stride_out_m,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    mask_d = offs_d < D
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for h in tl.static_range(0, H):
+        q = tl.load(
+            q_ptr
+            + h * stride_q_h
+            + offs_m[:, None] * stride_q_m
+            + offs_d[None, :],
+            mask=mask_m[:, None] & mask_d[None, :],
+            other=0.0,
+        )
+        k = tl.load(
+            k_ptr + offs_n[:, None] * stride_k_n + offs_d[None, :],
+            mask=mask_n[:, None] & mask_d[None, :],
+            other=0.0,
+        )
+        s = tl.dot(q, tl.trans(k), out_dtype=tl.float32)
+        weight = tl.load(
+            w_ptr + offs_m * stride_w_m + h,
+            mask=mask_m,
+            other=0.0,
+        )
+        acc += tl.maximum(s, 0.0) * weight[:, None]
+
+    row_start = tl.load(ks_ptr + offs_m, mask=mask_m, other=0)
+    row_end = tl.load(ke_ptr + offs_m, mask=mask_m, other=0)
+    valid = (
+        mask_m[:, None]
+        & mask_n[None, :]
+        & (offs_n[None, :] >= row_start[:, None])
+        & (offs_n[None, :] < row_end[:, None])
+    )
+    acc = tl.where(valid, acc, float("-inf"))
+    tl.store(
+        out_ptr + offs_m[:, None] * stride_out_m + offs_n[None, :],
+        acc,
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+
+
+def fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton(
+    q_bf16: torch.Tensor,
+    k_bf16: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    *,
+    actual_n: int | None = None,
+    logits_out: torch.Tensor | None = None,
+    block_m: int | None = None,
+    block_n: int | None = None,
+) -> torch.Tensor:
+    """Exact fused Triton logits path for pre-dequantized BF16 Q and K."""
+    M = q_bf16.shape[1]
+    N = k_bf16.shape[0] if actual_n is None else actual_n
+    if logits_out is None:
+        logits = torch.empty((M, N), dtype=torch.float32, device=q_bf16.device)
+    else:
+        logits = logits_out[:M, :N]
+        if logits.shape != (M, N):
+            raise RuntimeError(
+                f"logits_out is too small for M={M}, N={N}: {logits_out.shape}"
+            )
+    if M == 0 or N == 0:
+        return logits
+
+    if not q_bf16.is_cuda:
+        raise RuntimeError("q_bf16 is not a CUDA tensor")
+    if q_bf16.dtype != torch.bfloat16 or k_bf16.dtype != torch.bfloat16:
+        raise RuntimeError(
+            "fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton requires CUDA bf16 q/k"
+        )
+
+    block_m = block_m or int(
+        os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_BLOCK_M", "16")
+    )
+    block_n = block_n or int(
+        os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_BLOCK_N", "128")
+    )
+    H, _, D = q_bf16.shape
+    grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
+    _mqa_bf16_fused_logits_kernel[grid](
+        q_bf16,
+        k_bf16,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        logits,
+        q_bf16.stride(0),
+        q_bf16.stride(1),
+        k_bf16.stride(0),
+        weights.stride(0),
+        logits.stride(0),
+        M=M,
+        N=N,
+        H=H,
+        D=D,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_D=triton.next_power_of_2(D),
+        num_warps=4,
+        num_stages=3,
+    )
+    return logits
+
+
+def fp8_mqa_logits_cuda_v7_fused_triton(
+    q: torch.Tensor,
+    k_bf16: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    *,
+    actual_n: int | None = None,
+    q_bf16_out: torch.Tensor | None = None,
+    logits_out: torch.Tensor | None = None,
+    fallback: bool = True,
+) -> torch.Tensor:
+    """Exact fused Triton logits path that reuses a pre-dequantized BF16 K."""
+    try:
+        if not q.is_cuda:
+            raise RuntimeError("q is not a CUDA tensor")
+        if q.dtype != torch.float8_e4m3fn or k_bf16.dtype != torch.bfloat16:
+            raise RuntimeError(
+                "fp8_mqa_logits_cuda_v7_fused_triton requires CUDA fp8 q and "
+                "bf16 k"
+            )
+        M, H, D = q.shape
+        if q_bf16_out is None:
+            q_bf16 = torch.empty((H, M, D), dtype=torch.bfloat16, device=q.device)
+        else:
+            q_bf16 = q_bf16_out[:, :M, :]
+            if q_bf16.shape != (H, M, D):
+                raise RuntimeError(
+                    f"q_bf16_out is too small for H={H}, M={M}, D={D}: "
+                    f"{q_bf16_out.shape}"
+                )
+        fp8_mqa_dequant_q_cuda(q, q_bf16)
+        return fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton(
+            q_bf16,
+            k_bf16,
+            weights,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            actual_n=actual_n,
+            logits_out=logits_out,
+        )
+    except Exception as err:
+        if not fallback:
+            raise
+        logger.warning_once(
+            "fp8_mqa_logits_cuda_v7_fused_triton failed; falling back to "
+            "CUDA/cuBLAS bf16-k: %s",
+            err,
+        )
+        return fp8_mqa_logits_cuda_v7_bf16_k(
+            q,
+            k_bf16,
+            weights,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            actual_n=actual_n,
+            logits_out=logits_out,
+            fallback=fallback,
+        )
+
+
 def fp8_mqa_logits_cuda_v7_bf16_k(
     q: torch.Tensor,
     k_bf16: torch.Tensor,
