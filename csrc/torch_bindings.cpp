@@ -220,6 +220,28 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor weights, Tensor cu_seqlen_ks, Tensor cu_seqlen_ke, "
       "Tensor! logits) -> ()");
   ops.impl("fp8_mqa_logits_cuda_v7", torch::kCUDA, &fp8_mqa_logits_cuda_v7);
+
+  ops.def(
+      "fp8_mqa_dequant_k_cuda(Tensor k, Tensor k_scales, "
+      "Tensor! k_bf16) -> ()");
+  ops.impl("fp8_mqa_dequant_k_cuda", torch::kCUDA, &fp8_mqa_dequant_k_cuda);
+
+  ops.def("fp8_mqa_dequant_q_cuda(Tensor q, Tensor! q_bf16) -> ()");
+  ops.impl("fp8_mqa_dequant_q_cuda", torch::kCUDA, &fp8_mqa_dequant_q_cuda);
+
+  ops.def(
+      "fp8_mqa_logits_cuda_v7_bf16_k(Tensor q, Tensor k_bf16, "
+      "Tensor weights, Tensor cu_seqlen_ks, Tensor cu_seqlen_ke, "
+      "Tensor! logits) -> ()");
+  ops.impl("fp8_mqa_logits_cuda_v7_bf16_k", torch::kCUDA,
+           &fp8_mqa_logits_cuda_v7_bf16_k);
+
+  ops.def(
+      "fp8_mqa_logits_cuda_v7_bf16_qk(Tensor q_bf16, Tensor k_bf16, "
+      "Tensor weights, Tensor cu_seqlen_ks, Tensor cu_seqlen_ke, "
+      "Tensor! logits) -> ()");
+  ops.impl("fp8_mqa_logits_cuda_v7_bf16_qk", torch::kCUDA,
+           &fp8_mqa_logits_cuda_v7_bf16_qk);
 #endif
 
   // Layernorm-quant

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import os
+
 import torch
 
 import vllm.envs as envs
@@ -26,9 +28,13 @@ from vllm.v1.attention.backends.mla.indexer import (
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.attention.ops.mqa_logits_triton import (
+    fp8_mqa_dequant_k_cuda,
+    fp8_mqa_dequant_q_cuda,
     fp8_mqa_logits_cuda,
     fp8_mqa_logits_cuda_v5,
     fp8_mqa_logits_cuda_v7,
+    fp8_mqa_logits_cuda_v7_bf16_k,
+    fp8_mqa_logits_cuda_v7_bf16_qk,
     fp8_mqa_logits_triton,
     fp8_paged_mqa_logits_triton,
 )
@@ -67,11 +73,29 @@ def sparse_attn_indexer(
     # assert isinstance(attn_metadata, dict)
     if not isinstance(attn_metadata, dict):
         # Reserve workspace for indexer during profiling run
-        current_workspace_manager().get_simultaneous(
+        workspace_shapes: list[tuple[tuple[int, ...], torch.dtype]] = [
             ((total_seq_lens, head_dim), torch.float8_e4m3fn),
             ((total_seq_lens, 4), torch.uint8),
             ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
-        )
+        ]
+        if (
+            envs.VLLM_SPARSE_INDEXER_MQA_LOGITS_BACKEND == "cuda_v7"
+            and os.getenv("VLLM_MQA_CUDA_V7_PREDEQUANT_K", "0") == "1"
+            and os.getenv("VLLM_MQA_CUDA_V7_PREDEQUANT_K_WORKSPACE", "0") == "1"
+        ):
+            padded_total_seq_lens = total_seq_lens
+            if (
+                os.getenv("VLLM_MQA_CUDA_V7_PAD_N", "0") == "1"
+                and padded_total_seq_lens >= 32768
+                and padded_total_seq_lens % 128 != 0
+            ):
+                padded_total_seq_lens = (
+                    (padded_total_seq_lens + 127) // 128
+                ) * 128
+            workspace_shapes.append(
+                ((padded_total_seq_lens, head_dim), torch.bfloat16)
+            )
+        current_workspace_manager().get_simultaneous(*workspace_shapes)
 
         # Dummy allocation to simulate for peak logits tensor memory during inference.
         # FP8 elements so elements == bytes
@@ -118,29 +142,149 @@ def sparse_attn_indexer(
         scale_fmt,
     )
 
-    topk_indices_buffer[: hidden_states.shape[0]] = -1
+    skip_prefill_topk_clear = (
+        has_prefill
+        and not has_decode
+        and os.getenv("VLLM_SPARSE_INDEXER_SKIP_PREFILL_TOPK_CLEAR", "0") == "1"
+    )
+    if not skip_prefill_topk_clear:
+        topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
 
         # Get the full shared workspace buffers once (will allocate on first use)
         workspace_manager = current_workspace_manager()
-        k_fp8_full, k_scale_full = workspace_manager.get_simultaneous(
-            ((total_seq_lens, head_dim), fp8_dtype),
-            ((total_seq_lens, 4), torch.uint8),
+        mqa_backend = envs.VLLM_SPARSE_INDEXER_MQA_LOGITS_BACKEND
+        predequant_k = (
+            mqa_backend == "cuda_v7"
+            and os.getenv("VLLM_MQA_CUDA_V7_PREDEQUANT_K", "0") == "1"
         )
-        for chunk in prefill_metadata.chunks:
-            k_fp8 = k_fp8_full[: chunk.total_seq_lens]
-            k_scale = k_scale_full[: chunk.total_seq_lens]
+        predequant_q = (
+            predequant_k
+            and os.getenv("VLLM_MQA_CUDA_V7_PREDEQUANT_Q", "0") == "1"
+        )
+        q_workspace = (
+            predequant_k
+            and not predequant_q
+            and os.getenv("VLLM_MQA_CUDA_V7_Q_WORKSPACE", "0") == "1"
+        )
+        use_predequant_workspace = (
+            predequant_k
+            and os.getenv("VLLM_MQA_CUDA_V7_PREDEQUANT_K_WORKSPACE", "0") == "1"
+        )
+        k_bf16_workspace: torch.Tensor | None = None
+        if use_predequant_workspace:
 
+            def padded_total_n(n: int) -> int:
+                if (
+                    os.getenv("VLLM_MQA_CUDA_V7_PAD_N", "0") == "1"
+                    and n >= 32768
+                    and n % 128 != 0
+                ):
+                    return ((n + 127) // 128) * 128
+                return n
+
+            max_k_bf16_rows = max(
+                padded_total_n(chunk.total_seq_lens)
+                for chunk in prefill_metadata.chunks
+            )
+            k_fp8_full, k_scale_full, k_bf16_workspace = (
+                workspace_manager.get_simultaneous(
+                    ((total_seq_lens, head_dim), fp8_dtype),
+                    ((total_seq_lens, 4), torch.uint8),
+                    ((max_k_bf16_rows, head_dim), torch.bfloat16),
+                )
+            )
+        else:
+            k_fp8_full, k_scale_full = workspace_manager.get_simultaneous(
+                ((total_seq_lens, head_dim), fp8_dtype),
+                ((total_seq_lens, 4), torch.uint8),
+            )
+        k_bf16_full: torch.Tensor | None = None
+        q_bf16_full: torch.Tensor | None = None
+        if predequant_q:
+            q_bf16_full = torch.empty(
+                (q_fp8.shape[1], q_fp8.shape[0], q_fp8.shape[2]),
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
+            )
+            fp8_mqa_dequant_q_cuda(q_fp8, q_bf16_full)
+        q_bf16_workspace: torch.Tensor | None = None
+        if q_workspace:
+            max_chunk_m = max(
+                chunk.token_end - chunk.token_start
+                for chunk in prefill_metadata.chunks
+            )
+            q_bf16_workspace = torch.empty(
+                (q_fp8.shape[1], max_chunk_m, q_fp8.shape[2]),
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
+            )
+        logits_workspace: torch.Tensor | None = None
+        reuse_logits = (
+            predequant_k
+            and os.getenv("VLLM_MQA_CUDA_V7_REUSE_LOGITS", "0") == "1"
+        )
+        if reuse_logits:
+            pad_logits_n = os.getenv("VLLM_MQA_CUDA_V7_PAD_N", "0") == "1"
+
+            def padded_n(n: int) -> int:
+                if pad_logits_n and n >= 32768 and n % 128 != 0:
+                    return ((n + 127) // 128) * 128
+                return n
+
+            max_chunk_m = max(
+                chunk.token_end - chunk.token_start
+                for chunk in prefill_metadata.chunks
+            )
+            max_chunk_n = max(
+                padded_n(chunk.active_seq_lens)
+                for chunk in prefill_metadata.chunks
+            )
+            logits_workspace = torch.empty(
+                (max_chunk_m, max_chunk_n),
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+        for chunk in prefill_metadata.chunks:
             if not chunk.skip_kv_gather:
+                k_fp8_gather = k_fp8_full[: chunk.total_seq_lens]
+                k_scale_gather = k_scale_full[: chunk.total_seq_lens]
                 ops.cp_gather_indexer_k_quant_cache(
                     kv_cache,
-                    k_fp8,
-                    k_scale,
+                    k_fp8_gather,
+                    k_scale_gather,
                     chunk.block_table,
                     chunk.cu_seq_lens,
                 )
+                if predequant_k:
+                    padded_total_seq_lens = chunk.total_seq_lens
+                    if (
+                        os.getenv("VLLM_MQA_CUDA_V7_PAD_N", "0") == "1"
+                        and padded_total_seq_lens >= 32768
+                        and padded_total_seq_lens % 128 != 0
+                    ):
+                        padded_total_seq_lens = (
+                            (padded_total_seq_lens + 127) // 128
+                        ) * 128
+                    if use_predequant_workspace:
+                        assert k_bf16_workspace is not None
+                        k_bf16_full = k_bf16_workspace[:padded_total_seq_lens]
+                    else:
+                        k_bf16_full = torch.empty(
+                            (padded_total_seq_lens, head_dim),
+                            dtype=torch.bfloat16,
+                            device=hidden_states.device,
+                        )
+                    fp8_mqa_dequant_k_cuda(
+                        k_fp8_gather,
+                        k_scale_gather.view(torch.float32).flatten(),
+                        k_bf16_full[: chunk.total_seq_lens],
+                    )
+
+            k_fp8 = k_fp8_full[: chunk.active_seq_lens]
+            k_scale = k_scale_full[: chunk.active_seq_lens]
 
             if is_deep_gemm_supported():
                 logits = fp8_mqa_logits(
@@ -183,14 +327,69 @@ def sparse_attn_indexer(
                     logger.info_once(
                         "Sparse indexer prefill MQA logits backend: CUDA/cuBLAS v7"
                     )
-                    logits = fp8_mqa_logits_cuda_v7(
-                        q_chunk,
-                        (k_fp8, k_scales),
-                        w_chunk,
-                        chunk.cu_seqlen_ks,
-                        chunk.cu_seqlen_ke,
-                        fallback=False,
-                    )
+                    if predequant_k:
+                        assert k_bf16_full is not None
+                        if predequant_q:
+                            assert q_bf16_full is not None
+                            logits = fp8_mqa_logits_cuda_v7_bf16_qk(
+                                q_bf16_full[
+                                    :,
+                                    chunk.token_start : chunk.token_end,
+                                    :,
+                                ],
+                                k_bf16_full,
+                                w_chunk,
+                                chunk.cu_seqlen_ks,
+                                chunk.cu_seqlen_ke,
+                                actual_n=chunk.active_seq_lens,
+                                logits_out=logits_workspace,
+                                fallback=False,
+                            )
+                        elif q_workspace:
+                            assert q_bf16_workspace is not None
+                            q_bf16 = q_bf16_workspace.as_strided(
+                                (
+                                    q_fp8.shape[1],
+                                    q_chunk.shape[0],
+                                    q_fp8.shape[2],
+                                ),
+                                (
+                                    q_chunk.shape[0] * q_fp8.shape[2],
+                                    q_fp8.shape[2],
+                                    1,
+                                ),
+                            )
+                            fp8_mqa_dequant_q_cuda(q_chunk, q_bf16)
+                            logits = fp8_mqa_logits_cuda_v7_bf16_qk(
+                                q_bf16,
+                                k_bf16_full,
+                                w_chunk,
+                                chunk.cu_seqlen_ks,
+                                chunk.cu_seqlen_ke,
+                                actual_n=chunk.active_seq_lens,
+                                logits_out=logits_workspace,
+                                fallback=False,
+                            )
+                        else:
+                            logits = fp8_mqa_logits_cuda_v7_bf16_k(
+                                q_chunk,
+                                k_bf16_full,
+                                w_chunk,
+                                chunk.cu_seqlen_ks,
+                                chunk.cu_seqlen_ke,
+                                actual_n=chunk.active_seq_lens,
+                                logits_out=logits_workspace,
+                                fallback=False,
+                            )
+                    else:
+                        logits = fp8_mqa_logits_cuda_v7(
+                            q_chunk,
+                            (k_fp8, k_scales),
+                            w_chunk,
+                            chunk.cu_seqlen_ks,
+                            chunk.cu_seqlen_ke,
+                            fallback=False,
+                        )
                 else:
                     logger.info_once(
                         "Sparse indexer prefill MQA logits backend: CUDA/cuBLAS"

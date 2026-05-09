@@ -141,6 +141,26 @@ void fp8_mqa_logits_cuda_v7(const torch::Tensor& q, const torch::Tensor& k,
                             const torch::Tensor& cu_seqlen_ks,
                             const torch::Tensor& cu_seqlen_ke,
                             torch::Tensor& logits);
+
+void fp8_mqa_dequant_k_cuda(const torch::Tensor& k,
+                            const torch::Tensor& k_scales,
+                            torch::Tensor& k_bf16);
+
+void fp8_mqa_dequant_q_cuda(const torch::Tensor& q, torch::Tensor& q_bf16);
+
+void fp8_mqa_logits_cuda_v7_bf16_k(const torch::Tensor& q,
+                                   const torch::Tensor& k_bf16,
+                                   const torch::Tensor& weights,
+                                   const torch::Tensor& cu_seqlen_ks,
+                                   const torch::Tensor& cu_seqlen_ke,
+                                   torch::Tensor& logits);
+
+void fp8_mqa_logits_cuda_v7_bf16_qk(const torch::Tensor& q_bf16,
+                                    const torch::Tensor& k_bf16,
+                                    const torch::Tensor& weights,
+                                    const torch::Tensor& cu_seqlen_ks,
+                                    const torch::Tensor& cu_seqlen_ke,
+                                    torch::Tensor& logits);
 #endif
 
 void rms_norm_static_fp8_quant(torch::Tensor& out, torch::Tensor& input,

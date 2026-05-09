@@ -3,6 +3,7 @@
 """Pure-Triton sparse MLA backend for GPUs without FlashMLA Sparse (SM90+)
 or FlashInfer MLA Sparse (SM100+), e.g. SM80 (A100) and SM121 (GB10)."""
 
+import os
 from typing import ClassVar
 
 import torch
@@ -76,6 +77,32 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 num_kv_splits=splits,
                 sm_count=self._sm_count,
             )
+        extra_warmup_shapes = os.getenv("VLLM_SPARSE_MLA_WARMUP_NUM_TOKENS")
+        if extra_warmup_shapes:
+            for shape in extra_warmup_shapes.split(","):
+                num_tokens = int(shape.strip())
+                if num_tokens <= 1:
+                    continue
+                q = torch.empty(
+                    num_tokens,
+                    self.num_heads,
+                    _DIM_QK,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                indices = torch.zeros(
+                    num_tokens, 1, topk, dtype=torch.int32, device=device
+                )
+                triton_sparse_mla_attention(
+                    q,
+                    kv,
+                    indices,
+                    sm_scale=self.softmax_scale,
+                    num_kv_splits=1,
+                    sm_count=self._sm_count,
+                )
+            del q, indices
+            torch.cuda.empty_cache()
         # The indexer's fp8 MQA logits kernels live on a separate autotune
         # cache. Prime them here so cold TTFT doesn't include their sweep.
         warmup_fp8_mqa_logits_triton(

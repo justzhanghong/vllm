@@ -5857,7 +5857,11 @@ class GPUModelRunner(
 
         kv_cache_spec = self.get_kv_cache_spec()
         kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
-        min_blocks = self.compilation_config.max_cudagraph_capture_size or 1
+        max_capture_tokens = self.compilation_config.max_cudagraph_capture_size or 1
+        min_block_size = min(
+            group.kv_cache_spec.block_size for group in kv_cache_groups
+        )
+        min_blocks = cdiv(max_capture_tokens, min_block_size)
 
         # Temporarily change num_gpu_blocks_override to allocate a minimal KV cache
         saved_override = self.cache_config.num_gpu_blocks_override

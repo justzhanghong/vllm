@@ -3,6 +3,8 @@
 
 #include <torch/cuda.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cstdlib>
+#include <climits>
 
 #ifndef USE_ROCM
   #include <cub/cub.cuh>
@@ -324,7 +326,8 @@ __device__ bool processHistogramStep(
 
 // Follows half - 11 - 11 - 10 bit iterations
 template <int kNumThreadsPerBlock, int kNumBins, bool useRadixSort,
-          bool multipleBlocksPerRow = false, bool mergeBlocks = false>
+          bool multipleBlocksPerRow = false, bool mergeBlocks = false,
+          bool sortIndices = false>
 static __device__ void topKPerRowJob(const int* indices, const float* logits,
                                      int rowStart, int rowEnd, int* outIndices,
                                      float* outLogits, int stride1, int topK) {
@@ -338,6 +341,9 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
                                         kNumFinalItemsPerThread, int>;
   using FinalSortTempStorage =
       std::conditional_t<useRadixSort, typename FinalSort::TempStorage, int>;
+  using IndexSort =
+      cub::BlockRadixSort<int, kNumThreadsPerBlock, kNumFinalItemsPerThread>;
+  using IndexSortTempStorage = typename IndexSort::TempStorage;
   // The class to compute the inclusive prefix-sum over the histogram.
   using Scan = cub::BlockScan<int, kNumThreadsPerBlock>;
 
@@ -358,6 +364,7 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
   __shared__ union {
     FinalItems items;
     FinalSortTempStorage finalSort;
+    IndexSortTempStorage indexSort;
     Histogram histo;
   } smemFinal;
 
@@ -520,6 +527,29 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
     __syncthreads();
   }
 
+  if constexpr (sortIndices && !multipleBlocksPerRow && !mergeBlocks) {
+    int indexItems[kNumFinalItemsPerThread];
+
+#pragma unroll
+    for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
+      const int srcIdx = ii * kNumThreadsPerBlock + threadIdx.x;
+      indexItems[ii] = srcIdx < topK ? smemOutput[srcIdx] : INT_MAX;
+    }
+    __syncthreads();
+
+    IndexSort(smemFinal.indexSort).SortBlockedToStriped(indexItems);
+
+#pragma unroll
+    for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
+      const int dstIdx = ii * kNumThreadsPerBlock + threadIdx.x;
+      if (dstIdx < topK) {
+        smemOutput[dstIdx] =
+            indexItems[ii] == INT_MAX ? -1 : indexItems[ii];
+      }
+    }
+    __syncthreads();
+  }
+
   // Store to global memory.
   for (int i = threadIdx.x; i < topK; i += kNumThreadsPerBlock) {
     if constexpr (multipleBlocksPerRow) {
@@ -537,7 +567,8 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
   }
 }
 
-template <int kNumThreadsPerBlock, bool useRadixSort>
+template <int kNumThreadsPerBlock, bool useRadixSort,
+          bool sortIndices = false>
 static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(
     const float* logits, const int* rowStarts, const int* rowEnds,
     int* outIndices, int stride0, int stride1, const int topK,
@@ -556,7 +587,8 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(
   outIndices += static_cast<int64_t>(rowIdx) * topK;
   logits += static_cast<int64_t>(rowIdx) * stride0;
 
-  topKPerRowJob<kNumThreadsPerBlock, kNumBins, useRadixSort>(
+  topKPerRowJob<kNumThreadsPerBlock, kNumBins, useRadixSort, false, false,
+                sortIndices>(
       nullptr, logits, rowStart, rowEnd, outIndices, nullptr, stride1, topK);
 }
 
@@ -721,23 +753,44 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
   constexpr int kSortingAlgorithmThreshold = 12288;
   constexpr int kNumThreadsPerBlock = 512;
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const bool sortIndices =
+      std::getenv("VLLM_TOPK_PREFILL_SORT_INDICES") != nullptr &&
+      std::getenv("VLLM_TOPK_PREFILL_SORT_INDICES")[0] == '1';
 
   int numInsertionBlocks =
       std::min(static_cast<int>(numRows), kSortingAlgorithmThreshold);
-  vllm::topKPerRowPrefill<kNumThreadsPerBlock, false>
-      <<<numInsertionBlocks, kNumThreadsPerBlock, topK * sizeof(int32_t),
-         stream>>>(logits.data_ptr<float>(), rowStarts.data_ptr<int>(),
-                   rowEnds.data_ptr<int>(), indices.data_ptr<int>(),
-                   static_cast<int>(stride0), static_cast<int>(stride1),
-                   static_cast<int>(topK), 0);
-
-  if (numRows > kSortingAlgorithmThreshold) {
-    int numRadixBlocks = numRows - kSortingAlgorithmThreshold;
-    vllm::topKPerRowPrefill<kNumThreadsPerBlock, true>
-        <<<numRadixBlocks, kNumThreadsPerBlock, topK * sizeof(int32_t),
+  if (sortIndices) {
+    vllm::topKPerRowPrefill<kNumThreadsPerBlock, false, true>
+        <<<numInsertionBlocks, kNumThreadsPerBlock, topK * sizeof(int32_t),
            stream>>>(logits.data_ptr<float>(), rowStarts.data_ptr<int>(),
                      rowEnds.data_ptr<int>(), indices.data_ptr<int>(),
                      static_cast<int>(stride0), static_cast<int>(stride1),
-                     static_cast<int>(topK), kSortingAlgorithmThreshold);
+                     static_cast<int>(topK), 0);
+  } else {
+    vllm::topKPerRowPrefill<kNumThreadsPerBlock, false>
+        <<<numInsertionBlocks, kNumThreadsPerBlock, topK * sizeof(int32_t),
+           stream>>>(logits.data_ptr<float>(), rowStarts.data_ptr<int>(),
+                     rowEnds.data_ptr<int>(), indices.data_ptr<int>(),
+                     static_cast<int>(stride0), static_cast<int>(stride1),
+                     static_cast<int>(topK), 0);
+  }
+
+  if (numRows > kSortingAlgorithmThreshold) {
+    int numRadixBlocks = numRows - kSortingAlgorithmThreshold;
+    if (sortIndices) {
+      vllm::topKPerRowPrefill<kNumThreadsPerBlock, true, true>
+          <<<numRadixBlocks, kNumThreadsPerBlock, topK * sizeof(int32_t),
+             stream>>>(logits.data_ptr<float>(), rowStarts.data_ptr<int>(),
+                       rowEnds.data_ptr<int>(), indices.data_ptr<int>(),
+                       static_cast<int>(stride0), static_cast<int>(stride1),
+                       static_cast<int>(topK), kSortingAlgorithmThreshold);
+    } else {
+      vllm::topKPerRowPrefill<kNumThreadsPerBlock, true>
+          <<<numRadixBlocks, kNumThreadsPerBlock, topK * sizeof(int32_t),
+             stream>>>(logits.data_ptr<float>(), rowStarts.data_ptr<int>(),
+                       rowEnds.data_ptr<int>(), indices.data_ptr<int>(),
+                       static_cast<int>(stride0), static_cast<int>(stride1),
+                       static_cast<int>(topK), kSortingAlgorithmThreshold);
+    }
   }
 }

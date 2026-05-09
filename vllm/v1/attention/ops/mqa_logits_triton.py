@@ -16,6 +16,8 @@ K-side scale multiplication is done in fp32 before downcasting to bf16
 so the per-row dequant scale is applied at full precision.
 """
 
+import os
+
 import torch
 
 from vllm.logger import init_logger
@@ -486,6 +488,166 @@ def fp8_mqa_logits_cuda_v7(
     )
 
 
+def fp8_mqa_dequant_k_cuda(
+    k_fp8: torch.Tensor,
+    k_scales: torch.Tensor,
+    k_bf16: torch.Tensor,
+) -> None:
+    """Dequantize FP8 MQA K cache rows into a reusable BF16 buffer."""
+    from vllm import _custom_ops as _custom_ops  # noqa: F401
+
+    torch.ops._C.fp8_mqa_dequant_k_cuda(
+        k_fp8,
+        k_scales.reshape(-1),
+        k_bf16,
+    )
+
+
+def fp8_mqa_dequant_q_cuda(
+    q_fp8: torch.Tensor,
+    q_bf16: torch.Tensor,
+) -> None:
+    """Dequantize FP8 MQA Q into reusable head-major BF16 [H, M, D]."""
+    from vllm import _custom_ops as _custom_ops  # noqa: F401
+
+    torch.ops._C.fp8_mqa_dequant_q_cuda(
+        q_fp8,
+        q_bf16,
+    )
+
+
+def fp8_mqa_logits_cuda_v7_bf16_k(
+    q: torch.Tensor,
+    k_bf16: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    *,
+    actual_n: int | None = None,
+    logits_out: torch.Tensor | None = None,
+    fallback: bool = True,
+) -> torch.Tensor:
+    """v7 MQA logits path that reuses a pre-dequantized BF16 K buffer."""
+    M = q.shape[0]
+    actual_N = k_bf16.shape[0] if actual_n is None else actual_n
+    N = actual_N
+    pad_n = (
+        os.getenv("VLLM_MQA_CUDA_V7_PAD_N", "0") == "1"
+        and N >= 32768
+        and N % 128 != 0
+    )
+    if pad_n:
+        padded_N = ((N + 127) // 128) * 128
+        if k_bf16.shape[0] >= padded_N:
+            N = padded_N
+        else:
+            pad_n = False
+    if logits_out is None:
+        logits = torch.empty(
+            (M, N),
+            dtype=torch.float32,
+            device=q.device,
+        )
+    else:
+        logits = logits_out[:M, :N]
+        if logits.shape != (M, N):
+            raise RuntimeError(
+                f"logits_out is too small for M={M}, N={N}: {logits_out.shape}"
+            )
+
+    try:
+        if not q.is_cuda:
+            raise RuntimeError("q is not a CUDA tensor")
+        if q.dtype != torch.float8_e4m3fn or k_bf16.dtype != torch.bfloat16:
+            raise RuntimeError(
+                "fp8_mqa_logits_cuda_v7_bf16_k requires CUDA fp8 q and bf16 k"
+            )
+        from vllm import _custom_ops as _custom_ops  # noqa: F401
+
+        torch.ops._C.fp8_mqa_logits_cuda_v7_bf16_k(
+            q,
+            k_bf16[:N],
+            weights,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            logits,
+        )
+        if pad_n:
+            return logits[:, :actual_N]
+        return logits
+    except Exception as err:
+        if not fallback:
+            raise
+        raise RuntimeError(
+            "fp8_mqa_logits_cuda_v7_bf16_k has no lossless fallback without "
+            "the original FP8 K/scales"
+        ) from err
+
+
+def fp8_mqa_logits_cuda_v7_bf16_qk(
+    q_bf16: torch.Tensor,
+    k_bf16: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    *,
+    actual_n: int | None = None,
+    logits_out: torch.Tensor | None = None,
+    fallback: bool = True,
+) -> torch.Tensor:
+    """v7 MQA logits path that reuses pre-dequantized BF16 Q and K buffers."""
+    M = q_bf16.shape[1]
+    actual_N = k_bf16.shape[0] if actual_n is None else actual_n
+    N = actual_N
+    pad_n = (
+        os.getenv("VLLM_MQA_CUDA_V7_PAD_N", "0") == "1"
+        and N >= 32768
+        and N % 128 != 0
+    )
+    if pad_n:
+        padded_N = ((N + 127) // 128) * 128
+        if k_bf16.shape[0] >= padded_N:
+            N = padded_N
+        else:
+            pad_n = False
+    if logits_out is None:
+        logits = torch.empty((M, N), dtype=torch.float32, device=q_bf16.device)
+    else:
+        logits = logits_out[:M, :N]
+        if logits.shape != (M, N):
+            raise RuntimeError(
+                f"logits_out is too small for M={M}, N={N}: {logits_out.shape}"
+            )
+
+    try:
+        if not q_bf16.is_cuda:
+            raise RuntimeError("q_bf16 is not a CUDA tensor")
+        if q_bf16.dtype != torch.bfloat16 or k_bf16.dtype != torch.bfloat16:
+            raise RuntimeError(
+                "fp8_mqa_logits_cuda_v7_bf16_qk requires CUDA bf16 q/k"
+            )
+        from vllm import _custom_ops as _custom_ops  # noqa: F401
+
+        torch.ops._C.fp8_mqa_logits_cuda_v7_bf16_qk(
+            q_bf16,
+            k_bf16[:N],
+            weights,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            logits,
+        )
+        if pad_n:
+            return logits[:, :actual_N]
+        return logits
+    except Exception as err:
+        if not fallback:
+            raise
+        raise RuntimeError(
+            "fp8_mqa_logits_cuda_v7_bf16_qk has no lossless fallback without "
+            "the original FP8 Q/K/scales"
+        ) from err
+
+
 def _fp8_mqa_logits_cuda_op(
     op_name: str,
     q: torch.Tensor,
@@ -501,6 +663,16 @@ def _fp8_mqa_logits_cuda_op(
 
     M = q.shape[0]
     N = k_fp8.shape[0]
+    actual_N = N
+    pad_n = (
+        op_name == "fp8_mqa_logits_cuda_v7"
+        and os.getenv("VLLM_MQA_CUDA_V7_PAD_N", "0") == "1"
+        and N >= 32768
+        and N % 128 != 0
+    )
+    if pad_n:
+        padded_N = ((N + 127) // 128) * 128
+        N = padded_N
     logits = torch.empty(
         (M, N),
         dtype=torch.float32,
@@ -529,6 +701,8 @@ def _fp8_mqa_logits_cuda_op(
             cu_seqlen_ke,
             logits,
         )
+        if pad_n:
+            return logits[:, :actual_N]
         return logits
     except Exception as err:
         if not fallback:

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import dataclass
 
 import torch
@@ -85,6 +86,7 @@ def split_indexer_prefill_chunks(
     chunks: list[tuple[slice, slice]] = []
     n = len(seq_lens_cpu)
     max_logits_elems = max_logits_bytes // 4
+    active_split_cap = int(os.getenv("SPEED_UP_V7_ACTIVE_SPLIT_CAP", "0") or "0")
     end = 0
 
     while end < n:
@@ -106,10 +108,30 @@ def split_indexer_prefill_chunks(
             end += 1
 
         req_slice = slice(start + request_offset, end + request_offset)
-        max_q = max(1, max_logits_elems // chunk_n) if chunk_n > 0 else chunk_m
-        for q_off in range(0, chunk_m, max_q):
-            sub_m = min(max_q, chunk_m - q_off)
-            chunks.append((req_slice, slice(q_off, q_off + sub_m)))
+        if active_split_cap > 0 and end == start + 1 and chunk_n > 0:
+            q_off = 0
+            # For a single long request, selected query tokens are end-aligned
+            # in the sequence. Use the max active KV length of each subchunk
+            # for the logits budget, but cap M to avoid very large early tiles.
+            while q_off < chunk_m:
+                hi = min(active_split_cap, chunk_m - q_off)
+                lo = 1
+                best = 1
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    active_n = chunk_n - chunk_m + q_off + mid
+                    if mid * max(1, active_n) <= max_logits_elems:
+                        best = mid
+                        lo = mid + 1
+                    else:
+                        hi = mid - 1
+                chunks.append((req_slice, slice(q_off, q_off + best)))
+                q_off += best
+        else:
+            max_q = max(1, max_logits_elems // chunk_n) if chunk_n > 0 else chunk_m
+            for q_off in range(0, chunk_m, max_q):
+                sub_m = min(max_q, chunk_m - q_off)
+                chunks.append((req_slice, slice(q_off, q_off + sub_m)))
 
     return chunks
 
@@ -162,6 +184,7 @@ class DeepseekV32IndexerPrefillChunkMetadata:
     cu_seq_lens: torch.Tensor
     token_to_seq: torch.Tensor
     total_seq_lens: int
+    active_seq_lens: int
     token_start: int
     token_end: int
     num_reqs: int
@@ -214,8 +237,8 @@ class DeepseekV32IndexerMetadata:
 
 
 # TODO (zyongye) optimize this, this is now vibe coded
-def kv_spans_from_batches(
-    start_seq_loc: torch.Tensor, seq_len_per_batch: torch.Tensor, device: torch.device
+def kv_spans_from_batches_cpu(
+    start_seq_loc: torch.Tensor, seq_len_per_batch: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Args:
@@ -250,15 +273,17 @@ def kv_spans_from_batches(
 
     if N == 0:
         return (
-            torch.empty(0, dtype=torch.long, device=device),
-            torch.empty(0, dtype=torch.long, device=device),
+            torch.empty(0, dtype=torch.long, device=q.device),
+            torch.empty(0, dtype=torch.long, device=q.device),
         )
 
     # KV start offsets per batch in the concatenated KV cache
     kv_starts_per_batch = torch.cumsum(L, dim=0) - L  # [B]
 
     # For each selected token, which batch does it belong to?
-    batch_id = torch.repeat_interleave(torch.arange(B), counts)  # [N]
+    batch_id = torch.repeat_interleave(
+        torch.arange(B, device=q.device), counts
+    )  # [N]
 
     # Map batch KV start to each token
     start_tensor = kv_starts_per_batch[batch_id]  # [N]
@@ -269,13 +294,24 @@ def kv_spans_from_batches(
     m_expand = torch.repeat_interleave(counts, counts)  # [N]
     # position within the selected block: 1..counts[b]
     pos_within = (
-        torch.arange(N, dtype=torch.long) - torch.repeat_interleave(q[:-1], counts) + 1
+        torch.arange(N, dtype=torch.long, device=q.device)
+        - torch.repeat_interleave(q[:-1], counts)
+        + 1
     )
 
     local_pos = L_expand - m_expand + pos_within  # [N], 1-based
     end_location = start_tensor + local_pos  # exclusive end
 
-    return start_tensor.int().to(device), end_location.int().to(device)
+    return start_tensor.int(), end_location.int()
+
+
+def kv_spans_from_batches(
+    start_seq_loc: torch.Tensor, seq_len_per_batch: torch.Tensor, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    start_tensor, end_location = kv_spans_from_batches_cpu(
+        start_seq_loc, seq_len_per_batch
+    )
+    return start_tensor.to(device), end_location.to(device)
 
 
 def get_max_prefill_buffer_size(vllm_config: VllmConfig):
@@ -380,11 +416,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             query_start_loc_cpu[req_slice.start : req_slice.stop + 1]
             - query_start_loc_cpu[req_slice.start]
         )
-        cu_seqlen_ks, cu_seqlen_ke = kv_spans_from_batches(
-            prefill_query_start_loc, seq_lens_cpu[req_slice], self.device
+        cu_seqlen_ks_cpu, cu_seqlen_ke_cpu = kv_spans_from_batches_cpu(
+            prefill_query_start_loc, seq_lens_cpu[req_slice]
         )
+        active_seq_lens = int(cu_seqlen_ke_cpu[query_slice].max().item())
         token_start = query_start_loc_cpu[req_slice.start].item()
-        total_seq_lens = seq_lens_cpu[req_slice].sum()
+        total_seq_lens = int(seq_lens_cpu[req_slice].sum().item())
         num_reqs = req_slice.stop - req_slice.start
         seq_idx = torch.arange(0, num_reqs, dtype=torch.int32)
         token_to_seq = torch.repeat_interleave(seq_idx, seq_lens_cpu[req_slice]).to(
@@ -403,11 +440,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         )
 
         return DeepseekV32IndexerPrefillChunkMetadata(
-            cu_seqlen_ks=cu_seqlen_ks[query_slice],
-            cu_seqlen_ke=cu_seqlen_ke[query_slice],
+            cu_seqlen_ks=cu_seqlen_ks_cpu[query_slice].to(self.device),
+            cu_seqlen_ke=cu_seqlen_ke_cpu[query_slice].to(self.device),
             cu_seq_lens=cu_seq_lens,
             token_to_seq=token_to_seq,
             total_seq_lens=total_seq_lens,
+            active_seq_lens=active_seq_lens,
             block_table=block_table[req_slice],
             token_start=token_start + query_slice.start,
             token_end=token_start + query_slice.stop,

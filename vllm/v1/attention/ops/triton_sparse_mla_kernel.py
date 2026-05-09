@@ -22,7 +22,7 @@ _BLOCK_DPE = 64
 _BLOCK_DV = 512
 _DIM_QK = _BLOCK_DMODEL + _BLOCK_DPE  # 576
 
-_BLOCK_H = 32
+_BLOCK_H = int(os.getenv("VLLM_SPARSE_MLA_BLOCK_H", "32"))
 # Smallest BLOCK_N the autotune sweep offers; only used for the topk-divisibility
 # check at dispatch time.
 _MIN_BLOCK_N = 16
@@ -47,11 +47,33 @@ _NUM_MERGE_DV_TILES = _BLOCK_DV // _MERGE_BLOCK_DV_TILE
 #     split count we tested.
 # Each kernel only ever runs in its own regime (see `_choose_num_kv_splits`),
 # so we can tune each independently.
-_FINAL_AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK_N": 16}, num_warps=nw, num_stages=ns)
-    for nw in (2, 4)
-    for ns in (2, 4)
-]
+def _get_final_autotune_configs() -> list[triton.Config]:
+    forced_config = os.getenv("VLLM_SPARSE_MLA_FINAL_CONFIG")
+    if forced_config:
+        block_n, num_warps, num_stages = (
+            int(part) for part in forced_config.split(",")
+        )
+        return [
+            triton.Config(
+                {"BLOCK_N": block_n},
+                num_warps=num_warps,
+                num_stages=num_stages,
+            )
+        ]
+    if os.getenv("VLLM_SPARSE_MLA_FINAL_FAST_SWEEP", "0") == "1":
+        return [
+            triton.Config({"BLOCK_N": 16}, num_warps=4, num_stages=4),
+            triton.Config({"BLOCK_N": 32}, num_warps=4, num_stages=1),
+        ]
+    return [
+        triton.Config({"BLOCK_N": bn}, num_warps=nw, num_stages=ns)
+        for bn in (16, 32)
+        for nw in (1, 2, 4)
+        for ns in (1, 2, 4)
+    ]
+
+
+_FINAL_AUTOTUNE_CONFIGS = _get_final_autotune_configs()
 _SPLIT_AUTOTUNE_CONFIGS = [
     triton.Config({"BLOCK_N": 32}, num_warps=4, num_stages=ns) for ns in (2, 4)
 ]
@@ -180,7 +202,10 @@ def _sparse_mla_compute_tile(
     return acc, e_max, e_sum
 
 
-@triton.autotune(configs=_FINAL_AUTOTUNE_CONFIGS, key=["index_topk", "kv_group_num"])
+@triton.autotune(
+    configs=_FINAL_AUTOTUNE_CONFIGS,
+    key=["num_tokens", "index_topk", "kv_group_num"],
+)
 @triton.jit
 def _sparse_mla_kernel_final(
     q_buffer,
@@ -189,6 +214,7 @@ def _sparse_mla_kernel_final(
     out_ptr,
     seq_kv,
     h_q,
+    num_tokens: tl.constexpr,
     stride_q_token,
     stride_q_head,
     stride_kv_token,
@@ -241,6 +267,78 @@ def _sparse_mla_kernel_final(
     )
 
     # Guard against queries with zero valid KV (e_sum == 0 → NaN from 0/0).
+    e_sum_safe = tl.where(e_sum > 0, e_sum, 1.0)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    tl.store(
+        out_ptr
+        + cur_q * stride_out_token
+        + cur_head[:, None] * stride_out_head
+        + offs_dv[None, :],
+        (acc / e_sum_safe[:, None]).to(tl.bfloat16),
+        mask=mask_h[:, None],
+    )
+
+
+@triton.jit
+def _sparse_mla_kernel_final_static(
+    q_buffer,
+    k_buffer,
+    indices_ptr,
+    out_ptr,
+    seq_kv,
+    h_q,
+    num_tokens: tl.constexpr,
+    stride_q_token,
+    stride_q_head,
+    stride_kv_token,
+    stride_kv_head,
+    stride_out_token,
+    stride_out_head,
+    stride_indices_token,
+    stride_indices_head,
+    sm_scale,
+    index_topk: tl.constexpr,
+    kv_group_num: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DPE: tl.constexpr,
+):
+    """Single-pass final kernel with caller-selected static launch config."""
+    cur_q = tl.program_id(0)
+    cur_head_id = tl.program_id(1)
+    cur_kv_head_id = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
+
+    VALID_BLOCK_H: tl.constexpr = BLOCK_H if kv_group_num > BLOCK_H else kv_group_num
+    cur_head = cur_head_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = (cur_head < (cur_head_id + 1) * VALID_BLOCK_H) & (cur_head < h_q)
+
+    acc, e_max, e_sum = _sparse_mla_compute_tile(
+        q_buffer,
+        k_buffer,
+        indices_ptr,
+        cur_q,
+        cur_head,
+        cur_kv_head_id,
+        mask_h,
+        0,
+        index_topk,
+        seq_kv,
+        stride_q_token,
+        stride_q_head,
+        stride_kv_token,
+        stride_kv_head,
+        stride_indices_token,
+        stride_indices_head,
+        sm_scale,
+        BLOCK_H,
+        BLOCK_N,
+        BLOCK_DV,
+        BLOCK_DMODEL,
+        BLOCK_DPE,
+    )
+
     e_sum_safe = tl.where(e_sum > 0, e_sum, 1.0)
     offs_dv = tl.arange(0, BLOCK_DV)
     tl.store(
@@ -502,6 +600,39 @@ def triton_sparse_mla_attention(
     )
 
     if num_kv_splits == 1:
+        if os.getenv("VLLM_SPARSE_MLA_FINAL_STATIC_BY_TOKENS", "0") == "1":
+            if num_tokens >= 4096:
+                block_n, num_warps, num_stages = 16, 4, 4
+            else:
+                block_n, num_warps, num_stages = 32, 4, 1
+            _sparse_mla_kernel_final_static[(num_tokens, num_head_groups)](
+                q_buffer=q,
+                k_buffer=kv,
+                indices_ptr=indices,
+                out_ptr=out,
+                seq_kv=kv.shape[0],
+                h_q=num_heads_q,
+                num_tokens=num_tokens,
+                stride_q_token=q.stride(0),
+                stride_q_head=q.stride(1),
+                stride_kv_token=kv.stride(0),
+                stride_kv_head=kv.stride(1),
+                stride_out_token=out.stride(0),
+                stride_out_head=out.stride(1),
+                stride_indices_token=indices.stride(0),
+                stride_indices_head=indices.stride(1),
+                sm_scale=sm_scale * LOG2E,
+                index_topk=index_topk,
+                kv_group_num=kv_group_num,
+                BLOCK_H=_BLOCK_H,
+                BLOCK_N=block_n,
+                BLOCK_DV=_BLOCK_DV,
+                BLOCK_DMODEL=_BLOCK_DMODEL,
+                BLOCK_DPE=_BLOCK_DPE,
+                num_warps=num_warps,
+                num_stages=num_stages,
+            )
+            return out
         _sparse_mla_kernel_final[(num_tokens, num_head_groups)](
             q_buffer=q,
             k_buffer=kv,
@@ -509,6 +640,7 @@ def triton_sparse_mla_attention(
             out_ptr=out,
             seq_kv=kv.shape[0],
             h_q=num_heads_q,
+            num_tokens=num_tokens,
             stride_q_token=q.stride(0),
             stride_q_head=q.stride(1),
             stride_kv_token=kv.stride(0),
