@@ -23,6 +23,7 @@ from vllm.v1.attention.ops.mqa_logits_triton import (
     warmup_fp8_paged_mqa_logits_triton,
 )
 from vllm.v1.attention.ops.triton_sparse_mla_kernel import (
+    _BLOCK_DV,
     _DIM_QK,
     KV_SPLITS_CANDIDATES,
     triton_sparse_mla_attention,
@@ -129,6 +130,70 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
             -1, 1, kv_c_and_k_pe_cache.shape[-1]
         )
         topk_indices = topk_indices.view(num_tokens, 1, -1)
+        if (
+            os.getenv("VLLM_SPARSE_MLA_ASSUME_VALID_DYNAMIC", "0") == "1"
+            and attn_metadata.num_reqs == 1
+        ):
+            full_topk_start = attn_metadata.full_topk_start
+            if full_topk_start <= 0:
+                output = triton_sparse_mla_attention(
+                    q,
+                    kv_c_and_k_pe_cache,
+                    topk_indices,
+                    sm_scale=self.softmax_scale,
+                    sm_count=self._sm_count,
+                    assume_valid_indices=True,
+                )
+                return output[:, : self.num_heads, :]
+            if full_topk_start < num_tokens:
+                output = triton_sparse_mla_attention(
+                    q,
+                    kv_c_and_k_pe_cache,
+                    topk_indices,
+                    sm_scale=self.softmax_scale,
+                    sm_count=self._sm_count,
+                    valid_index_base_seq_len=attn_metadata.base_seq_len,
+                )
+                return output[:, : self.num_heads, :]
+        if (
+            os.getenv("VLLM_SPARSE_MLA_ASSUME_VALID_SPLIT", "0") == "1"
+            and attn_metadata.num_reqs == 1
+        ):
+            full_topk_start = attn_metadata.full_topk_start
+            if full_topk_start <= 0:
+                output = triton_sparse_mla_attention(
+                    q,
+                    kv_c_and_k_pe_cache,
+                    topk_indices,
+                    sm_scale=self.softmax_scale,
+                    sm_count=self._sm_count,
+                    assume_valid_indices=True,
+                )
+                return output[:, : self.num_heads, :]
+            if full_topk_start < num_tokens:
+                output = torch.empty(
+                    (num_tokens, self.num_heads, _BLOCK_DV),
+                    dtype=torch.bfloat16,
+                    device=q.device,
+                )
+                triton_sparse_mla_attention(
+                    q[:full_topk_start],
+                    kv_c_and_k_pe_cache,
+                    topk_indices[:full_topk_start],
+                    sm_scale=self.softmax_scale,
+                    sm_count=self._sm_count,
+                    out=output[:full_topk_start],
+                )
+                triton_sparse_mla_attention(
+                    q[full_topk_start:],
+                    kv_c_and_k_pe_cache,
+                    topk_indices[full_topk_start:],
+                    sm_scale=self.softmax_scale,
+                    sm_count=self._sm_count,
+                    out=output[full_topk_start:],
+                    assume_valid_indices=True,
+                )
+                return output[:, : self.num_heads, :]
         output = triton_sparse_mla_attention(
             q,
             kv_c_and_k_pe_cache,

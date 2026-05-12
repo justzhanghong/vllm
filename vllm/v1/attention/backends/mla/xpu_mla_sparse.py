@@ -96,6 +96,8 @@ class XPUMLASparseMetadata(AttentionMetadata):
 
     block_size: int = 1
     topk_tokens: int = 2048
+    full_topk_start: int = 0
+    base_seq_len: int = 0
 
 
 @dataclass
@@ -154,6 +156,18 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
         )
 
         req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
+        full_topk_start = 0
+        base_seq_len = 0
+        if common_attn_metadata.num_reqs == 1 and common_attn_metadata.causal:
+            query_len = int(starts[1] - starts[0])
+            # For single-request chunked prefill, max_seq_len is the sequence
+            # length after scheduling this chunk. The token at local row i has
+            # context length (base_seq_len + i + 1).
+            base_seq_len = int(common_attn_metadata.max_seq_len) - query_len
+            full_topk_start = max(
+                0,
+                min(query_len, self.topk_tokens - base_seq_len - 1),
+            )
 
         metadata = XPUMLASparseMetadata(
             num_reqs=common_attn_metadata.num_reqs,
@@ -166,6 +180,8 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
             req_id_per_token=req_id_per_token,
             block_size=self.kv_cache_spec.block_size,
             topk_tokens=self.topk_tokens,
+            full_topk_start=full_topk_start,
+            base_seq_len=base_seq_len,
         )
         return metadata
 

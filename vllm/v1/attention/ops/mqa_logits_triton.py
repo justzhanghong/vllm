@@ -536,6 +536,13 @@ def _mqa_bf16_fused_logits_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    ROW_START_ZERO: tl.constexpr,
+    ROW_END_CONTIGUOUS: tl.constexpr,
+    ROW_END_BASE: tl.constexpr,
+    FAST_FULL_TILE: tl.constexpr,
+    FAST_INVALID_TILE: tl.constexpr,
+    SKIP_INVALID_STORE: tl.constexpr,
+    REUSE_K_TILE: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -546,7 +553,27 @@ def _mqa_bf16_fused_logits_kernel(
     mask_n = offs_n < N
     mask_d = offs_d < D
 
+    if FAST_INVALID_TILE and ROW_START_ZERO and ROW_END_CONTIGUOUS:
+        block_n_start = pid_n * BLOCK_N
+        max_row_end = (
+            ROW_END_BASE + tl.minimum((pid_m + 1) * BLOCK_M, M) - 1
+        )
+        if block_n_start >= max_row_end:
+            if not SKIP_INVALID_STORE:
+                tl.store(
+                    out_ptr + offs_m[:, None] * stride_out_m + offs_n[None, :],
+                    float("-inf"),
+                    mask=mask_m[:, None] & mask_n[None, :],
+                )
+            return
+
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    if REUSE_K_TILE:
+        k_reuse = tl.load(
+            k_ptr + offs_n[:, None] * stride_k_n + offs_d[None, :],
+            mask=mask_n[:, None] & mask_d[None, :],
+            other=0.0,
+        )
     for h in tl.static_range(0, H):
         q = tl.load(
             q_ptr
@@ -556,11 +583,14 @@ def _mqa_bf16_fused_logits_kernel(
             mask=mask_m[:, None] & mask_d[None, :],
             other=0.0,
         )
-        k = tl.load(
-            k_ptr + offs_n[:, None] * stride_k_n + offs_d[None, :],
-            mask=mask_n[:, None] & mask_d[None, :],
-            other=0.0,
-        )
+        if REUSE_K_TILE:
+            k = k_reuse
+        else:
+            k = tl.load(
+                k_ptr + offs_n[:, None] * stride_k_n + offs_d[None, :],
+                mask=mask_n[:, None] & mask_d[None, :],
+                other=0.0,
+            )
         s = tl.dot(q, tl.trans(k), out_dtype=tl.float32)
         weight = tl.load(
             w_ptr + offs_m * stride_w_m + h,
@@ -569,14 +599,33 @@ def _mqa_bf16_fused_logits_kernel(
         )
         acc += tl.maximum(s, 0.0) * weight[:, None]
 
-    row_start = tl.load(ks_ptr + offs_m, mask=mask_m, other=0)
-    row_end = tl.load(ke_ptr + offs_m, mask=mask_m, other=0)
-    valid = (
-        mask_m[:, None]
-        & mask_n[None, :]
-        & (offs_n[None, :] >= row_start[:, None])
-        & (offs_n[None, :] < row_end[:, None])
-    )
+    if FAST_FULL_TILE and ROW_START_ZERO and ROW_END_CONTIGUOUS:
+        block_n_end = (pid_n + 1) * BLOCK_N
+        block_min_row_end = ROW_END_BASE + pid_m * BLOCK_M
+        if block_n_end <= block_min_row_end:
+            tl.store(
+                out_ptr + offs_m[:, None] * stride_out_m + offs_n[None, :],
+                acc,
+                mask=mask_m[:, None] & mask_n[None, :],
+            )
+            return
+
+    if ROW_END_CONTIGUOUS:
+        row_end = ROW_END_BASE + offs_m
+    else:
+        row_end = tl.load(ke_ptr + offs_m, mask=mask_m, other=0)
+    if ROW_START_ZERO:
+        valid = mask_m[:, None] & mask_n[None, :] & (
+            offs_n[None, :] < row_end[:, None]
+        )
+    else:
+        row_start = tl.load(ks_ptr + offs_m, mask=mask_m, other=0)
+        valid = (
+            mask_m[:, None]
+            & mask_n[None, :]
+            & (offs_n[None, :] >= row_start[:, None])
+            & (offs_n[None, :] < row_end[:, None])
+        )
     acc = tl.where(valid, acc, float("-inf"))
     tl.store(
         out_ptr + offs_m[:, None] * stride_out_m + offs_n[None, :],
@@ -596,6 +645,8 @@ def fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton(
     logits_out: torch.Tensor | None = None,
     block_m: int | None = None,
     block_n: int | None = None,
+    row_start_zero: bool = False,
+    row_end_base: int | None = None,
 ) -> torch.Tensor:
     """Exact fused Triton logits path for pre-dequantized BF16 Q and K."""
     M = q_bf16.shape[1]
@@ -624,6 +675,18 @@ def fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton(
     block_n = block_n or int(
         os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_BLOCK_N", "128")
     )
+    fast_full_tile = (
+        os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_FAST_FULL_TILE", "0") == "1"
+    )
+    fast_invalid_tile = (
+        os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_FAST_INVALID_TILE", "0") == "1"
+    )
+    skip_invalid_store = (
+        os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_SKIP_INVALID_STORE", "0") == "1"
+    )
+    reuse_k_tile = (
+        os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_REUSE_K_TILE", "0") == "1"
+    )
     H, _, D = q_bf16.shape
     grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
     _mqa_bf16_fused_logits_kernel[grid](
@@ -645,6 +708,13 @@ def fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_D=triton.next_power_of_2(D),
+        ROW_START_ZERO=row_start_zero,
+        ROW_END_CONTIGUOUS=row_end_base is not None,
+        ROW_END_BASE=0 if row_end_base is None else row_end_base,
+        FAST_FULL_TILE=fast_full_tile,
+        FAST_INVALID_TILE=fast_invalid_tile,
+        SKIP_INVALID_STORE=skip_invalid_store,
+        REUSE_K_TILE=reuse_k_tile,
         num_warps=4,
         num_stages=3,
     )
@@ -661,6 +731,8 @@ def fp8_mqa_logits_cuda_v7_fused_triton(
     actual_n: int | None = None,
     q_bf16_out: torch.Tensor | None = None,
     logits_out: torch.Tensor | None = None,
+    row_start_zero: bool = False,
+    row_end_base: int | None = None,
     fallback: bool = True,
 ) -> torch.Tensor:
     """Exact fused Triton logits path that reuses a pre-dequantized BF16 K."""
@@ -691,6 +763,8 @@ def fp8_mqa_logits_cuda_v7_fused_triton(
             cu_seqlen_ke,
             actual_n=actual_n,
             logits_out=logits_out,
+            row_start_zero=row_start_zero,
+            row_end_base=row_end_base,
         )
     except Exception as err:
         if not fallback:

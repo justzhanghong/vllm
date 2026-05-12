@@ -89,6 +89,28 @@ _MIN_TOPK_PER_SPLIT = 128  # below this, per-split work is too small to amortize
 _SPLIT_MAX_OCCUPANCY = 4  # skip split when baseline grid fills >=1/4 of SMs
 
 
+def _parse_final_static_config(env_name: str, default: str) -> tuple[int, int, int]:
+    config = os.getenv(env_name, default)
+    block_n, num_warps, num_stages = (int(part) for part in config.split(","))
+    return block_n, num_warps, num_stages
+
+
+def _choose_dynamic_final_static_config(num_tokens: int) -> tuple[int, int, int]:
+    small_m = int(os.getenv("VLLM_SPARSE_MLA_FINAL_DYNAMIC_SMALL_M", "1024"))
+    large_m = int(os.getenv("VLLM_SPARSE_MLA_FINAL_DYNAMIC_LARGE_M", "4096"))
+    if num_tokens < small_m:
+        return _parse_final_static_config(
+            "VLLM_SPARSE_MLA_FINAL_DYNAMIC_SMALL_CONFIG", "16,2,4"
+        )
+    if num_tokens >= large_m:
+        return _parse_final_static_config(
+            "VLLM_SPARSE_MLA_FINAL_DYNAMIC_LARGE_CONFIG", "16,2,2"
+        )
+    return _parse_final_static_config(
+        "VLLM_SPARSE_MLA_FINAL_DYNAMIC_MID_CONFIG", "16,2,1"
+    )
+
+
 @triton.jit
 def _sparse_mla_compute_tile(
     q_buffer,
@@ -113,30 +135,49 @@ def _sparse_mla_compute_tile(
     BLOCK_DV: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DPE: tl.constexpr,
+    REUSE_K_AS_V: tl.constexpr,
+    FULL_BLOCK_H: tl.constexpr,
+    ASSUME_VALID_INDICES: tl.constexpr,
+    ASSUME_VALID_AFTER_TOPK: tl.constexpr,
+    VALID_INDEX_BASE_SEQ_LEN: tl.constexpr,
+    INDEX_TOPK: tl.constexpr,
 ):
     """Shared stage-1 body: load Q, run the sparse online-softmax loop over
     `[split_start, split_end)` of the topk axis, return accumulators."""
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
     offs_dv = tl.arange(0, BLOCK_DV)
-    mask_dpe = offs_dpe < BLOCK_DMODEL + BLOCK_DPE
 
-    q = tl.load(
-        q_buffer
-        + cur_q * stride_q_token
-        + cur_head[:, None] * stride_q_head
-        + offs_d[None, :],
-        mask=mask_h[:, None],
-        other=0.0,
-    )
-    qpe = tl.load(
-        q_buffer
-        + cur_q * stride_q_token
-        + cur_head[:, None] * stride_q_head
-        + offs_dpe[None, :],
-        mask=(mask_h[:, None]) & (mask_dpe[None, :]),
-        other=0.0,
-    )
+    if FULL_BLOCK_H:
+        q = tl.load(
+            q_buffer
+            + cur_q * stride_q_token
+            + cur_head[:, None] * stride_q_head
+            + offs_d[None, :],
+        )
+        qpe = tl.load(
+            q_buffer
+            + cur_q * stride_q_token
+            + cur_head[:, None] * stride_q_head
+            + offs_dpe[None, :],
+        )
+    else:
+        q = tl.load(
+            q_buffer
+            + cur_q * stride_q_token
+            + cur_head[:, None] * stride_q_head
+            + offs_d[None, :],
+            mask=mask_h[:, None],
+            other=0.0,
+        )
+        qpe = tl.load(
+            q_buffer
+            + cur_q * stride_q_token
+            + cur_head[:, None] * stride_q_head
+            + offs_dpe[None, :],
+            mask=mask_h[:, None],
+            other=0.0,
+        )
 
     # Large negative but finite sentinel for masked-out positions. `-inf`
     # would give `-inf - -inf = NaN` when a whole BLOCK_N tile is masked
@@ -159,14 +200,25 @@ def _sparse_mla_compute_tile(
             mask=mask_indice,
             other=-1,
         )
-        mask_kv = (indices >= 0) & (indices < seq_kv)
+        if ASSUME_VALID_INDICES:
+            mask_kv = mask_indice
+        elif ASSUME_VALID_AFTER_TOPK and (
+            VALID_INDEX_BASE_SEQ_LEN + cur_q + 1 >= INDEX_TOPK
+        ):
+            mask_kv = mask_indice
+        else:
+            mask_kv = (indices >= 0) & (indices < seq_kv)
 
         offs_k = (
             indices[None, :] * stride_kv_token
             + cur_kv_head_id * stride_kv_head
             + offs_d[:, None]
         )
-        k = tl.load(k_buffer + offs_k, mask=mask_kv[None, :], other=0.0)
+        k = tl.load(
+            k_buffer + offs_k,
+            mask=mask_kv[None, :],
+            other=0.0,
+        )
         qk = tl.dot(q, k.to(q.dtype))
 
         offs_kpe = (
@@ -176,20 +228,26 @@ def _sparse_mla_compute_tile(
         )
         kpe = tl.load(
             k_buffer + offs_kpe,
-            mask=(mask_kv[None, :]) & (mask_dpe[:, None]),
+            mask=mask_kv[None, :],
             other=0.0,
         )
         qk += tl.dot(qpe, kpe.to(q.dtype))
 
         qk *= sm_scale
-        qk = tl.where((mask_h[:, None]) & (mask_kv[None, :]), qk, NEG_LARGE)
+        if FULL_BLOCK_H:
+            qk = tl.where(mask_kv[None, :], qk, NEG_LARGE)
+        else:
+            qk = tl.where((mask_h[:, None]) & (mask_kv[None, :]), qk, NEG_LARGE)
 
-        offs_v = (
-            indices[:, None] * stride_kv_token
-            + cur_kv_head_id * stride_kv_head
-            + offs_dv[None, :]
-        )
-        v = tl.load(k_buffer + offs_v, mask=mask_kv[:, None], other=0.0)
+        if REUSE_K_AS_V:
+            v = tl.trans(k)
+        else:
+            offs_v = (
+                indices[:, None] * stride_kv_token
+                + cur_kv_head_id * stride_kv_head
+                + offs_dv[None, :]
+            )
+            v = tl.load(k_buffer + offs_v, mask=mask_kv[:, None], other=0.0)
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
         re_scale = tl.exp2(e_max - n_e_max)
@@ -231,6 +289,11 @@ def _sparse_mla_kernel_final(
     BLOCK_DV: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DPE: tl.constexpr,
+    REUSE_K_AS_V: tl.constexpr,
+    FULL_BLOCK_H: tl.constexpr,
+    ASSUME_VALID_INDICES: tl.constexpr,
+    ASSUME_VALID_AFTER_TOPK: tl.constexpr,
+    VALID_INDEX_BASE_SEQ_LEN: tl.constexpr,
 ):
     """Single-pass fast path: full topk, write final bf16 output directly."""
     cur_q = tl.program_id(0)
@@ -264,19 +327,34 @@ def _sparse_mla_kernel_final(
         BLOCK_DV,
         BLOCK_DMODEL,
         BLOCK_DPE,
+        REUSE_K_AS_V,
+        FULL_BLOCK_H,
+        ASSUME_VALID_INDICES,
+        ASSUME_VALID_AFTER_TOPK,
+        VALID_INDEX_BASE_SEQ_LEN,
+        index_topk,
     )
 
     # Guard against queries with zero valid KV (e_sum == 0 → NaN from 0/0).
     e_sum_safe = tl.where(e_sum > 0, e_sum, 1.0)
     offs_dv = tl.arange(0, BLOCK_DV)
-    tl.store(
-        out_ptr
-        + cur_q * stride_out_token
-        + cur_head[:, None] * stride_out_head
-        + offs_dv[None, :],
-        (acc / e_sum_safe[:, None]).to(tl.bfloat16),
-        mask=mask_h[:, None],
-    )
+    if FULL_BLOCK_H:
+        tl.store(
+            out_ptr
+            + cur_q * stride_out_token
+            + cur_head[:, None] * stride_out_head
+            + offs_dv[None, :],
+            (acc / e_sum_safe[:, None]).to(tl.bfloat16),
+        )
+    else:
+        tl.store(
+            out_ptr
+            + cur_q * stride_out_token
+            + cur_head[:, None] * stride_out_head
+            + offs_dv[None, :],
+            (acc / e_sum_safe[:, None]).to(tl.bfloat16),
+            mask=mask_h[:, None],
+        )
 
 
 @triton.jit
@@ -304,6 +382,11 @@ def _sparse_mla_kernel_final_static(
     BLOCK_DV: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DPE: tl.constexpr,
+    REUSE_K_AS_V: tl.constexpr,
+    FULL_BLOCK_H: tl.constexpr,
+    ASSUME_VALID_INDICES: tl.constexpr,
+    ASSUME_VALID_AFTER_TOPK: tl.constexpr,
+    VALID_INDEX_BASE_SEQ_LEN: tl.constexpr,
 ):
     """Single-pass final kernel with caller-selected static launch config."""
     cur_q = tl.program_id(0)
@@ -337,18 +420,33 @@ def _sparse_mla_kernel_final_static(
         BLOCK_DV,
         BLOCK_DMODEL,
         BLOCK_DPE,
+        REUSE_K_AS_V,
+        FULL_BLOCK_H,
+        ASSUME_VALID_INDICES,
+        ASSUME_VALID_AFTER_TOPK,
+        VALID_INDEX_BASE_SEQ_LEN,
+        index_topk,
     )
 
     e_sum_safe = tl.where(e_sum > 0, e_sum, 1.0)
     offs_dv = tl.arange(0, BLOCK_DV)
-    tl.store(
-        out_ptr
-        + cur_q * stride_out_token
-        + cur_head[:, None] * stride_out_head
-        + offs_dv[None, :],
-        (acc / e_sum_safe[:, None]).to(tl.bfloat16),
-        mask=mask_h[:, None],
-    )
+    if FULL_BLOCK_H:
+        tl.store(
+            out_ptr
+            + cur_q * stride_out_token
+            + cur_head[:, None] * stride_out_head
+            + offs_dv[None, :],
+            (acc / e_sum_safe[:, None]).to(tl.bfloat16),
+        )
+    else:
+        tl.store(
+            out_ptr
+            + cur_q * stride_out_token
+            + cur_head[:, None] * stride_out_head
+            + offs_dv[None, :],
+            (acc / e_sum_safe[:, None]).to(tl.bfloat16),
+            mask=mask_h[:, None],
+        )
 
 
 @triton.autotune(
@@ -382,6 +480,11 @@ def _sparse_mla_kernel_split(
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DPE: tl.constexpr,
     LOGE2: tl.constexpr,
+    REUSE_K_AS_V: tl.constexpr,
+    FULL_BLOCK_H: tl.constexpr,
+    ASSUME_VALID_INDICES: tl.constexpr,
+    ASSUME_VALID_AFTER_TOPK: tl.constexpr,
+    VALID_INDEX_BASE_SEQ_LEN: tl.constexpr,
 ):
     """Stage 1 of split-KV: process one slice of the topk axis and write
     its `(out_partial, lse_partial)` into the mid buffer."""
@@ -421,6 +524,12 @@ def _sparse_mla_kernel_split(
         BLOCK_DV,
         BLOCK_DMODEL,
         BLOCK_DPE,
+        REUSE_K_AS_V,
+        FULL_BLOCK_H,
+        ASSUME_VALID_INDICES,
+        ASSUME_VALID_AFTER_TOPK,
+        VALID_INDEX_BASE_SEQ_LEN,
+        index_topk,
     )
 
     # Partial output and natural-log LSE for stage-2 merge.
@@ -435,11 +544,17 @@ def _sparse_mla_kernel_split(
         + cur_head[:, None] * stride_mid_head
         + split_kv_id * stride_mid_split
     )
-    tl.store(
-        mid_base_2d + offs_dv[None, :],
-        acc / e_sum_safe[:, None],
-        mask=mask_h[:, None],
-    )
+    if FULL_BLOCK_H:
+        tl.store(
+            mid_base_2d + offs_dv[None, :],
+            acc / e_sum_safe[:, None],
+        )
+    else:
+        tl.store(
+            mid_base_2d + offs_dv[None, :],
+            acc / e_sum_safe[:, None],
+            mask=mask_h[:, None],
+        )
     mid_lse_ptr = (
         mid_out_ptr
         + cur_q * stride_mid_token
@@ -447,7 +562,10 @@ def _sparse_mla_kernel_split(
         + split_kv_id * stride_mid_split
         + BLOCK_DV
     )
-    tl.store(mid_lse_ptr, (e_max + tl.log2(e_sum)) * LOGE2, mask=mask_h)
+    if FULL_BLOCK_H:
+        tl.store(mid_lse_ptr, (e_max + tl.log2(e_sum)) * LOGE2)
+    else:
+        tl.store(mid_lse_ptr, (e_max + tl.log2(e_sum)) * LOGE2, mask=mask_h)
 
 
 @triton.jit
@@ -551,6 +669,9 @@ def triton_sparse_mla_attention(
     sm_scale: float,
     num_kv_splits: int | None = None,
     sm_count: int | None = None,
+    out: torch.Tensor | None = None,
+    assume_valid_indices: bool = False,
+    valid_index_base_seq_len: int | None = None,
 ) -> torch.Tensor:
     """Sparse MLA attention over topk indices.
 
@@ -593,13 +714,69 @@ def triton_sparse_mla_attention(
                 num_tokens, num_head_groups, index_topk, sm_count
             )
 
-    out = torch.empty(
-        (num_tokens, num_heads_q, _BLOCK_DV),
-        dtype=torch.bfloat16,
-        device=q.device,
+    if out is None:
+        out = torch.empty(
+            (num_tokens, num_heads_q, _BLOCK_DV),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+    elif out.shape != (num_tokens, num_heads_q, _BLOCK_DV):
+        raise RuntimeError(
+            "triton_sparse_mla_attention out shape mismatch: "
+            f"expected {(num_tokens, num_heads_q, _BLOCK_DV)}, got {out.shape}"
+        )
+    reuse_k_as_v = os.getenv("VLLM_SPARSE_MLA_REUSE_K_AS_V", "0") == "1"
+    full_block_h = (
+        os.getenv("VLLM_SPARSE_MLA_FULL_BLOCK_H", "0") == "1"
+        and num_heads_q % _BLOCK_H == 0
+        and kv_group_num >= _BLOCK_H
     )
+    full_block_h_max_tokens = int(
+        os.getenv("VLLM_SPARSE_MLA_FULL_BLOCK_H_MAX_TOKENS", "0")
+    )
+    if full_block_h and full_block_h_max_tokens > 0:
+        full_block_h = num_tokens <= full_block_h_max_tokens
 
     if num_kv_splits == 1:
+        if os.getenv("VLLM_SPARSE_MLA_FINAL_DYNAMIC_CONFIG", "0") == "1":
+            block_n, num_warps, num_stages = _choose_dynamic_final_static_config(
+                num_tokens
+            )
+            _sparse_mla_kernel_final_static[(num_tokens, num_head_groups)](
+                q_buffer=q,
+                k_buffer=kv,
+                indices_ptr=indices,
+                out_ptr=out,
+                seq_kv=kv.shape[0],
+                h_q=num_heads_q,
+                num_tokens=num_tokens,
+                stride_q_token=q.stride(0),
+                stride_q_head=q.stride(1),
+                stride_kv_token=kv.stride(0),
+                stride_kv_head=kv.stride(1),
+                stride_out_token=out.stride(0),
+                stride_out_head=out.stride(1),
+                stride_indices_token=indices.stride(0),
+                stride_indices_head=indices.stride(1),
+                sm_scale=sm_scale * LOG2E,
+                index_topk=index_topk,
+                kv_group_num=kv_group_num,
+                BLOCK_H=_BLOCK_H,
+                BLOCK_N=block_n,
+                BLOCK_DV=_BLOCK_DV,
+                BLOCK_DMODEL=_BLOCK_DMODEL,
+                BLOCK_DPE=_BLOCK_DPE,
+                REUSE_K_AS_V=reuse_k_as_v,
+                FULL_BLOCK_H=full_block_h,
+                ASSUME_VALID_INDICES=assume_valid_indices,
+                ASSUME_VALID_AFTER_TOPK=valid_index_base_seq_len is not None,
+                VALID_INDEX_BASE_SEQ_LEN=0
+                if valid_index_base_seq_len is None
+                else valid_index_base_seq_len,
+                num_warps=num_warps,
+                num_stages=num_stages,
+            )
+            return out
         if os.getenv("VLLM_SPARSE_MLA_FINAL_STATIC_BY_TOKENS", "0") == "1":
             if num_tokens >= 4096:
                 block_n, num_warps, num_stages = 16, 4, 4
@@ -629,6 +806,13 @@ def triton_sparse_mla_attention(
                 BLOCK_DV=_BLOCK_DV,
                 BLOCK_DMODEL=_BLOCK_DMODEL,
                 BLOCK_DPE=_BLOCK_DPE,
+                REUSE_K_AS_V=reuse_k_as_v,
+                FULL_BLOCK_H=full_block_h,
+                ASSUME_VALID_INDICES=assume_valid_indices,
+                ASSUME_VALID_AFTER_TOPK=valid_index_base_seq_len is not None,
+                VALID_INDEX_BASE_SEQ_LEN=0
+                if valid_index_base_seq_len is None
+                else valid_index_base_seq_len,
                 num_warps=num_warps,
                 num_stages=num_stages,
             )
@@ -656,6 +840,13 @@ def triton_sparse_mla_attention(
             BLOCK_DV=_BLOCK_DV,
             BLOCK_DMODEL=_BLOCK_DMODEL,
             BLOCK_DPE=_BLOCK_DPE,
+            REUSE_K_AS_V=reuse_k_as_v,
+            FULL_BLOCK_H=full_block_h,
+            ASSUME_VALID_INDICES=assume_valid_indices,
+            ASSUME_VALID_AFTER_TOPK=valid_index_base_seq_len is not None,
+            VALID_INDEX_BASE_SEQ_LEN=0
+            if valid_index_base_seq_len is None
+            else valid_index_base_seq_len,
         )
         return out
 
@@ -690,6 +881,11 @@ def triton_sparse_mla_attention(
         BLOCK_DMODEL=_BLOCK_DMODEL,
         BLOCK_DPE=_BLOCK_DPE,
         LOGE2=LOGE2,
+        REUSE_K_AS_V=reuse_k_as_v,
+        FULL_BLOCK_H=full_block_h,
+        ASSUME_VALID_INDICES=assume_valid_indices,
+        ASSUME_VALID_AFTER_TOPK=False,
+        VALID_INDEX_BASE_SEQ_LEN=0,
     )
 
     _sparse_mla_merge_kernel[(num_tokens, num_heads_q, _NUM_MERGE_DV_TILES)](

@@ -312,6 +312,42 @@ def sparse_attn_indexer(
                 q_chunk = q_fp8[chunk.token_start : chunk.token_end]
                 w_chunk = weights[chunk.token_start : chunk.token_end]
                 k_scales = k_scale.view(torch.float32).flatten()
+                topk_indices = topk_indices_buffer[
+                    chunk.token_start : chunk.token_end, :topk_tokens
+                ]
+                cu_seqlen_ks = chunk.cu_seqlen_ks
+                cu_seqlen_ke = chunk.cu_seqlen_ke
+                token_start = chunk.token_start
+                row_start_zero = (
+                    chunk.num_reqs == 1
+                    and os.getenv(
+                        "VLLM_MQA_CUDA_V7_FUSED_TRITON_ROW_START_ZERO", "0"
+                    )
+                    == "1"
+                    and q_chunk.shape[0]
+                    >= int(
+                        os.getenv(
+                            "VLLM_MQA_CUDA_V7_FUSED_TRITON_ROW_START_MIN_M",
+                            "0",
+                        )
+                    )
+                )
+                row_end_base = None
+                if (
+                    row_start_zero
+                    and os.getenv(
+                        "VLLM_MQA_CUDA_V7_FUSED_TRITON_ROW_END_CONTIGUOUS", "0"
+                    )
+                    == "1"
+                    and q_chunk.shape[0]
+                    >= int(
+                        os.getenv(
+                            "VLLM_MQA_CUDA_V7_FUSED_TRITON_ROW_END_MIN_M",
+                            "1024",
+                        )
+                    )
+                ):
+                    row_end_base = chunk.active_seq_lens - q_chunk.shape[0] + 1
                 if mqa_backend == "triton":
                     logger.info_once(
                         "Sparse indexer prefill MQA logits backend: Triton"
@@ -320,8 +356,8 @@ def sparse_attn_indexer(
                         q_chunk,
                         (k_fp8, k_scales),
                         w_chunk,
-                        chunk.cu_seqlen_ks,
-                        chunk.cu_seqlen_ke,
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
                     )
                 elif mqa_backend == "cuda_v5":
                     logger.info_once(
@@ -331,8 +367,8 @@ def sparse_attn_indexer(
                         q_chunk,
                         (k_fp8, k_scales),
                         w_chunk,
-                        chunk.cu_seqlen_ks,
-                        chunk.cu_seqlen_ke,
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
                         fallback=False,
                     )
                 elif mqa_backend == "cuda_v7":
@@ -354,15 +390,17 @@ def sparse_attn_indexer(
                                 logits = fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton(
                                     q_bf16_full[
                                         :,
-                                        chunk.token_start : chunk.token_end,
+                                        token_start : chunk.token_end,
                                         :,
                                     ],
                                     k_bf16_full,
                                     w_chunk,
-                                    chunk.cu_seqlen_ks,
-                                    chunk.cu_seqlen_ke,
+                                    cu_seqlen_ks,
+                                    cu_seqlen_ke,
                                     actual_n=chunk.active_seq_lens,
                                     logits_out=logits_workspace,
+                                    row_start_zero=row_start_zero,
+                                    row_end_base=row_end_base,
                                 )
                             else:
                                 q_bf16_out = None
@@ -384,11 +422,13 @@ def sparse_attn_indexer(
                                     q_chunk,
                                     k_bf16_full,
                                     w_chunk,
-                                    chunk.cu_seqlen_ks,
-                                    chunk.cu_seqlen_ke,
+                                    cu_seqlen_ks,
+                                    cu_seqlen_ke,
                                     actual_n=chunk.active_seq_lens,
                                     q_bf16_out=q_bf16_out,
                                     logits_out=logits_workspace,
+                                    row_start_zero=row_start_zero,
+                                    row_end_base=row_end_base,
                                     fallback=False,
                                 )
                         elif predequant_q:
@@ -396,13 +436,13 @@ def sparse_attn_indexer(
                             logits = fp8_mqa_logits_cuda_v7_bf16_qk(
                                 q_bf16_full[
                                     :,
-                                    chunk.token_start : chunk.token_end,
+                                    token_start : chunk.token_end,
                                     :,
                                 ],
                                 k_bf16_full,
                                 w_chunk,
-                                chunk.cu_seqlen_ks,
-                                chunk.cu_seqlen_ke,
+                                cu_seqlen_ks,
+                                cu_seqlen_ke,
                                 actual_n=chunk.active_seq_lens,
                                 logits_out=logits_workspace,
                                 fallback=False,
@@ -426,8 +466,8 @@ def sparse_attn_indexer(
                                 q_bf16,
                                 k_bf16_full,
                                 w_chunk,
-                                chunk.cu_seqlen_ks,
-                                chunk.cu_seqlen_ke,
+                                cu_seqlen_ks,
+                                cu_seqlen_ke,
                                 actual_n=chunk.active_seq_lens,
                                 logits_out=logits_workspace,
                                 fallback=False,
@@ -437,8 +477,8 @@ def sparse_attn_indexer(
                                 q_chunk,
                                 k_bf16_full,
                                 w_chunk,
-                                chunk.cu_seqlen_ks,
-                                chunk.cu_seqlen_ke,
+                                cu_seqlen_ks,
+                                cu_seqlen_ke,
                                 actual_n=chunk.active_seq_lens,
                                 logits_out=logits_workspace,
                                 fallback=False,
@@ -448,8 +488,8 @@ def sparse_attn_indexer(
                             q_chunk,
                             (k_fp8, k_scales),
                             w_chunk,
-                            chunk.cu_seqlen_ks,
-                            chunk.cu_seqlen_ke,
+                            cu_seqlen_ks,
+                            cu_seqlen_ke,
                             fallback=False,
                         )
                 else:
@@ -460,15 +500,11 @@ def sparse_attn_indexer(
                         q_chunk,
                         (k_fp8, k_scales),
                         w_chunk,
-                        chunk.cu_seqlen_ks,
-                        chunk.cu_seqlen_ke,
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
                         fallback=mqa_backend == "auto",
                     )
             num_rows = logits.shape[0]
-
-            topk_indices = topk_indices_buffer[
-                chunk.token_start : chunk.token_end, :topk_tokens
-            ]
 
             if (
                 current_platform.is_cuda()
@@ -479,7 +515,7 @@ def sparse_attn_indexer(
                 torch.ops._C.top_k_per_row_decode(
                     logits,
                     1,
-                    chunk.cu_seqlen_ke,
+                    cu_seqlen_ke,
                     topk_indices,
                     num_rows,
                     logits.stride(0),
@@ -497,7 +533,7 @@ def sparse_attn_indexer(
                 )
                 torch.ops._C.persistent_topk(
                     logits,
-                    chunk.cu_seqlen_ke,
+                    cu_seqlen_ke,
                     topk_indices,
                     topk_workspace,
                     topk_tokens,
@@ -506,8 +542,8 @@ def sparse_attn_indexer(
             elif current_platform.is_xpu():
                 xpu_ops.top_k_per_row_prefill(  # type: ignore[attr-defined]
                     logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
+                    cu_seqlen_ks,
+                    cu_seqlen_ke,
                     topk_indices,
                     num_rows,
                     logits.stride(0),
@@ -517,15 +553,14 @@ def sparse_attn_indexer(
             else:
                 torch.ops._C.top_k_per_row_prefill(
                     logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
+                    cu_seqlen_ks,
+                    cu_seqlen_ke,
                     topk_indices,
                     num_rows,
                     logits.stride(0),
                     logits.stride(1),
                     topk_tokens,
                 )
-
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
         assert decode_metadata is not None
@@ -612,7 +647,6 @@ def sparse_attn_indexer(
                     logits.stride(1),
                     topk_tokens,
                 )
-
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
             # the topk indices removing padded tokens
