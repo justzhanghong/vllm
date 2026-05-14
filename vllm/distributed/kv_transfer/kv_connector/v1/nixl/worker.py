@@ -54,6 +54,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import
 )
 from vllm.distributed.nixl_utils import NixlWrapper, nixl_agent_config
 from vllm.distributed.parallel_state import (
+    get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -187,6 +188,7 @@ class NixlConnectorWorker:
         self.engine_id: EngineId = engine_id
         self.tp_rank = get_tensor_model_parallel_rank()
         self.world_size = get_tensor_model_parallel_world_size()
+        self.pp_rank = get_pp_group().rank_in_group
 
         self.num_blocks = kv_cache_config.num_blocks
         self.enable_permute_local_kv = False
@@ -386,15 +388,19 @@ class NixlConnectorWorker:
 
         with zmq_ctx(zmq.REQ, path) as sock:
             for remote_rank in p_remote_ranks:
+                remote_metadata_rank = self.pp_rank * remote_tp_size + remote_rank
                 logger.debug(
-                    "Querying metadata on path: %s at remote tp rank %s",
+                    "Querying metadata on path: %s at remote pp/tp rank %s/%s "
+                    "(metadata rank %s)",
                     path,
+                    self.pp_rank,
                     remote_rank,
+                    remote_metadata_rank,
                 )
 
                 start_time = time.perf_counter()
                 # Send query for the request.
-                msg = msgspec.msgpack.encode((GET_META_MSG, remote_rank))
+                msg = msgspec.msgpack.encode((GET_META_MSG, remote_metadata_rank))
                 # Set receive timeout to 5 seconds to avoid hanging on dead server
                 sock.setsockopt(zmq.RCVTIMEO, 5000)  # milliseconds
                 sock.send(msg)

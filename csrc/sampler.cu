@@ -593,7 +593,8 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(
 }
 
 template <int kNumThreadsPerBlock, bool useRadixSort,
-          bool multipleBlocksPerRow = false, bool mergeBlocks = false>
+          bool multipleBlocksPerRow = false, bool mergeBlocks = false,
+          bool sortIndices = false>
 static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(
     const float* logits, const int* seqLens, int* outIndices, int stride0,
     int stride1, const int topK, int next_n, int seqLensIs2D = 0,
@@ -637,7 +638,7 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(
   logits += static_cast<int64_t>(rowIdx) * stride0;
 
   topKPerRowJob<kNumThreadsPerBlock, kNumBins, useRadixSort,
-                multipleBlocksPerRow, mergeBlocks>(
+                multipleBlocksPerRow, mergeBlocks, sortIndices>(
       indices, logits, rowStart, rowEnd, outIndices, outLogits, stride1, topK);
 }
 
@@ -698,23 +699,44 @@ void top_k_per_row_decode(const torch::Tensor& logits, int64_t next_n,
   // effective seq_len. False if seqLens is 1D (B,): all rows in a batch share
   // the same seq_len and the kernel computes the per-row offset itself.
   int seqLensIs2D = seqLens.dim() == 2 ? 1 : 0;
+  const bool sortIndices =
+      std::getenv("VLLM_TOPK_DECODE_SORT_INDICES") != nullptr &&
+      std::getenv("VLLM_TOPK_DECODE_SORT_INDICES")[0] == '1';
 
   if (numColumns < kSortingAlgorithmThreshold) {
     // Use insertion sort
-    vllm::topKPerRowDecode<kNumThreadsPerBlock, false>
-        <<<numRows, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
-            logits.data_ptr<float>(), seqLens.data_ptr<int>(),
-            indices.data_ptr<int>(), static_cast<int>(stride0),
-            static_cast<int>(stride1), static_cast<int>(topK),
-            static_cast<int>(next_n), seqLensIs2D);
+    if (sortIndices) {
+      vllm::topKPerRowDecode<kNumThreadsPerBlock, false, false, false, true>
+          <<<numRows, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
+              logits.data_ptr<float>(), seqLens.data_ptr<int>(),
+              indices.data_ptr<int>(), static_cast<int>(stride0),
+              static_cast<int>(stride1), static_cast<int>(topK),
+              static_cast<int>(next_n), seqLensIs2D);
+    } else {
+      vllm::topKPerRowDecode<kNumThreadsPerBlock, false>
+          <<<numRows, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
+              logits.data_ptr<float>(), seqLens.data_ptr<int>(),
+              indices.data_ptr<int>(), static_cast<int>(stride0),
+              static_cast<int>(stride1), static_cast<int>(topK),
+              static_cast<int>(next_n), seqLensIs2D);
+    }
   } else if (numColumns < kSplitWorkThreshold) {
     // From this threshold, use radix sort instead
-    vllm::topKPerRowDecode<kNumThreadsPerBlock, true>
-        <<<numRows, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
-            logits.data_ptr<float>(), seqLens.data_ptr<int>(),
-            indices.data_ptr<int>(), static_cast<int>(stride0),
-            static_cast<int>(stride1), static_cast<int>(topK),
-            static_cast<int>(next_n), seqLensIs2D);
+    if (sortIndices) {
+      vllm::topKPerRowDecode<kNumThreadsPerBlock, true, false, false, true>
+          <<<numRows, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
+              logits.data_ptr<float>(), seqLens.data_ptr<int>(),
+              indices.data_ptr<int>(), static_cast<int>(stride0),
+              static_cast<int>(stride1), static_cast<int>(topK),
+              static_cast<int>(next_n), seqLensIs2D);
+    } else {
+      vllm::topKPerRowDecode<kNumThreadsPerBlock, true>
+          <<<numRows, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
+              logits.data_ptr<float>(), seqLens.data_ptr<int>(),
+              indices.data_ptr<int>(), static_cast<int>(stride0),
+              static_cast<int>(stride1), static_cast<int>(topK),
+              static_cast<int>(next_n), seqLensIs2D);
+    }
   } else {
     // Long sequences are run in two steps
     constexpr auto multipleBlocksPerRowConfig = 10;

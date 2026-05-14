@@ -3782,6 +3782,38 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         return bool(self.discard_request_mask.np[:num_reqs].all())
 
+    def _should_skip_pp_final_sampled_token_broadcast(
+        self, sampled_token_ids: torch.Tensor | None = None
+    ) -> bool:
+        if not envs.VLLM_PP_SKIP_FINAL_MAX_TOKENS_BROADCAST:
+            return False
+        if self.speculative_config is not None or self.num_spec_tokens:
+            return False
+        if sampled_token_ids is not None and (
+            sampled_token_ids.dim() != 2 or sampled_token_ids.shape[-1] != 1
+        ):
+            return False
+
+        num_reqs = self.input_batch.num_reqs
+        if num_reqs == 0:
+            return False
+
+        has_valid_req = False
+        discard_mask = self.discard_request_mask.np[:num_reqs]
+        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            if discard_mask[i]:
+                continue
+            has_valid_req = True
+            req_state = self.requests.get(req_id)
+            if req_state is None or req_state.sampling_params is None:
+                return False
+            max_tokens = req_state.sampling_params.max_tokens
+            if max_tokens is None:
+                return False
+            if len(req_state.output_token_ids) + 1 < max_tokens:
+                return False
+        return has_valid_req
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -4386,7 +4418,9 @@ class GPUModelRunner(
         )
         # Skip for chunked prefill: sampled tokens are dummy
         # and will be discarded, no need to broadcast.
-        if not self._is_all_reqs_chunked_prefill():
+        if not self._is_all_reqs_chunked_prefill() and not (
+            self._should_skip_pp_final_sampled_token_broadcast(sampled_token_ids)
+        ):
             torch.distributed.broadcast(
                 sampled_token_ids, src=pp.rank, group=pp.device_group
             )
@@ -4398,9 +4432,16 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
         recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
+        skip_final_sampled_token = (
+            self._should_skip_pp_final_sampled_token_broadcast()
+        )
         # skip for chunked prefill.
-        if not self._is_all_reqs_chunked_prefill():
+        if not self._is_all_reqs_chunked_prefill() and not skip_final_sampled_token:
             torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
+        if skip_final_sampled_token:
+            self.input_batch.prev_sampled_token_ids = None
+            self.input_batch.prev_req_id_to_index = {}
+            return
         self.input_batch.prev_sampled_token_ids = recv
 
         # construct `prev_req_id_to_index` here so `_prepare_input_ids`

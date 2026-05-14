@@ -12,11 +12,19 @@ from vllm.config import get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.platform_utils import num_compute_units
-from vllm.v1.attention.backend import AttentionBackend, AttentionCGSupport
+from vllm.utils.torch_utils import is_quantized_kv_cache
+from vllm.v1.attention.backend import (
+    AttentionBackend,
+    AttentionCGSupport,
+    AttentionLayer,
+)
 from vllm.v1.attention.backends.mla.xpu_mla_sparse import (
     XPUMLASparseImpl,
     XPUMLASparseMetadata,
     XPUMLASparseMetadataBuilder,
+)
+from vllm.v1.attention.backends.mla.flashmla_sparse import (
+    triton_convert_req_index_to_global_index,
 )
 from vllm.v1.attention.ops.mqa_logits_triton import (
     warmup_fp8_mqa_logits_triton,
@@ -49,6 +57,8 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
     """Overrides XPU sparse impl to use the split-KV kernel, which is
     3–7× faster for single-query decode on SM80 (A100/A30) and SM120 (GB10).
     """
+
+    can_return_lse_for_decode: ClassVar[bool] = True
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -102,6 +112,32 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                     num_kv_splits=1,
                     sm_count=self._sm_count,
                 )
+                if os.getenv("VLLM_SPARSE_MLA_ASSUME_VALID_NOMASK", "0") == "1":
+                    triton_sparse_mla_attention(
+                        q,
+                        kv,
+                        indices,
+                        sm_scale=self.softmax_scale,
+                        num_kv_splits=1,
+                        sm_count=self._sm_count,
+                        assume_valid_indices=True,
+                    )
+                    if (
+                        os.getenv(
+                            "VLLM_SPARSE_MLA_ASSUME_VALID_AFTER_TOPK_NOMASK",
+                            "0",
+                        )
+                        == "1"
+                    ):
+                        triton_sparse_mla_attention(
+                            q,
+                            kv,
+                            indices,
+                            sm_scale=self.softmax_scale,
+                            num_kv_splits=1,
+                            sm_count=self._sm_count,
+                            valid_index_base_seq_len=0,
+                        )
             del q, indices
             torch.cuda.empty_cache()
         # The indexer's fp8 MQA logits kernels live on a separate autotune
@@ -118,66 +154,103 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 device=device,
             )
 
+    @staticmethod
+    def _slice_q(
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor], item: slice
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(q, tuple):
+            return q[0][item], q[1][item]
+        return q[item]
+
     def _forward_bf16_kv(
         self,
-        q: torch.Tensor,  # [sq, heads, d_qk]
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         kv_c_and_k_pe_cache: torch.Tensor,  # [blocks, heads, d_qk]
         topk_indices: torch.Tensor,  # [sq, topk]
         attn_metadata: XPUMLASparseMetadata,
-    ) -> torch.Tensor:
-        num_tokens = q.shape[0]
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        q_nope = q[0] if isinstance(q, tuple) else q
+        num_tokens = q_nope.shape[0]
         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
             -1, 1, kv_c_and_k_pe_cache.shape[-1]
         )
         topk_indices = topk_indices.view(num_tokens, 1, -1)
+        out_heads = q_nope.shape[1] if return_lse else self.num_heads
         if (
             os.getenv("VLLM_SPARSE_MLA_ASSUME_VALID_DYNAMIC", "0") == "1"
             and attn_metadata.num_reqs == 1
         ):
             full_topk_start = attn_metadata.full_topk_start
             if full_topk_start <= 0:
-                output = triton_sparse_mla_attention(
+                result = triton_sparse_mla_attention(
                     q,
                     kv_c_and_k_pe_cache,
                     topk_indices,
                     sm_scale=self.softmax_scale,
                     sm_count=self._sm_count,
                     assume_valid_indices=True,
+                    return_lse=return_lse,
                 )
-                return output[:, : self.num_heads, :]
+                if return_lse:
+                    output, lse = result
+                    return output[:, :out_heads, :], lse[:, :out_heads]
+                return result[:, :out_heads, :]
             if full_topk_start < num_tokens:
-                output = triton_sparse_mla_attention(
+                result = triton_sparse_mla_attention(
                     q,
                     kv_c_and_k_pe_cache,
                     topk_indices,
                     sm_scale=self.softmax_scale,
                     sm_count=self._sm_count,
                     valid_index_base_seq_len=attn_metadata.base_seq_len,
+                    return_lse=return_lse,
                 )
-                return output[:, : self.num_heads, :]
+                if return_lse:
+                    output, lse = result
+                    return output[:, :out_heads, :], lse[:, :out_heads]
+                return result[:, :out_heads, :]
         if (
             os.getenv("VLLM_SPARSE_MLA_ASSUME_VALID_SPLIT", "0") == "1"
             and attn_metadata.num_reqs == 1
         ):
             full_topk_start = attn_metadata.full_topk_start
             if full_topk_start <= 0:
-                output = triton_sparse_mla_attention(
+                result = triton_sparse_mla_attention(
                     q,
                     kv_c_and_k_pe_cache,
                     topk_indices,
                     sm_scale=self.softmax_scale,
                     sm_count=self._sm_count,
                     assume_valid_indices=True,
+                    return_lse=return_lse,
                 )
-                return output[:, : self.num_heads, :]
+                if return_lse:
+                    output, lse = result
+                    return output[:, :out_heads, :], lse[:, :out_heads]
+                return result[:, :out_heads, :]
             if full_topk_start < num_tokens:
                 output = torch.empty(
                     (num_tokens, self.num_heads, _BLOCK_DV),
                     dtype=torch.bfloat16,
-                    device=q.device,
+                    device=q_nope.device,
                 )
+                # This split shortcut is only used in the non-DCP path; DCP
+                # needs all gathered heads plus LSE for the downstream combine.
+                if return_lse:
+                    result = triton_sparse_mla_attention(
+                        q,
+                        kv_c_and_k_pe_cache,
+                        topk_indices,
+                        sm_scale=self.softmax_scale,
+                        sm_count=self._sm_count,
+                        valid_index_base_seq_len=attn_metadata.base_seq_len,
+                        return_lse=True,
+                    )
+                    output, lse = result
+                    return output[:, :out_heads, :], lse[:, :out_heads]
                 triton_sparse_mla_attention(
-                    q[:full_topk_start],
+                    self._slice_q(q, slice(None, full_topk_start)),
                     kv_c_and_k_pe_cache,
                     topk_indices[:full_topk_start],
                     sm_scale=self.softmax_scale,
@@ -185,7 +258,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                     out=output[:full_topk_start],
                 )
                 triton_sparse_mla_attention(
-                    q[full_topk_start:],
+                    self._slice_q(q, slice(full_topk_start, None)),
                     kv_c_and_k_pe_cache,
                     topk_indices[full_topk_start:],
                     sm_scale=self.softmax_scale,
@@ -193,15 +266,54 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                     out=output[full_topk_start:],
                     assume_valid_indices=True,
                 )
-                return output[:, : self.num_heads, :]
-        output = triton_sparse_mla_attention(
+                return output[:, :out_heads, :]
+        result = triton_sparse_mla_attention(
             q,
             kv_c_and_k_pe_cache,
             topk_indices,
             sm_scale=self.softmax_scale,
             sm_count=self._sm_count,
+            return_lse=return_lse,
         )
-        return output[:, : self.num_heads, :]
+        if return_lse:
+            output, lse = result
+            return output[:, :out_heads, :], lse[:, :out_heads]
+        return result[:, :out_heads, :]
+
+    def forward_mqa(
+        self,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: XPUMLASparseMetadata,
+        layer: AttentionLayer,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            raise NotImplementedError("FP8 kv is not supported with MLA Sparse yet")
+
+        q_shape = q[0] if isinstance(q, tuple) else q
+        num_actual_toks = q_shape.shape[0]
+        assert self.topk_indices_buffer is not None
+        topk_indices = self.topk_indices_buffer[:num_actual_toks]
+
+        topk_indices_global = triton_convert_req_index_to_global_index(
+            attn_metadata.req_id_per_token,
+            attn_metadata.block_table,
+            topk_indices,
+            BLOCK_SIZE=attn_metadata.block_size,
+            NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
+        )
+
+        result = self._forward_bf16_kv(
+            q,
+            kv_c_and_k_pe_cache,
+            topk_indices_global,
+            attn_metadata,
+            return_lse=self.need_to_return_lse_for_decode,
+        )
+        if self.need_to_return_lse_for_decode:
+            attn_out, lse = result
+            return attn_out, lse
+        return result, None
 
 
 class TritonMLASparseBackend(AttentionBackend):

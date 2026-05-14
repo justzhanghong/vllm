@@ -495,8 +495,15 @@ class Worker(WorkerBase):
         if (metadata := connector.get_handshake_metadata()) is None:
             return None
 
-        tp_rank = get_tp_group().rank_in_group
-        return {tp_rank: metadata}
+        tp_group = get_tp_group()
+        pp_group = get_pp_group()
+        # NIXL side-channel metadata is served from the scheduler process as a
+        # flat rank map. TP rank alone is ambiguous under PP>1, so include the
+        # pipeline stage to avoid PP workers overwriting each other's metadata.
+        metadata_rank = pp_group.rank_in_group * tp_group.world_size + (
+            tp_group.rank_in_group
+        )
+        return {metadata_rank: metadata}
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()

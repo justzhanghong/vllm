@@ -687,6 +687,46 @@ def fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton(
     reuse_k_tile = (
         os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_REUSE_K_TILE", "0") == "1"
     )
+    num_warps = int(
+        os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_NUM_WARPS", "4")
+    )
+    num_stages = int(
+        os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_NUM_STAGES", "3")
+    )
+    small_n_max = int(
+        os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_SMALL_N_MAX", "0")
+    )
+    if small_n_max > 0 and N <= small_n_max:
+        small_block_m = os.getenv(
+            "VLLM_MQA_CUDA_V7_FUSED_TRITON_SMALL_N_BLOCK_M"
+        )
+        if small_block_m is not None:
+            block_m = int(small_block_m)
+        small_block_n = os.getenv(
+            "VLLM_MQA_CUDA_V7_FUSED_TRITON_SMALL_N_BLOCK_N"
+        )
+        if small_block_n is not None:
+            block_n = int(small_block_n)
+        small_skip_invalid_store = os.getenv(
+            "VLLM_MQA_CUDA_V7_FUSED_TRITON_SMALL_N_SKIP_INVALID_STORE"
+        )
+        if small_skip_invalid_store is not None:
+            skip_invalid_store = small_skip_invalid_store == "1"
+        small_fast_full_tile = os.getenv(
+            "VLLM_MQA_CUDA_V7_FUSED_TRITON_SMALL_N_FAST_FULL_TILE"
+        )
+        if small_fast_full_tile is not None:
+            fast_full_tile = small_fast_full_tile == "1"
+        small_num_stages = os.getenv(
+            "VLLM_MQA_CUDA_V7_FUSED_TRITON_SMALL_N_NUM_STAGES"
+        )
+        if small_num_stages is not None:
+            num_stages = int(small_num_stages)
+        small_num_warps = os.getenv(
+            "VLLM_MQA_CUDA_V7_FUSED_TRITON_SMALL_N_NUM_WARPS"
+        )
+        if small_num_warps is not None:
+            num_warps = int(small_num_warps)
     H, _, D = q_bf16.shape
     grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
     _mqa_bf16_fused_logits_kernel[grid](
@@ -715,8 +755,8 @@ def fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton(
         FAST_INVALID_TILE=fast_invalid_tile,
         SKIP_INVALID_STORE=skip_invalid_store,
         REUSE_K_TILE=reuse_k_tile,
-        num_warps=4,
-        num_stages=3,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return logits
 

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fused MoE utilities for GPTQ."""
 
+import os
 from collections.abc import Callable
 
 import torch
@@ -315,6 +316,9 @@ def fused_marlin_moe(
 
     if input_dtype is not None and input_dtype.itemsize == 1:
         block_size_m = max(block_size_m, 16)
+    forced_block_size_m = int(os.getenv("VLLM_MARLIN_MOE_BLOCK_SIZE_M", "0"))
+    if forced_block_size_m in (8, 16, 32, 48, 64):
+        block_size_m = forced_block_size_m
 
     if global_num_experts == -1:
         global_num_experts = E

@@ -188,6 +188,7 @@ return curr_o @ W_O
 """
 
 import functools
+import os
 from abc import abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
@@ -722,17 +723,27 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 N, B, P = mqa_q_nope.shape
                 _, _, L = self.W_UK_T.shape
 
-                if self.q_pad_num_heads is not None:
+                contiguous_q_nope_out = (
+                    os.getenv("VLLM_MLA_CONTIG_Q_NOPE_BMM_OUT", "0") == "1"
+                    and self.q_pad_num_heads is None
+                )
+                if contiguous_q_nope_out:
+                    mqa_ql_nope = mqa_q_nope.new_empty((B, N, L))
+                    mqa_ql_nope_bmm_out = mqa_ql_nope.transpose(0, 1)
+                elif self.q_pad_num_heads is not None:
                     mqa_ql_nope = mqa_q_nope.new_empty((self.q_pad_num_heads, B, L))
                     mqa_ql_nope.resize_((N, B, L))
+                    mqa_ql_nope_bmm_out = mqa_ql_nope
                 else:
                     mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
+                    mqa_ql_nope_bmm_out = mqa_ql_nope
 
                 # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-                torch.bmm(mqa_q_nope, self.W_UK_T, out=mqa_ql_nope)
+                torch.bmm(mqa_q_nope, self.W_UK_T, out=mqa_ql_nope_bmm_out)
 
-                # Convert from (N, B, L) to (B, N, L)
-                mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
+                if not contiguous_q_nope_out:
+                    # Convert from (N, B, L) to (B, N, L)
+                    mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
 
             if fp8_attention and self.impl.supports_quant_query_input:
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
@@ -976,6 +987,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
             # Multiply (N, B, L) x (N, L, V) -> (N, B, V)
             torch.bmm(x, self.W_UV, out=out)  # Reuse "out" to make it "hot"
+
+            if os.getenv("VLLM_MLA_SKIP_V_UP_COPY", "0") == "1":
+                return
 
             # Convert from (N, B, V) to (B, N * V)
             out_new = out.transpose(0, 1).reshape(-1, self.num_heads * self.v_head_dim)

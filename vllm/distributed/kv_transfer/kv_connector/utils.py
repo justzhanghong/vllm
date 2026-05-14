@@ -211,14 +211,22 @@ def copy_kv_blocks(
         dst_device=dst_device,
     )
 
-    if direction == "h2d":
-        copy_fn = current_platform.insert_blocks_to_device
-    else:
-        copy_fn = current_platform.swap_out_blocks_to_host
     for layer_name in src_kv_caches:
         src_tensor = src_kv_caches[layer_name]
         dst_tensor = dst_kv_caches[layer_name]
-        copy_fn(src_tensor, dst_tensor, src_indices, dst_indices)
+        # MLA/FlashInfer KV cache tensors are block-first, while the legacy
+        # CUDA helper assumes [K/V, num_blocks, ...]. Pick the block dimension
+        # from the tensor shape to avoid silently copying the wrong axis when
+        # host transfer buffers are used.
+        block_dim = (
+            1
+            if src_tensor.dim() >= 2
+            and src_tensor.shape[0] == 2
+            and src_tensor.shape[1] > max(src_block_ids)
+            else 0
+        )
+        src_blocks = src_tensor.index_select(block_dim, src_indices)
+        dst_tensor.index_copy_(block_dim, dst_indices, src_blocks.to(dst_tensor.device))
 
 
 def kv_postprocess_blksize_on_receive(cache, indices, block_size_ratio):
