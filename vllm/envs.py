@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_SAMPLER: bool | None = None
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_PP_SKIP_FINAL_MAX_TOKENS_BROADCAST: bool = False
+    VLLM_PP_DIRECT_RECV_INTERMEDIATE: bool = False
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
@@ -86,6 +87,10 @@ if TYPE_CHECKING:
     VLLM_MAIN_CUDA_VERSION: str = "13.0"
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
+    VLLM_FP8_MOE_DEQUANT_BF16: bool = False
+    VLLM_FP8_SHARED_EXPERTS_DEQUANT_BF16: bool = False
+    VLLM_FP8_MLP_LINEAR_DEQUANT_BF16: bool = False
+    VLLM_FP8_ATTN_LINEAR_DEQUANT_BF16: bool = False
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
     VLLM_USE_PRECOMPILED: bool = False
@@ -155,6 +160,8 @@ if TYPE_CHECKING:
     VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY: str = ""
     VLLM_RAY_EXTRA_ENV_VARS_TO_COPY: str = ""
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
+    VLLM_MARLIN_USE_FP32_REDUCE: bool = True
+    VLLM_MARLIN_MOE_USE_FP32_REDUCE: bool = True
     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
@@ -523,6 +530,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+    # GLM FP8 v2 experiment: dequantize block-FP8 MoE weights to BF16 after
+    # loading and run the unquantized MoE kernel. Disabled by default.
+    "VLLM_FP8_MOE_DEQUANT_BF16": lambda: bool(
+        int(os.getenv("VLLM_FP8_MOE_DEQUANT_BF16", "0"))
+    ),
+    # GLM FP8 v2 experiment: dequantize shared-expert FP8 linear weights to
+    # BF16 after loading while keeping routed MoE weights on the normal path.
+    "VLLM_FP8_SHARED_EXPERTS_DEQUANT_BF16": lambda: bool(
+        int(os.getenv("VLLM_FP8_SHARED_EXPERTS_DEQUANT_BF16", "0"))
+    ),
+    # GLM FP8 v2 experiment: dequantize non-routed MLP FP8 linear weights
+    # (dense MLP and shared experts) to BF16 after loading.
+    "VLLM_FP8_MLP_LINEAR_DEQUANT_BF16": lambda: bool(
+        int(os.getenv("VLLM_FP8_MLP_LINEAR_DEQUANT_BF16", "0"))
+    ),
+    # GLM FP8 v2 experiment: dequantize attention FP8 linear weights to BF16
+    # after loading. DSA/indexer weights are intentionally excluded.
+    "VLLM_FP8_ATTN_LINEAR_DEQUANT_BF16": lambda: bool(
+        int(os.getenv("VLLM_FP8_ATTN_LINEAR_DEQUANT_BF16", "0"))
+    ),
     # Maximum number of compilation jobs to run in parallel.
     # By default this is the number of CPUs
     "MAX_JOBS": lambda: os.getenv("MAX_JOBS", None),
@@ -729,6 +756,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # that no later decode step can consume.
     "VLLM_PP_SKIP_FINAL_MAX_TOKENS_BROADCAST": lambda: bool(
         int(os.getenv("VLLM_PP_SKIP_FINAL_MAX_TOKENS_BROADCAST", "0"))
+    ),
+    # In eager PP runs, use received intermediate tensors directly instead of
+    # copying them into a persistent model-runner buffer.
+    "VLLM_PP_DIRECT_RECV_INTERMEDIATE": lambda: bool(
+        int(os.getenv("VLLM_PP_DIRECT_RECV_INTERMEDIATE", "0"))
     ),
     # (CPU backend only) CPU key-value cache space.
     # default is None and will be set as 4 GB
@@ -1217,6 +1249,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use atomicAdd reduce in gptq/awq marlin kernel.
     "VLLM_MARLIN_USE_ATOMIC_ADD": lambda: (
         os.environ.get("VLLM_MARLIN_USE_ATOMIC_ADD", "0") == "1"
+    ),
+    # Whether to use fp32 reductions in Marlin linear kernels.
+    "VLLM_MARLIN_USE_FP32_REDUCE": lambda: (
+        os.environ.get("VLLM_MARLIN_USE_FP32_REDUCE", "1") == "1"
+    ),
+    # Whether to use fp32 reductions in Marlin MoE kernels. Defaults to the
+    # global Marlin setting when unset.
+    "VLLM_MARLIN_MOE_USE_FP32_REDUCE": lambda: (
+        os.environ.get(
+            "VLLM_MARLIN_MOE_USE_FP32_REDUCE",
+            os.environ.get("VLLM_MARLIN_USE_FP32_REDUCE", "1"),
+        )
+        == "1"
     ),
     # Whether to use marlin kernel in mxfp4 quantization method
     "VLLM_MXFP4_USE_MARLIN": lambda: maybe_convert_bool(

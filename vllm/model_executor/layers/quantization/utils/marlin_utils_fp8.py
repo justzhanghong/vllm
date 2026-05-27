@@ -5,6 +5,7 @@
 import torch
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     USE_FP32_REDUCE_DEFAULT,
@@ -83,7 +84,7 @@ def apply_fp8_marlin_linear(
         size_n=size_n,
         size_k=size_k,
         use_atomic_add=use_atomic_add,
-        use_fp32_reduce=use_fp32_reduce,
+        use_fp32_reduce=use_fp32_reduce and envs.VLLM_MARLIN_USE_FP32_REDUCE,
     )
 
     return output.reshape(out_shape)
@@ -384,7 +385,7 @@ def apply_mxfp8_marlin_linear(
         size_n=size_n,
         size_k=size_k,
         use_atomic_add=use_atomic_add,
-        use_fp32_reduce=use_fp32_reduce,
+        use_fp32_reduce=use_fp32_reduce and envs.VLLM_MARLIN_USE_FP32_REDUCE,
     )
 
     return output.reshape(out_shape)

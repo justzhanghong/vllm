@@ -49,6 +49,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_scale_parameter,
     create_fp8_weight_parameter,
     process_fp8_input_tensor_strategy_moe,
+    process_fp8_weight_block_strategy,
     process_fp8_weight_tensor_strategy,
     process_fp8_weight_tensor_strategy_moe,
     validate_fp8_block_shape,
@@ -308,6 +309,28 @@ class Fp8LinearMethod(LinearMethodBase):
             else:
                 self.activation_quant_key = kFp8DynamicTensorSym
 
+    @staticmethod
+    def _scaled_dequantize_block_fp8_linear_weight(
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        block_shape: GroupShape,
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        block_n, block_k = block_shape
+        out = torch.empty(weight.shape, device=weight.device, dtype=out_dtype)
+        for row_start in range(0, weight.shape[-2], block_n):
+            row_end = min(row_start + block_n, weight.shape[-2])
+            scale_row = row_start // block_n
+            for col_start in range(0, weight.shape[-1], block_k):
+                col_end = min(col_start + block_k, weight.shape[-1])
+                scale_col = col_start // block_k
+                scale_block = scale[..., scale_row, scale_col].to(out_dtype)
+                out[..., row_start:row_end, col_start:col_end] = (
+                    weight[..., row_start:row_end, col_start:col_end].to(out_dtype)
+                    * scale_block.reshape((*scale_block.shape, 1, 1))
+                )
+        return out
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -384,6 +407,55 @@ class Fp8LinearMethod(LinearMethodBase):
         self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        layer_prefix = getattr(layer, "prefix", "")
+        dequant_shared_experts = (
+            envs.VLLM_FP8_SHARED_EXPERTS_DEQUANT_BF16
+            and "shared_experts" in layer_prefix
+        )
+        dequant_mlp_linear = (
+            envs.VLLM_FP8_MLP_LINEAR_DEQUANT_BF16
+            and ".mlp." in layer_prefix
+            and ".experts." not in layer_prefix
+        )
+        dequant_attn_linear = (
+            envs.VLLM_FP8_ATTN_LINEAR_DEQUANT_BF16
+            and ".self_attn." in layer_prefix
+            and ".indexer." not in layer_prefix
+        )
+        if (
+            self.use_marlin
+            and self.block_quant
+            and (
+                dequant_shared_experts
+                or dequant_mlp_linear
+                or dequant_attn_linear
+            )
+        ):
+            assert self.weight_block_size is not None
+            weight, weight_scale_inv = process_fp8_weight_block_strategy(
+                layer.weight, layer.weight_scale_inv
+            )
+            out_dtype = (
+                layer.orig_dtype
+                if layer.orig_dtype in (torch.float16, torch.bfloat16)
+                else torch.bfloat16
+            )
+            block_shape = GroupShape(
+                self.weight_block_size[0], self.weight_block_size[1]
+            )
+            logger.info_once(
+                "GLM FP8 v2: dequantizing selected FP8 linear weights to %s.",
+                out_dtype,
+            )
+            weight = self._scaled_dequantize_block_fp8_linear_weight(
+                weight, weight_scale_inv, block_shape, out_dtype
+            )
+            replace_parameter(layer, "weight", weight)
+            replace_parameter(layer, "weight_scale_inv", weight_scale_inv)
+            layer._fp8_dequant_bf16_linear = True
+            torch.cuda.empty_cache()
+            return
+
         if self.use_marlin:
             # Only Marlin kernels support `marlin_input_dtype`; guard to avoid
             # AttributeError if backend selection changes.
@@ -434,6 +506,9 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if getattr(layer, "_fp8_dequant_bf16_linear", False):
+            return torch.nn.functional.linear(x, layer.weight, bias)
+
         # if batch invariant mode is enabled, prefer DeepGEMM FP8 path
         # we will use BF16 dequant when DeepGEMM is not supported.
         if envs.VLLM_BATCH_INVARIANT:
@@ -776,6 +851,29 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 shared_experts=layer.shared_experts,
             )
 
+
+    @staticmethod
+    def _scaled_dequantize_block_fp8_moe_weight(
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        block_shape: GroupShape,
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        block_n, block_k = block_shape
+        out = torch.empty(weight.shape, device=weight.device, dtype=out_dtype)
+        for row_start in range(0, weight.shape[-2], block_n):
+            row_end = min(row_start + block_n, weight.shape[-2])
+            scale_row = row_start // block_n
+            for col_start in range(0, weight.shape[-1], block_k):
+                col_end = min(col_start + block_k, weight.shape[-1])
+                scale_col = col_start // block_k
+                scale_block = scale[..., scale_row, scale_col].to(out_dtype)
+                out[..., row_start:row_end, col_start:col_end] = (
+                    weight[..., row_start:row_end, col_start:col_end].to(out_dtype)
+                    * scale_block.reshape((*scale_block.shape, 1, 1))
+                )
+        return out
+
     def process_weights_after_loading(self, layer: Module) -> None:
         # Allow for accessing weights and scales in standard way.
         w13 = layer.w13_weight
@@ -815,6 +913,40 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13, w13_scale = process_fp8_weight_tensor_strategy_moe(
                 w13, w13_scale, shard_size, layer.local_num_experts
             )
+
+        if envs.VLLM_FP8_MOE_DEQUANT_BF16:
+            if not self.block_quant or self.weight_block_size is None:
+                raise RuntimeError(
+                    "VLLM_FP8_MOE_DEQUANT_BF16 requires block-FP8 MoE weights."
+                )
+            out_dtype = (
+                layer.orig_dtype
+                if layer.orig_dtype in (torch.float16, torch.bfloat16)
+                else torch.bfloat16
+            )
+            block_shape = GroupShape(
+                self.weight_block_size[0], self.weight_block_size[1]
+            )
+            logger.info_once(
+                "VLLM_FP8_MOE_DEQUANT_BF16=1: dequantizing block-FP8 MoE "
+                "weights to %s and using the unquantized MoE backend.",
+                out_dtype,
+            )
+            w13 = self._scaled_dequantize_block_fp8_moe_weight(
+                w13, w13_scale, block_shape, out_dtype
+            )
+            replace_parameter(layer, "w13_weight", w13)
+            torch.cuda.empty_cache()
+            w2 = self._scaled_dequantize_block_fp8_moe_weight(
+                w2, w2_scale, block_shape, out_dtype
+            )
+            replace_parameter(layer, "w2_weight", w2)
+            torch.cuda.empty_cache()
+            unquantized = UnquantizedFusedMoEMethod(layer.moe_config)
+            layer._replace_quant_method(unquantized)
+            layer.base_quant_method = unquantized
+            unquantized.process_weights_after_loading(layer)
+            return
 
         # Shuffle weights to runtime format and setup kernel.
         self._setup_kernel(

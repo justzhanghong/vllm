@@ -912,6 +912,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             self.W_UV = W_UV.transpose(0, 1)
             # Convert from (L, N, P) to (N, P, L)
             self.W_UK_T = W_UK.permute(1, 2, 0)
+            if self.W_UV.dtype != act_dtype:
+                self.W_UV = self.W_UV.to(dtype=act_dtype)
+            if self.W_UK_T.dtype != act_dtype:
+                self.W_UK_T = self.W_UK_T.to(dtype=act_dtype)
 
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]

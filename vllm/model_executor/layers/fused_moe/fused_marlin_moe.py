@@ -51,6 +51,27 @@ from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
 
 
+def _get_int_env(name: str, default: int = -1) -> int:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def _get_marlin_moe_exec_config(prefix: str) -> tuple[int, int, int]:
+    global_thread_k = _get_int_env("VLLM_MARLIN_MOE_THREAD_K")
+    global_thread_n = _get_int_env("VLLM_MARLIN_MOE_THREAD_N")
+    global_blocks_per_sm = _get_int_env("VLLM_MARLIN_MOE_BLOCKS_PER_SM")
+    return (
+        _get_int_env(f"VLLM_MARLIN_MOE_{prefix}_THREAD_K", global_thread_k),
+        _get_int_env(f"VLLM_MARLIN_MOE_{prefix}_THREAD_N", global_thread_n),
+        _get_int_env(
+            f"VLLM_MARLIN_MOE_{prefix}_BLOCKS_PER_SM",
+            global_blocks_per_sm,
+        ),
+    )
+
+
 def _fused_marlin_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -127,6 +148,21 @@ def _fused_marlin_moe(
     elif input_dtype == torch.float8_e4m3fn:
         gate_up_input, a_scales1 = marlin_quant_input(hidden_states, input_dtype)
 
+    use_atomic_add = os.getenv("VLLM_MARLIN_MOE_USE_ATOMIC_ADD", "0") == "1"
+    use_fp32_reduce = (
+        os.getenv(
+            "VLLM_MARLIN_MOE_USE_FP32_REDUCE",
+            os.getenv("VLLM_MARLIN_USE_FP32_REDUCE", "1"),
+        )
+        == "1"
+    )
+    w1_thread_k, w1_thread_n, w1_blocks_per_sm = (
+        _get_marlin_moe_exec_config("W1")
+    )
+    w2_thread_k, w2_thread_n, w2_blocks_per_sm = (
+        _get_marlin_moe_exec_config("W2")
+    )
+
     intermediate_cache1 = ops.moe_wna16_marlin_gemm(
         gate_up_input,
         intermediate_cache1,
@@ -151,9 +187,12 @@ def _fused_marlin_moe(
         size_n=w13_num_shards * N,
         size_k=K,
         is_k_full=is_k_full,
-        use_atomic_add=False,
-        use_fp32_reduce=True,
+        use_atomic_add=use_atomic_add,
+        use_fp32_reduce=use_fp32_reduce,
         is_zp_float=False,
+        thread_k=w1_thread_k,
+        thread_n=w1_thread_n,
+        blocks_per_sm=w1_blocks_per_sm,
     )
     activation_func(
         activation,
@@ -203,9 +242,12 @@ def _fused_marlin_moe(
         size_n=K,
         size_k=N,
         is_k_full=is_k_full,
-        use_atomic_add=False,
-        use_fp32_reduce=True,
+        use_atomic_add=use_atomic_add,
+        use_fp32_reduce=use_fp32_reduce,
         is_zp_float=False,
+        thread_k=w2_thread_k,
+        thread_n=w2_thread_n,
+        blocks_per_sm=w2_blocks_per_sm,
     )
 
     return output
