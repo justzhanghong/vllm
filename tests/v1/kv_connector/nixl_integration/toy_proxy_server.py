@@ -5,6 +5,7 @@ import argparse
 import itertools
 import logging
 import os
+import time
 import uuid
 from contextlib import asynccontextmanager
 
@@ -218,8 +219,10 @@ async def stream_service_response(
 
 async def _handle_completions(api: str, request: Request):
     try:
+        t0 = time.perf_counter()
         req_data = await request.json()
         request_id = str(uuid.uuid4())
+        max_tokens = req_data.get("max_tokens", req_data.get("max_completion_tokens"))
 
         # Get the next prefill client in round-robin fashion
         prefill_client_info = get_next_client(request.app, "prefill")
@@ -228,6 +231,7 @@ async def _handle_completions(api: str, request: Request):
         response = await send_request_to_service(
             prefill_client_info, api, req_data, request_id
         )
+        t_prefill_done = time.perf_counter()
 
         # Extract the needed fields
         response_json = response.json()
@@ -243,10 +247,33 @@ async def _handle_completions(api: str, request: Request):
 
         # Stream response from decode service
         async def generate_stream():
+            t_decode_start = time.perf_counter()
+            first_chunk = True
             async for chunk in stream_service_response(
                 decode_client_info, api, req_data, request_id=request_id
             ):
+                if first_chunk:
+                    first_chunk = False
+                    t_first_chunk = time.perf_counter()
+                    print(
+                        "PROXY_TIMING "
+                        f"request_id={request_id} api={api} "
+                        f"max_tokens={max_tokens} "
+                        f"prefill_ms={(t_prefill_done - t0) * 1000:.3f} "
+                        f"decode_first_ms={(t_first_chunk - t_decode_start) * 1000:.3f} "
+                        f"ttft_proxy_ms={(t_first_chunk - t0) * 1000:.3f} "
+                        f"prefill={prefill_client_info['host']}:{prefill_client_info['port']} "
+                        f"decode={decode_client_info['host']}:{decode_client_info['port']}",
+                        flush=True,
+                    )
                 yield chunk
+            t_done = time.perf_counter()
+            print(
+                "PROXY_DONE "
+                f"request_id={request_id} api={api} "
+                f"total_ms={(t_done - t0) * 1000:.3f}",
+                flush=True,
+            )
 
         return StreamingResponse(generate_stream(), media_type="application/json")
 

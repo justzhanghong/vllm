@@ -24,6 +24,8 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
+import os
+import time
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -31,6 +33,11 @@ from itertools import islice
 import torch
 from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config
+
+if os.environ.get("VLLM_CUDNN_DETERMINISTIC") == "1":
+    torch.backends.cudnn.deterministic = True
+if os.environ.get("VLLM_CUDNN_BENCHMARK") == "0":
+    torch.backends.cudnn.benchmark = False
 
 import vllm._custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
@@ -1127,6 +1134,65 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
 
+    def _capture_post_attention_layernorm(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> None:
+        capture_dir = os.environ.get("VLLM_NORM_CAPTURE_DIR")
+        capture_hook = os.environ.get("VLLM_NORM_CAPTURE_HOOK", "model.norm")
+        target_layer = int(os.environ.get("VLLM_NORM_CAPTURE_LAYER", "36"))
+        expected_hook = f"model.layers.{target_layer}.post_attention_layernorm"
+        if (
+            not capture_dir
+            or capture_hook != expected_hook
+            or self.layer_idx != target_layer
+        ):
+            return
+        tp_rank = get_tensor_model_parallel_rank()
+        target_tp_rank = os.environ.get("VLLM_NORM_CAPTURE_TP_RANK")
+        if target_tp_rank is not None and tp_rank != int(target_tp_rank):
+            return
+        pp_group = get_pp_group()
+        pp_rank = pp_group.rank_in_group
+        pp_world_size = pp_group.world_size
+        global_rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            else None
+        )
+        os.makedirs(capture_dir, exist_ok=True)
+        counter = getattr(self, "_post_attention_layernorm_capture_counter", 0)
+        self._post_attention_layernorm_capture_counter = counter + 1
+        tag = os.environ.get("VLLM_NORM_CAPTURE_TAG", "norm")
+        path = os.path.join(
+            capture_dir,
+            f"{tag}_layer{self.layer_idx:03d}_post_attention_layernorm_"
+            f"tp{tp_rank}_pp{pp_rank}_{os.getpid()}_{counter:06d}_"
+            f"{time.time_ns()}.pt",
+        )
+        torch.save(
+            {
+                "hidden_states": hidden_states.detach().cpu().clone(),
+                "positions": positions.detach().cpu().clone(),
+                "shape": tuple(hidden_states.shape),
+                "dtype": str(hidden_states.dtype),
+                "tag": tag,
+                "pid": os.getpid(),
+                "counter": counter,
+                "time_ns": time.time_ns(),
+                "hook": expected_hook,
+                "layer_idx": self.layer_idx,
+                "tp_rank": tp_rank,
+                "tp_world_size": get_tensor_model_parallel_world_size(),
+                "pp_rank": pp_rank,
+                "pp_world_size": pp_world_size,
+                "global_rank": global_rank,
+            },
+            path,
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1164,6 +1230,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        self._capture_post_attention_layernorm(positions, hidden_states)
         hidden_states = self.mlp(hidden_states)
 
         if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
@@ -1231,6 +1298,65 @@ class DeepseekV2Model(nn.Module):
 
         self.aux_hidden_state_layers = tuple[int, ...]()
 
+    def _capture_debug_tensor(
+        self,
+        *,
+        capture_dir: str,
+        capture_name: str,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        extra_meta: dict[str, typing.Any],
+    ) -> None:
+        tp_rank = get_tensor_model_parallel_rank()
+        target_tp_rank = os.environ.get(
+            "VLLM_LAYER_CAPTURE_TP_RANK",
+            os.environ.get("VLLM_NORM_CAPTURE_TP_RANK"),
+        )
+        if target_tp_rank is not None and tp_rank != int(target_tp_rank):
+            return
+        pp_group = get_pp_group()
+        pp_rank = pp_group.rank_in_group
+        pp_world_size = pp_group.world_size
+        global_rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            else None
+        )
+        os.makedirs(capture_dir, exist_ok=True)
+        safe_name = capture_name.replace(".", "_").replace("/", "_")
+        counter_attr = f"_debug_capture_counter_{safe_name}"
+        counter = getattr(self, counter_attr, 0)
+        setattr(self, counter_attr, counter + 1)
+        tag = os.environ.get("VLLM_LAYER_CAPTURE_TAG",
+                             os.environ.get("VLLM_NORM_CAPTURE_TAG", "debug"))
+        path = os.path.join(
+            capture_dir,
+            f"{tag}_{safe_name}_tp{tp_rank}_pp{pp_rank}_{os.getpid()}_"
+            f"{counter:06d}_{time.time_ns()}.pt",
+        )
+        torch.save(
+            {
+                "hidden_states": hidden_states.detach().cpu().clone(),
+                "positions": positions.detach().cpu().clone(),
+                "shape": tuple(hidden_states.shape),
+                "dtype": str(hidden_states.dtype),
+                "tag": tag,
+                "capture_name": capture_name,
+                "pid": os.getpid(),
+                "counter": counter,
+                "time_ns": time.time_ns(),
+                "hook": extra_meta.get("hook", capture_name),
+                "tp_rank": tp_rank,
+                "tp_world_size": get_tensor_model_parallel_world_size(),
+                "pp_rank": pp_rank,
+                "pp_world_size": pp_world_size,
+                "global_rank": global_rank,
+                **extra_meta,
+            },
+            path,
+        )
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -1281,6 +1407,33 @@ class DeepseekV2Model(nn.Module):
             hidden_states, residual = layer(
                 positions, hidden_states, residual, llama_4_scaling
             )
+            layer_capture_dir = os.environ.get("VLLM_LAYER_CAPTURE_DIR")
+            if layer_capture_dir:
+                layer_spec = os.environ.get("VLLM_LAYER_CAPTURE_LAYERS", "all")
+                capture_layer = layer_spec in ("", "all")
+                if not capture_layer:
+                    capture_layer = str(idx) in {
+                        item.strip()
+                        for item in layer_spec.split(",")
+                        if item.strip()
+                    }
+                if capture_layer:
+                    combined_hidden = (
+                        hidden_states if residual is None else hidden_states +
+                        residual
+                    )
+                    self._capture_debug_tensor(
+                        capture_dir=layer_capture_dir,
+                        capture_name=f"layer_{idx:03d}",
+                        positions=positions,
+                        hidden_states=combined_hidden,
+                        extra_meta={
+                            "hook": "DeepseekV2Model.decoder_layer_output",
+                            "layer_idx": idx,
+                            "residual_present": residual is not None,
+                            "capture_policy": "hidden_states_plus_residual",
+                        },
+                    )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -1288,6 +1441,52 @@ class DeepseekV2Model(nn.Module):
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
+        capture_dir = os.environ.get("VLLM_NORM_CAPTURE_DIR")
+        capture_hook = os.environ.get("VLLM_NORM_CAPTURE_HOOK", "model.norm")
+        if capture_dir:
+            if capture_hook not in ("model.norm", "DeepseekV2Model.model.norm"):
+                capture_dir = ""
+        if capture_dir:
+            tp_rank = get_tensor_model_parallel_rank()
+            target_tp_rank = os.environ.get("VLLM_NORM_CAPTURE_TP_RANK")
+            if target_tp_rank is None or tp_rank == int(target_tp_rank):
+                pp_group = get_pp_group()
+                pp_rank = pp_group.rank_in_group
+                pp_world_size = pp_group.world_size
+                global_rank = (
+                    torch.distributed.get_rank()
+                    if torch.distributed.is_available()
+                    and torch.distributed.is_initialized()
+                    else None
+                )
+                os.makedirs(capture_dir, exist_ok=True)
+                counter = getattr(self, "_norm_capture_counter", 0)
+                self._norm_capture_counter = counter + 1
+                tag = os.environ.get("VLLM_NORM_CAPTURE_TAG", "norm")
+                path = os.path.join(
+                    capture_dir,
+                    f"{tag}_tp{tp_rank}_pp{pp_rank}_{os.getpid()}_"
+                    f"{counter:06d}_{time.time_ns()}.pt",
+                )
+                torch.save(
+                    {
+                        "hidden_states": hidden_states.detach().cpu().clone(),
+                        "positions": positions.detach().cpu().clone(),
+                        "shape": tuple(hidden_states.shape),
+                        "dtype": str(hidden_states.dtype),
+                        "tag": tag,
+                        "pid": os.getpid(),
+                        "counter": counter,
+                        "time_ns": time.time_ns(),
+                        "hook": "DeepseekV2Model.model.norm",
+                        "tp_rank": tp_rank,
+                        "tp_world_size": get_tensor_model_parallel_world_size(),
+                        "pp_rank": pp_rank,
+                        "pp_world_size": pp_world_size,
+                        "global_rank": global_rank,
+                    },
+                    path,
+                )
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states
