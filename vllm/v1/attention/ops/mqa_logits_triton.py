@@ -693,6 +693,29 @@ def fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton(
     num_stages = int(
         os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_NUM_STAGES", "3")
     )
+    decode_m_max_env = os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_DECODE_M_MAX")
+    decode_m_max = int(decode_m_max_env) if decode_m_max_env else 0
+    if decode_m_max > 0 and M <= decode_m_max:
+        decode_block_m = os.getenv(
+            "VLLM_MQA_CUDA_V7_FUSED_TRITON_DECODE_BLOCK_M"
+        )
+        if decode_block_m:
+            block_m = int(decode_block_m)
+        decode_block_n = os.getenv(
+            "VLLM_MQA_CUDA_V7_FUSED_TRITON_DECODE_BLOCK_N"
+        )
+        if decode_block_n:
+            block_n = int(decode_block_n)
+        decode_num_stages = os.getenv(
+            "VLLM_MQA_CUDA_V7_FUSED_TRITON_DECODE_NUM_STAGES"
+        )
+        if decode_num_stages:
+            num_stages = int(decode_num_stages)
+        decode_num_warps = os.getenv(
+            "VLLM_MQA_CUDA_V7_FUSED_TRITON_DECODE_NUM_WARPS"
+        )
+        if decode_num_warps:
+            num_warps = int(decode_num_warps)
     small_n_max = int(
         os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_SMALL_N_MAX", "0")
     )

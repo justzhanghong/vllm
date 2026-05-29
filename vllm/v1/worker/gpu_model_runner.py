@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -510,6 +511,12 @@ class GPUModelRunner(
         self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
 
         self.use_aux_hidden_state_outputs = False
+        self.norm_capture_aux_runner = (
+            os.environ.get("VLLM_NORM_CAPTURE_MODE", "") == "aux_runner"
+        )
+        if self.norm_capture_aux_runner:
+            self.use_aux_hidden_state_outputs = True
+        self._norm_capture_aux_counter = 0
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
@@ -4106,6 +4113,10 @@ class GPUModelRunner(
                 hidden_states = model_output
                 aux_hidden_states = None
 
+            self._maybe_capture_norm_aux_hidden_states(
+                positions, aux_hidden_states
+            )
+
             if not self.broadcast_pp_output:
                 # Common case.
                 if not get_pp_group().is_last_rank:
@@ -4872,20 +4883,29 @@ class GPUModelRunner(
                             "aux_hidden_state_outputs was requested"
                         )
 
-                    # Try to get auxiliary layers from speculative config,
-                    # otherwise use model's default layers
-                    aux_layers = self._get_eagle3_aux_layers_from_config()
-                    if aux_layers:
-                        logger.info(
-                            "Using auxiliary layers from speculative config: %s",
-                            aux_layers,
+                    if self.norm_capture_aux_runner:
+                        self.model.set_aux_hidden_state_layers(())
+                        logger.info_once(
+                            "Using norm capture auxiliary output without "
+                            "EAGLE3 auxiliary hidden-state layers."
                         )
                     else:
-                        aux_layers = (
-                            self.model.get_eagle3_default_aux_hidden_state_layers()
-                        )
+                        # Try to get auxiliary layers from speculative config,
+                        # otherwise use model's default layers.
+                        aux_layers = self._get_eagle3_aux_layers_from_config()
+                        if aux_layers:
+                            logger.info(
+                                "Using auxiliary layers from speculative "
+                                "config: %s",
+                                aux_layers,
+                            )
+                        else:
+                            aux_layers = (
+                                self.model
+                                .get_eagle3_default_aux_hidden_state_layers()
+                            )
 
-                    self.model.set_aux_hidden_state_layers(aux_layers)
+                        self.model.set_aux_hidden_state_layers(aux_layers)
 
                 if (
                     is_mixture_of_experts(self.model)
@@ -5737,6 +5757,64 @@ class GPUModelRunner(
                 dummy_metadata,
             )
         return sampler_output
+
+    def _maybe_capture_norm_aux_hidden_states(
+        self,
+        positions: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+    ) -> None:
+        if not self.norm_capture_aux_runner or not aux_hidden_states:
+            return
+        capture_dir = os.environ.get("VLLM_NORM_CAPTURE_DIR")
+        if not capture_dir:
+            return
+        enable_file = os.environ.get("VLLM_NORM_CAPTURE_ENABLE_FILE")
+        if enable_file and not os.path.exists(enable_file):
+            return
+        tp_rank = get_tp_group().rank_in_group
+        target_tp_rank = os.environ.get("VLLM_NORM_CAPTURE_TP_RANK")
+        if target_tp_rank and tp_rank != int(target_tp_rank):
+            return
+        pp_group = get_pp_group()
+        pp_rank = pp_group.rank_in_group
+        pp_world_size = pp_group.world_size
+        global_rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            else None
+        )
+        os.makedirs(capture_dir, exist_ok=True)
+        tag = os.environ.get("VLLM_NORM_CAPTURE_TAG", "norm")
+        hook = os.environ.get("VLLM_NORM_CAPTURE_HOOK", "model.norm")
+        for hidden_states in aux_hidden_states:
+            counter = self._norm_capture_aux_counter
+            self._norm_capture_aux_counter += 1
+            path = os.path.join(
+                capture_dir,
+                f"{tag}_tp{tp_rank}_pp{pp_rank}_{os.getpid()}_"
+                f"{counter:06d}_{time.time_ns()}.pt",
+            )
+            torch.save(
+                {
+                    "hidden_states": hidden_states.detach().cpu().clone(),
+                    "positions": positions.detach().cpu().clone(),
+                    "shape": tuple(hidden_states.shape),
+                    "dtype": str(hidden_states.dtype),
+                    "tag": tag,
+                    "pid": os.getpid(),
+                    "counter": counter,
+                    "time_ns": time.time_ns(),
+                    "hook": hook,
+                    "tp_rank": tp_rank,
+                    "tp_world_size": get_tp_group().world_size,
+                    "pp_rank": pp_rank,
+                    "pp_world_size": pp_world_size,
+                    "global_rank": global_rank,
+                    "capture_mode": "aux_runner",
+                },
+                path,
+            )
 
     def _dummy_pooler_run_task(
         self,

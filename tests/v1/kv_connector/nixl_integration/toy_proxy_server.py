@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import asyncio
 import itertools
 import logging
 import os
@@ -42,6 +43,7 @@ async def lifespan(app: FastAPI):
                 "host": host,
                 "port": port,
                 "id": i,
+                "long_prefill_semaphore": asyncio.Semaphore(_long_prefill_limit()),
             }
         )
 
@@ -130,6 +132,38 @@ def parse_args():
     args.decoder_instances = list(zip(args.decoder_hosts, args.decoder_ports))
 
     return args
+
+
+def _long_prefill_limit() -> int:
+    return max(1, int(os.environ.get("PREFILL_PROXY_LONG_PREFILL_LIMIT", "1")))
+
+
+def _request_text_size(req_data: dict) -> int:
+    messages = req_data.get("messages") or []
+    total = 0
+    for msg in messages:
+        content = msg.get("content", "") if isinstance(msg, dict) else ""
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    total += len(str(item.get("text", "")))
+                else:
+                    total += len(str(item))
+        else:
+            total += len(str(content))
+    prompt = req_data.get("prompt")
+    if isinstance(prompt, str):
+        total += len(prompt)
+    elif isinstance(prompt, list):
+        total += sum(len(str(x)) for x in prompt)
+    return total
+
+
+def _is_long_prefill(req_data: dict) -> bool:
+    threshold = int(os.environ.get("PREFILL_PROXY_MIN_DISAGG_CHARS", "2048"))
+    return _request_text_size(req_data) >= threshold
 
 
 def get_next_client(app, service_type: str):
@@ -223,14 +257,22 @@ async def _handle_completions(api: str, request: Request):
         req_data = await request.json()
         request_id = str(uuid.uuid4())
         max_tokens = req_data.get("max_tokens", req_data.get("max_completion_tokens"))
+        text_chars = _request_text_size(req_data)
+        long_prefill = _is_long_prefill(req_data)
 
         # Get the next prefill client in round-robin fashion
         prefill_client_info = get_next_client(request.app, "prefill")
 
         # Send request to prefill service
-        response = await send_request_to_service(
-            prefill_client_info, api, req_data, request_id
-        )
+        if long_prefill:
+            async with prefill_client_info["long_prefill_semaphore"]:
+                response = await send_request_to_service(
+                    prefill_client_info, api, req_data, request_id
+                )
+        else:
+            response = await send_request_to_service(
+                prefill_client_info, api, req_data, request_id
+            )
         t_prefill_done = time.perf_counter()
 
         # Extract the needed fields
@@ -259,6 +301,8 @@ async def _handle_completions(api: str, request: Request):
                         "PROXY_TIMING "
                         f"request_id={request_id} api={api} "
                         f"max_tokens={max_tokens} "
+                        f"text_chars={text_chars} "
+                        f"long_prefill={long_prefill} "
                         f"prefill_ms={(t_prefill_done - t0) * 1000:.3f} "
                         f"decode_first_ms={(t_first_chunk - t_decode_start) * 1000:.3f} "
                         f"ttft_proxy_ms={(t_first_chunk - t0) * 1000:.3f} "
