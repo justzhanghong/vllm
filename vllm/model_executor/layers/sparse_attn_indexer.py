@@ -80,6 +80,13 @@ def sparse_attn_indexer(
             ((total_seq_lens, 4), torch.uint8),
             ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
         ]
+        use_decode_logits_workspace = (
+            os.getenv("VLLM_SPARSE_INDEXER_DECODE_LOGITS_WORKSPACE", "0")
+            == "1"
+        )
+        max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+        if use_decode_logits_workspace:
+            workspace_shapes.append(((max_logits_elems,), torch.uint8))
         if (
             envs.VLLM_SPARSE_INDEXER_MQA_LOGITS_BACKEND == "cuda_v7"
             and os.getenv("VLLM_MQA_CUDA_V7_PREDEQUANT_K", "0") == "1"
@@ -101,10 +108,10 @@ def sparse_attn_indexer(
 
         # Dummy allocation to simulate for peak logits tensor memory during inference.
         # FP8 elements so elements == bytes
-        max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
-        _ = torch.empty(
-            max_logits_elems, dtype=torch.uint8, device=hidden_states.device
-        )
+        if not use_decode_logits_workspace:
+            _ = torch.empty(
+                max_logits_elems, dtype=torch.uint8, device=hidden_states.device
+            )
 
         return sparse_attn_indexer_fake(
             hidden_states,
@@ -149,7 +156,12 @@ def sparse_attn_indexer(
         and not has_decode
         and os.getenv("VLLM_SPARSE_INDEXER_SKIP_PREFILL_TOPK_CLEAR", "0") == "1"
     )
-    if not skip_prefill_topk_clear:
+    skip_decode_topk_clear = (
+        has_decode
+        and not has_prefill
+        and os.getenv("VLLM_SPARSE_INDEXER_SKIP_DECODE_TOPK_CLEAR", "0") == "1"
+    )
+    if not (skip_prefill_topk_clear or skip_decode_topk_clear):
         topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
@@ -588,34 +600,109 @@ def sparse_attn_indexer(
         seq_lens = decode_metadata.seq_lens[:batch_size]
         # seq_lens is (B, next_n) for native spec decode, (B,) otherwise.
         # fp8_paged_mqa_logits and all topk kernels accept both shapes.
+        decode_block_table = decode_metadata.block_table
+        decode_logits_len = max_model_len
+        if os.getenv("VLLM_SPARSE_INDEXER_DECODE_TRIM_LOGITS", "0") == "1":
+            bucket_size = int(
+                os.getenv(
+                    "VLLM_SPARSE_INDEXER_DECODE_LOGITS_BUCKET_SIZE", "8192"
+                )
+                or "0"
+            )
+            active_len = max(int(attn_metadata_narrowed.max_seq_len), topk_tokens)
+            if bucket_size > 0:
+                active_len = (
+                    (active_len + bucket_size - 1) // bucket_size
+                ) * bucket_size
+            decode_logits_len = min(max_model_len, active_len)
+            block_size = int(kv_cache.shape[1])
+            max_blocks = (decode_logits_len + block_size - 1) // block_size
+            decode_block_table = decode_block_table[:, :max_blocks]
+        if (
+            os.getenv("VLLM_SPARSE_INDEXER_DECODE_TRIM_BLOCK_TABLE", "0") == "1"
+            and attn_metadata_narrowed.max_seq_len < max_model_len
+        ):
+            block_size = int(kv_cache.shape[1])
+            max_blocks = (
+                attn_metadata_narrowed.max_seq_len + block_size - 1
+            ) // block_size
+            decode_block_table = decode_block_table[:, :max_blocks]
+        topk_workspace: torch.Tensor | None = None
+        decode_topk_backend = os.getenv(
+            "VLLM_SPARSE_INDEXER_DECODE_TOPK_BACKEND", "persistent"
+        )
+        decode_topk_logits_len = decode_logits_len
+        topk_pad_logits_len = int(
+            os.getenv("VLLM_SPARSE_INDEXER_DECODE_TOPK_PAD_LOGITS_LEN", "0")
+            or "0"
+        )
+        if (
+            current_platform.is_cuda()
+            and decode_topk_backend == "legacy"
+            and topk_pad_logits_len > decode_logits_len
+        ):
+            # Widen only the topK view so legacy topK can use its multi-block
+            # branch. MQA logits still computes decode_logits_len columns, and
+            # topK only scans rowEnd <= seq_len <= decode_logits_len.
+            decode_topk_logits_len = min(max_model_len, topk_pad_logits_len)
         if is_deep_gemm_supported():
             logits = fp8_paged_mqa_logits(
                 padded_q_fp8_decode_tokens,
                 kv_cache,
                 weights[:num_padded_tokens],
                 seq_lens,
-                decode_metadata.block_table,
+                decode_block_table,
                 decode_metadata.schedule_metadata,
-                max_model_len=max_model_len,
+                max_model_len=decode_logits_len,
                 clean_logits=False,
             )
         else:
+            logits_out: torch.Tensor | None = None
+            if (
+                current_platform.is_cuda()
+                and os.getenv(
+                    "VLLM_SPARSE_INDEXER_DECODE_LOGITS_WORKSPACE", "0"
+                )
+                == "1"
+            ):
+                workspace_manager = current_workspace_manager()
+                if decode_topk_backend == "legacy":
+                    (logits_out,) = workspace_manager.get_simultaneous(
+                        (
+                            (num_padded_tokens, decode_topk_logits_len),
+                            torch.float32,
+                        ),
+                    )
+                else:
+                    logits_out, topk_workspace = (
+                        workspace_manager.get_simultaneous(
+                            ((num_padded_tokens, decode_logits_len), torch.float32),
+                            ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+                        )
+                    )
             logits = fp8_paged_mqa_logits_triton(
                 padded_q_fp8_decode_tokens,
                 kv_cache,
                 weights[:num_padded_tokens],
                 seq_lens,
-                decode_metadata.block_table,
-                max_model_len=max_model_len,
+                decode_block_table,
+                max_model_len=decode_logits_len,
+                logits_out=logits_out,
             )
+            if (
+                logits_out is not None
+                and decode_topk_logits_len > decode_logits_len
+            ):
+                logits = logits_out[:num_padded_tokens, :decode_topk_logits_len]
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        if current_platform.is_cuda():
-            workspace_manager = current_workspace_manager()
-            (topk_workspace,) = workspace_manager.get_simultaneous(
-                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
-            )
+        if current_platform.is_cuda() and decode_topk_backend != "legacy":
+            if topk_workspace is None:
+                workspace_manager = current_workspace_manager()
+                (topk_workspace,) = workspace_manager.get_simultaneous(
+                    ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+                )
             torch.ops._C.persistent_topk(
                 logits,
                 seq_lens,
@@ -623,6 +710,17 @@ def sparse_attn_indexer(
                 topk_workspace,
                 topk_tokens,
                 attn_metadata_narrowed.max_seq_len,
+            )
+        elif current_platform.is_cuda():
+            torch.ops._C.top_k_per_row_decode(
+                logits,
+                next_n,
+                seq_lens,
+                topk_indices,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+                topk_tokens,
             )
         else:
             if current_platform.is_xpu():

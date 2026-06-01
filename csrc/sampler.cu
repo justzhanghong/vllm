@@ -3,6 +3,7 @@
 
 #include <torch/cuda.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <algorithm>
 #include <cstdlib>
 #include <climits>
 
@@ -11,6 +12,23 @@
 #else
   #include <hipcub/hipcub.hpp>
 #endif
+
+namespace {
+
+int get_env_int(const char* name, int default_value) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') {
+    return default_value;
+  }
+  char* end = nullptr;
+  long parsed = std::strtol(value, &end, 10);
+  if (end == value) {
+    return default_value;
+  }
+  return static_cast<int>(parsed);
+}
+
+}  // namespace
 
 namespace vllm {
 
@@ -694,6 +712,10 @@ void top_k_per_row_decode(const torch::Tensor& logits, int64_t next_n,
   constexpr int kNumThreadsPerBlock = 512;
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const auto numColumns = logits.size(1);
+  const int splitWorkThreshold =
+      std::max(kSortingAlgorithmThreshold + 1,
+               get_env_int("VLLM_TOPK_DECODE_SPLIT_THRESHOLD",
+                           kSplitWorkThreshold));
 
   // True if seqLens is 2D (B, next_n): each logit row has its own pre-computed
   // effective seq_len. False if seqLens is 1D (B,): all rows in a batch share
@@ -720,7 +742,7 @@ void top_k_per_row_decode(const torch::Tensor& logits, int64_t next_n,
               static_cast<int>(stride1), static_cast<int>(topK),
               static_cast<int>(next_n), seqLensIs2D);
     }
-  } else if (numColumns < kSplitWorkThreshold) {
+  } else if (numColumns < splitWorkThreshold) {
     // From this threshold, use radix sort instead
     if (sortIndices) {
       vllm::topKPerRowDecode<kNumThreadsPerBlock, true, false, false, true>
@@ -739,7 +761,8 @@ void top_k_per_row_decode(const torch::Tensor& logits, int64_t next_n,
     }
   } else {
     // Long sequences are run in two steps
-    constexpr auto multipleBlocksPerRowConfig = 10;
+    const int multipleBlocksPerRowConfig = std::min(
+        32, std::max(1, get_env_int("VLLM_TOPK_DECODE_SPLIT_BLOCKS", 10)));
 
     const auto outIndicesAux =
         torch::empty({numRows, multipleBlocksPerRowConfig, topK},

@@ -579,3 +579,77 @@ def test_fp8_paged_mqa_logits_triton_matches_torch(
             atol=_ATOL,
             rtol=_RTOL,
         )
+
+
+@pytest.mark.parametrize("block_pages", [2, 4])
+def test_fp8_paged_mqa_logits_triton_block_pages_matches_torch(
+    monkeypatch, block_pages
+):
+    torch.manual_seed(1)
+    batch_size = 2
+    next_n = 1
+    num_heads = 16
+    head_dim = 128
+    block_size = 64
+    device = "cuda"
+
+    context_lens = torch.tensor([189, 257], dtype=torch.int32, device=device)
+    max_context_len = int(context_lens.max().item())
+    total_blocks = 16
+    max_blocks = (max_context_len + block_size - 1) // block_size + 2
+
+    kv_bf16 = torch.randn(
+        total_blocks, block_size, head_dim, dtype=torch.bfloat16, device=device
+    )
+    kv_packed = _pack_paged_kv(kv_bf16)
+    q_fp8 = torch.randn(
+        batch_size,
+        next_n,
+        num_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    ).to(torch.float8_e4m3fn)
+    weights = torch.randn(
+        batch_size * next_n, num_heads, dtype=torch.float32, device=device
+    )
+    block_tables = torch.randint(
+        0,
+        total_blocks,
+        (batch_size, max_blocks),
+        dtype=torch.int32,
+        device=device,
+    )
+    max_model_len = max_blocks * block_size
+
+    out_torch = _fp8_paged_mqa_logits_ref(
+        q_fp8,
+        kv_packed,
+        weights,
+        context_lens,
+        block_tables,
+        max_model_len,
+    )
+    monkeypatch.setenv(
+        "VLLM_SPARSE_INDEXER_DECODE_LOGITS_BLOCK_PAGES", str(block_pages)
+    )
+    out_triton = fp8_paged_mqa_logits_triton(
+        q_fp8,
+        kv_packed,
+        weights,
+        context_lens,
+        block_tables,
+        max_model_len,
+    )
+
+    inf_torch = torch.isinf(out_torch) & (out_torch < 0)
+    inf_triton = torch.isinf(out_triton) & (out_triton < 0)
+    assert torch.equal(inf_torch, inf_triton)
+    finite = ~inf_torch
+    if finite.any():
+        torch.testing.assert_close(
+            out_triton[finite],
+            out_torch[finite],
+            atol=_ATOL,
+            rtol=_RTOL,
+        )

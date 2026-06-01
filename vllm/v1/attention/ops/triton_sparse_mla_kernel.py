@@ -117,6 +117,8 @@ def _sparse_mla_compute_tile(
     q_pe_buffer,
     k_buffer,  # V is the first BLOCK_DV lanes of each row of k_buffer.
     indices_ptr,
+    req_id_ptr,
+    block_table_ptr,
     cur_q,
     cur_head,
     cur_kv_head_id,
@@ -132,14 +134,19 @@ def _sparse_mla_compute_tile(
     stride_kv_head,
     stride_indices_token,
     stride_indices_head,
+    stride_block_table_req,
+    stride_block_table_block,
     sm_scale,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DPE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    MAX_NUM_BLOCKS_PER_REQ: tl.constexpr,
     REUSE_K_AS_V: tl.constexpr,
     FULL_BLOCK_H: tl.constexpr,
+    CONVERT_REQ_TO_GLOBAL: tl.constexpr,
     ASSUME_VALID_INDICES: tl.constexpr,
     ASSUME_VALID_NOMASK: tl.constexpr,
     ASSUME_VALID_AFTER_TOPK: tl.constexpr,
@@ -199,6 +206,7 @@ def _sparse_mla_compute_tile(
     for start_indice in range(split_start, split_end, BLOCK_N):
         offs_indice = start_indice + tl.arange(0, BLOCK_N)
         mask_indice = offs_indice < split_end
+        convert_valid = mask_indice
         prefix_mask_kv = (
             mask_indice
             & (offs_indice < (VALID_INDEX_BASE_SEQ_LEN + cur_q + 1))
@@ -213,6 +221,25 @@ def _sparse_mla_compute_tile(
                 + cur_kv_head_id * stride_indices_head
                 + offs_indice,
             )
+            if CONVERT_REQ_TO_GLOBAL:
+                req_id = tl.load(req_id_ptr + cur_q)
+                block_id = indices // BLOCK_SIZE
+                inblock_off = indices - block_id * BLOCK_SIZE
+                convert_valid = (indices >= 0) & (
+                    block_id < MAX_NUM_BLOCKS_PER_REQ
+                )
+                block_idx = tl.load(
+                    block_table_ptr
+                    + req_id * stride_block_table_req
+                    + block_id * stride_block_table_block,
+                    mask=convert_valid,
+                    other=0,
+                )
+                indices = tl.where(
+                    convert_valid,
+                    block_idx * BLOCK_SIZE + inblock_off,
+                    0,
+                )
         elif ASSUME_PREFIX_LEN_MASK:
             indices = tl.load(
                 indices_ptr
@@ -222,6 +249,26 @@ def _sparse_mla_compute_tile(
                 mask=prefix_mask_kv,
                 other=0,
             )
+            if CONVERT_REQ_TO_GLOBAL:
+                req_id = tl.load(req_id_ptr + cur_q)
+                block_id = indices // BLOCK_SIZE
+                inblock_off = indices - block_id * BLOCK_SIZE
+                valid_block = (block_id >= 0) & (
+                    block_id < MAX_NUM_BLOCKS_PER_REQ
+                )
+                convert_valid = prefix_mask_kv & valid_block
+                block_idx = tl.load(
+                    block_table_ptr
+                    + req_id * stride_block_table_req
+                    + block_id * stride_block_table_block,
+                    mask=convert_valid,
+                    other=0,
+                )
+                indices = tl.where(
+                    convert_valid,
+                    block_idx * BLOCK_SIZE + inblock_off,
+                    0,
+                )
         else:
             indices = tl.load(
                 indices_ptr
@@ -231,12 +278,35 @@ def _sparse_mla_compute_tile(
                 mask=mask_indice,
                 other=-1,
             )
+            if CONVERT_REQ_TO_GLOBAL:
+                req_id = tl.load(req_id_ptr + cur_q)
+                block_id = indices // BLOCK_SIZE
+                inblock_off = indices - block_id * BLOCK_SIZE
+                valid_block = (block_id >= 0) & (
+                    block_id < MAX_NUM_BLOCKS_PER_REQ
+                )
+                convert_valid = mask_indice & valid_block
+                block_idx = tl.load(
+                    block_table_ptr
+                    + req_id * stride_block_table_req
+                    + block_id * stride_block_table_block,
+                    mask=convert_valid,
+                    other=0,
+                )
+                indices = tl.where(
+                    convert_valid,
+                    block_idx * BLOCK_SIZE + inblock_off,
+                    0,
+                )
 
         if ASSUME_VALID_NOMASK or (
             ASSUME_VALID_AFTER_TOPK_NOMASK
             and (VALID_INDEX_BASE_SEQ_LEN + cur_q + 1 >= INDEX_TOPK)
         ):
-            mask_kv = mask_indice
+            if CONVERT_REQ_TO_GLOBAL:
+                mask_kv = convert_valid
+            else:
+                mask_kv = mask_indice
         elif ASSUME_VALID_INDICES:
             mask_kv = mask_indice
         elif ASSUME_VALID_AFTER_TOPK and (
@@ -257,7 +327,10 @@ def _sparse_mla_compute_tile(
             ASSUME_VALID_AFTER_TOPK_NOMASK
             and (VALID_INDEX_BASE_SEQ_LEN + cur_q + 1 >= INDEX_TOPK)
         ):
-            k = tl.load(k_buffer + offs_k)
+            if CONVERT_REQ_TO_GLOBAL:
+                k = tl.load(k_buffer + offs_k, mask=mask_kv[None, :], other=0.0)
+            else:
+                k = tl.load(k_buffer + offs_k)
         else:
             k = tl.load(
                 k_buffer + offs_k,
@@ -275,7 +348,12 @@ def _sparse_mla_compute_tile(
             ASSUME_VALID_AFTER_TOPK_NOMASK
             and (VALID_INDEX_BASE_SEQ_LEN + cur_q + 1 >= INDEX_TOPK)
         ):
-            kpe = tl.load(k_buffer + offs_kpe)
+            if CONVERT_REQ_TO_GLOBAL:
+                kpe = tl.load(
+                    k_buffer + offs_kpe, mask=mask_kv[None, :], other=0.0
+                )
+            else:
+                kpe = tl.load(k_buffer + offs_kpe)
         else:
             kpe = tl.load(
                 k_buffer + offs_kpe,
@@ -289,7 +367,14 @@ def _sparse_mla_compute_tile(
             ASSUME_VALID_AFTER_TOPK_NOMASK
             and (VALID_INDEX_BASE_SEQ_LEN + cur_q + 1 >= INDEX_TOPK)
         ):
-            if not FULL_BLOCK_H:
+            if CONVERT_REQ_TO_GLOBAL:
+                if FULL_BLOCK_H:
+                    qk = tl.where(mask_kv[None, :], qk, NEG_LARGE)
+                else:
+                    qk = tl.where(
+                        (mask_h[:, None]) & (mask_kv[None, :]), qk, NEG_LARGE
+                    )
+            elif not FULL_BLOCK_H:
                 qk = tl.where(mask_h[:, None], qk, NEG_LARGE)
         else:
             if FULL_BLOCK_H:
@@ -311,7 +396,10 @@ def _sparse_mla_compute_tile(
                 ASSUME_VALID_AFTER_TOPK_NOMASK
                 and (VALID_INDEX_BASE_SEQ_LEN + cur_q + 1 >= INDEX_TOPK)
             ):
-                v = tl.load(k_buffer + offs_v)
+                if CONVERT_REQ_TO_GLOBAL:
+                    v = tl.load(k_buffer + offs_v, mask=mask_kv[:, None], other=0.0)
+                else:
+                    v = tl.load(k_buffer + offs_v)
             else:
                 v = tl.load(k_buffer + offs_v, mask=mask_kv[:, None], other=0.0)
 
@@ -336,6 +424,8 @@ def _sparse_mla_kernel_final(
     q_pe_buffer,
     k_buffer,
     indices_ptr,
+    req_id_ptr,
+    block_table_ptr,
     out_ptr,
     lse_ptr,
     seq_kv,
@@ -352,6 +442,8 @@ def _sparse_mla_kernel_final(
     stride_lse_token,
     stride_indices_token,
     stride_indices_head,
+    stride_block_table_req,
+    stride_block_table_block,
     sm_scale,
     index_topk: tl.constexpr,
     kv_group_num: tl.constexpr,
@@ -360,10 +452,13 @@ def _sparse_mla_kernel_final(
     BLOCK_DV: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DPE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    MAX_NUM_BLOCKS_PER_REQ: tl.constexpr,
     LOGE2: tl.constexpr,
     REUSE_K_AS_V: tl.constexpr,
     FULL_BLOCK_H: tl.constexpr,
     RETURN_LSE: tl.constexpr,
+    CONVERT_REQ_TO_GLOBAL: tl.constexpr,
     ASSUME_VALID_INDICES: tl.constexpr,
     ASSUME_VALID_NOMASK: tl.constexpr,
     ASSUME_VALID_AFTER_TOPK: tl.constexpr,
@@ -385,6 +480,8 @@ def _sparse_mla_kernel_final(
         q_pe_buffer,
         k_buffer,
         indices_ptr,
+        req_id_ptr,
+        block_table_ptr,
         cur_q,
         cur_head,
         cur_kv_head_id,
@@ -400,14 +497,19 @@ def _sparse_mla_kernel_final(
         stride_kv_head,
         stride_indices_token,
         stride_indices_head,
+        stride_block_table_req,
+        stride_block_table_block,
         sm_scale,
         BLOCK_H,
         BLOCK_N,
         BLOCK_DV,
         BLOCK_DMODEL,
         BLOCK_DPE,
+        BLOCK_SIZE,
+        MAX_NUM_BLOCKS_PER_REQ,
         REUSE_K_AS_V,
         FULL_BLOCK_H,
+        CONVERT_REQ_TO_GLOBAL,
         ASSUME_VALID_INDICES,
         ASSUME_VALID_NOMASK,
         ASSUME_VALID_AFTER_TOPK,
@@ -455,6 +557,8 @@ def _sparse_mla_kernel_final_static(
     q_pe_buffer,
     k_buffer,
     indices_ptr,
+    req_id_ptr,
+    block_table_ptr,
     out_ptr,
     lse_ptr,
     seq_kv,
@@ -471,6 +575,8 @@ def _sparse_mla_kernel_final_static(
     stride_lse_token,
     stride_indices_token,
     stride_indices_head,
+    stride_block_table_req,
+    stride_block_table_block,
     sm_scale,
     index_topk: tl.constexpr,
     kv_group_num: tl.constexpr,
@@ -479,10 +585,13 @@ def _sparse_mla_kernel_final_static(
     BLOCK_DV: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DPE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    MAX_NUM_BLOCKS_PER_REQ: tl.constexpr,
     LOGE2: tl.constexpr,
     REUSE_K_AS_V: tl.constexpr,
     FULL_BLOCK_H: tl.constexpr,
     RETURN_LSE: tl.constexpr,
+    CONVERT_REQ_TO_GLOBAL: tl.constexpr,
     ASSUME_VALID_INDICES: tl.constexpr,
     ASSUME_VALID_NOMASK: tl.constexpr,
     ASSUME_VALID_AFTER_TOPK: tl.constexpr,
@@ -504,6 +613,8 @@ def _sparse_mla_kernel_final_static(
         q_pe_buffer,
         k_buffer,
         indices_ptr,
+        req_id_ptr,
+        block_table_ptr,
         cur_q,
         cur_head,
         cur_kv_head_id,
@@ -519,14 +630,19 @@ def _sparse_mla_kernel_final_static(
         stride_kv_head,
         stride_indices_token,
         stride_indices_head,
+        stride_block_table_req,
+        stride_block_table_block,
         sm_scale,
         BLOCK_H,
         BLOCK_N,
         BLOCK_DV,
         BLOCK_DMODEL,
         BLOCK_DPE,
+        BLOCK_SIZE,
+        MAX_NUM_BLOCKS_PER_REQ,
         REUSE_K_AS_V,
         FULL_BLOCK_H,
+        CONVERT_REQ_TO_GLOBAL,
         ASSUME_VALID_INDICES,
         ASSUME_VALID_NOMASK,
         ASSUME_VALID_AFTER_TOPK,
@@ -577,6 +693,8 @@ def _sparse_mla_kernel_split(
     q_pe_buffer,
     k_buffer,
     indices_ptr,
+    req_id_ptr,
+    block_table_ptr,
     mid_out_ptr,
     seq_kv,
     h_q,
@@ -591,6 +709,8 @@ def _sparse_mla_kernel_split(
     stride_mid_split,
     stride_indices_token,
     stride_indices_head,
+    stride_block_table_req,
+    stride_block_table_block,
     sm_scale,
     index_topk: tl.constexpr,
     NUM_KV_SPLITS: tl.constexpr,
@@ -600,9 +720,12 @@ def _sparse_mla_kernel_split(
     BLOCK_DV: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DPE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    MAX_NUM_BLOCKS_PER_REQ: tl.constexpr,
     LOGE2: tl.constexpr,
     REUSE_K_AS_V: tl.constexpr,
     FULL_BLOCK_H: tl.constexpr,
+    CONVERT_REQ_TO_GLOBAL: tl.constexpr,
     ASSUME_VALID_INDICES: tl.constexpr,
     ASSUME_VALID_NOMASK: tl.constexpr,
     ASSUME_VALID_AFTER_TOPK: tl.constexpr,
@@ -630,6 +753,8 @@ def _sparse_mla_kernel_split(
         q_pe_buffer,
         k_buffer,
         indices_ptr,
+        req_id_ptr,
+        block_table_ptr,
         cur_q,
         cur_head,
         cur_kv_head_id,
@@ -645,14 +770,19 @@ def _sparse_mla_kernel_split(
         stride_kv_head,
         stride_indices_token,
         stride_indices_head,
+        stride_block_table_req,
+        stride_block_table_block,
         sm_scale,
         BLOCK_H,
         BLOCK_N,
         BLOCK_DV,
         BLOCK_DMODEL,
         BLOCK_DPE,
+        BLOCK_SIZE,
+        MAX_NUM_BLOCKS_PER_REQ,
         REUSE_K_AS_V,
         FULL_BLOCK_H,
+        CONVERT_REQ_TO_GLOBAL,
         ASSUME_VALID_INDICES,
         ASSUME_VALID_NOMASK,
         ASSUME_VALID_AFTER_TOPK,
@@ -813,6 +943,9 @@ def triton_sparse_mla_attention(
     assume_valid_indices: bool = False,
     valid_index_base_seq_len: int | None = None,
     return_lse: bool = False,
+    req_id: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
+    block_size: int = 64,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Sparse MLA attention over topk indices.
 
@@ -821,7 +954,9 @@ def triton_sparse_mla_attention(
                    (q_nope [num_tokens, num_heads_q, 512],
                     q_pe [num_tokens, num_heads_q, 64])
         kv:        [seq_kv, num_heads_kv=1, dim_qk] bf16
-        indices:   [num_tokens, num_heads_kv=1, topk] int32
+        indices:   [num_tokens, num_heads_kv=1, topk] int32. When
+            block_table is provided, these are request-local indices that are
+            converted to physical KV slots inside the sparse DSA kernel.
         sm_scale:  softmax scale
         num_kv_splits: override auto-heuristic; None/0 = auto, 1 = force single-pass.
         sm_count:  device SM count, used by the split heuristic. If None,
@@ -908,6 +1043,25 @@ def triton_sparse_mla_attention(
         os.getenv("VLLM_SPARSE_MLA_ASSUME_PREFIX_LEN_MASK", "0") == "1"
         and valid_index_base_seq_len is not None
     )
+    convert_req_to_global = req_id is not None and block_table is not None
+    if convert_req_to_global:
+        assert req_id is not None
+        assert block_table is not None
+        assert req_id.dtype == torch.int32
+        assert block_table.dtype == torch.int32
+        assert req_id.device == indices.device
+        assert block_table.device == indices.device
+        assert req_id.shape[0] >= num_tokens
+        req_id_ptr = req_id
+        block_table_ptr = block_table
+        stride_block_table_req, stride_block_table_block = block_table.stride()
+        max_num_blocks_per_req = block_table.shape[1]
+    else:
+        req_id_ptr = indices
+        block_table_ptr = indices
+        stride_block_table_req = 0
+        stride_block_table_block = 0
+        max_num_blocks_per_req = 1
 
     if num_kv_splits == 1:
         if os.getenv("VLLM_SPARSE_MLA_FINAL_DYNAMIC_CONFIG", "0") == "1":
@@ -919,6 +1073,8 @@ def triton_sparse_mla_attention(
                 q_pe_buffer=q_pe,
                 k_buffer=kv,
                 indices_ptr=indices,
+                req_id_ptr=req_id_ptr,
+                block_table_ptr=block_table_ptr,
                 out_ptr=out,
                 lse_ptr=lse_ptr,
                 seq_kv=kv.shape[0],
@@ -935,6 +1091,8 @@ def triton_sparse_mla_attention(
                 stride_lse_token=0 if lse is None else lse.stride(0),
                 stride_indices_token=indices.stride(0),
                 stride_indices_head=indices.stride(1),
+                stride_block_table_req=stride_block_table_req,
+                stride_block_table_block=stride_block_table_block,
                 sm_scale=sm_scale * LOG2E,
                 index_topk=index_topk,
                 kv_group_num=kv_group_num,
@@ -943,10 +1101,13 @@ def triton_sparse_mla_attention(
                 BLOCK_DV=_BLOCK_DV,
                 BLOCK_DMODEL=_BLOCK_DMODEL,
                 BLOCK_DPE=_BLOCK_DPE,
+                BLOCK_SIZE=block_size,
+                MAX_NUM_BLOCKS_PER_REQ=max_num_blocks_per_req,
                 LOGE2=LOGE2,
                 REUSE_K_AS_V=reuse_k_as_v,
                 FULL_BLOCK_H=full_block_h,
                 RETURN_LSE=return_lse,
+                CONVERT_REQ_TO_GLOBAL=convert_req_to_global,
                 ASSUME_VALID_INDICES=assume_valid_indices,
                 ASSUME_VALID_NOMASK=assume_valid_nomask
                 and index_topk % block_n == 0,
@@ -971,6 +1132,8 @@ def triton_sparse_mla_attention(
                 q_pe_buffer=q_pe,
                 k_buffer=kv,
                 indices_ptr=indices,
+                req_id_ptr=req_id_ptr,
+                block_table_ptr=block_table_ptr,
                 out_ptr=out,
                 lse_ptr=lse_ptr,
                 seq_kv=kv.shape[0],
@@ -987,6 +1150,8 @@ def triton_sparse_mla_attention(
                 stride_lse_token=0 if lse is None else lse.stride(0),
                 stride_indices_token=indices.stride(0),
                 stride_indices_head=indices.stride(1),
+                stride_block_table_req=stride_block_table_req,
+                stride_block_table_block=stride_block_table_block,
                 sm_scale=sm_scale * LOG2E,
                 index_topk=index_topk,
                 kv_group_num=kv_group_num,
@@ -995,10 +1160,13 @@ def triton_sparse_mla_attention(
                 BLOCK_DV=_BLOCK_DV,
                 BLOCK_DMODEL=_BLOCK_DMODEL,
                 BLOCK_DPE=_BLOCK_DPE,
+                BLOCK_SIZE=block_size,
+                MAX_NUM_BLOCKS_PER_REQ=max_num_blocks_per_req,
                 LOGE2=LOGE2,
                 REUSE_K_AS_V=reuse_k_as_v,
                 FULL_BLOCK_H=full_block_h,
                 RETURN_LSE=return_lse,
+                CONVERT_REQ_TO_GLOBAL=convert_req_to_global,
                 ASSUME_VALID_INDICES=assume_valid_indices,
                 ASSUME_VALID_NOMASK=assume_valid_nomask
                 and index_topk % block_n == 0,
@@ -1018,6 +1186,8 @@ def triton_sparse_mla_attention(
             q_pe_buffer=q_pe,
             k_buffer=kv,
             indices_ptr=indices,
+            req_id_ptr=req_id_ptr,
+            block_table_ptr=block_table_ptr,
             out_ptr=out,
             lse_ptr=lse_ptr,
             seq_kv=kv.shape[0],
@@ -1034,6 +1204,8 @@ def triton_sparse_mla_attention(
             stride_lse_token=0 if lse is None else lse.stride(0),
             stride_indices_token=indices.stride(0),
             stride_indices_head=indices.stride(1),
+            stride_block_table_req=stride_block_table_req,
+            stride_block_table_block=stride_block_table_block,
             sm_scale=sm_scale * LOG2E,
             index_topk=index_topk,
             kv_group_num=kv_group_num,
@@ -1041,10 +1213,13 @@ def triton_sparse_mla_attention(
             BLOCK_DV=_BLOCK_DV,
             BLOCK_DMODEL=_BLOCK_DMODEL,
             BLOCK_DPE=_BLOCK_DPE,
+            BLOCK_SIZE=block_size,
+            MAX_NUM_BLOCKS_PER_REQ=max_num_blocks_per_req,
             LOGE2=LOGE2,
             REUSE_K_AS_V=reuse_k_as_v,
             FULL_BLOCK_H=full_block_h,
             RETURN_LSE=return_lse,
+            CONVERT_REQ_TO_GLOBAL=convert_req_to_global,
             ASSUME_VALID_INDICES=assume_valid_indices,
             ASSUME_VALID_NOMASK=assume_valid_nomask and index_topk % 32 == 0,
             ASSUME_VALID_AFTER_TOPK=valid_index_base_seq_len is not None,
@@ -1068,6 +1243,8 @@ def triton_sparse_mla_attention(
         q_pe_buffer=q_pe,
         k_buffer=kv,
         indices_ptr=indices,
+        req_id_ptr=req_id_ptr,
+        block_table_ptr=block_table_ptr,
         mid_out_ptr=mid_out,
         seq_kv=kv.shape[0],
         h_q=num_heads_q,
@@ -1082,6 +1259,8 @@ def triton_sparse_mla_attention(
         stride_mid_split=mid_out.stride(2),
         stride_indices_token=indices.stride(0),
         stride_indices_head=indices.stride(1),
+        stride_block_table_req=stride_block_table_req,
+        stride_block_table_block=stride_block_table_block,
         sm_scale=sm_scale * LOG2E,
         index_topk=index_topk,
         NUM_KV_SPLITS=num_kv_splits,
@@ -1090,9 +1269,12 @@ def triton_sparse_mla_attention(
         BLOCK_DV=_BLOCK_DV,
         BLOCK_DMODEL=_BLOCK_DMODEL,
         BLOCK_DPE=_BLOCK_DPE,
+        BLOCK_SIZE=block_size,
+        MAX_NUM_BLOCKS_PER_REQ=max_num_blocks_per_req,
         LOGE2=LOGE2,
         REUSE_K_AS_V=reuse_k_as_v,
         FULL_BLOCK_H=full_block_h,
+        CONVERT_REQ_TO_GLOBAL=convert_req_to_global,
         ASSUME_VALID_INDICES=assume_valid_indices,
         ASSUME_VALID_NOMASK=False,
         ASSUME_VALID_AFTER_TOPK=False,

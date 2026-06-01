@@ -180,6 +180,122 @@ def _fp8_paged_mqa_logits_kernel(
     )
 
 
+@triton.jit
+def _fp8_paged_mqa_logits_multi_block_kernel(
+    q_ptr,
+    kv_fp8_ptr,
+    kv_scale_ptr,
+    weights_ptr,
+    context_lens_ptr,
+    block_tables_ptr,
+    logits_ptr,
+    stride_q_b,
+    stride_q_n,
+    stride_q_h,
+    stride_q_d,
+    stride_kvf_block,
+    stride_kvf_s,
+    stride_kvf_d,
+    stride_kvs_block,
+    stride_kvs_s,
+    stride_w_t,
+    stride_w_h,
+    stride_bt_b,
+    stride_bt_k,
+    stride_l_t,
+    stride_l_n,
+    next_n: tl.constexpr,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    block_table_blocks: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_PAGES: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    block_group = tl.program_id(1) * BLOCK_PAGES
+
+    batch_id = token_id // next_n
+    next_n_id = token_id % next_n
+
+    context_len = tl.load(context_lens_ptr + batch_id)
+    if block_group * block_size >= context_len:
+        return
+
+    q_offset = context_len - next_n + next_n_id
+
+    offs_h = tl.arange(0, BLOCK_H)
+    offs_d = tl.arange(0, BLOCK_D)
+    offs_n = tl.arange(0, BLOCK_N)
+    mask_h = offs_h < num_heads
+    mask_d = offs_d < head_dim
+
+    in_group_tokens = BLOCK_PAGES * block_size
+    mask_n = offs_n < in_group_tokens
+    page_in_group = offs_n // block_size
+    page_offset = offs_n - page_in_group * block_size
+    block_rk = block_group + page_in_group
+    mask_block = block_rk < block_table_blocks
+
+    block_idx = tl.load(
+        block_tables_ptr + batch_id * stride_bt_b + block_rk * stride_bt_k,
+        mask=mask_n & mask_block,
+        other=0,
+    )
+
+    q_base = q_ptr + batch_id * stride_q_b + next_n_id * stride_q_n
+    q_byte = tl.load(
+        q_base + offs_h[:, None] * stride_q_h + offs_d[None, :] * stride_q_d,
+        mask=mask_h[:, None] & mask_d[None, :],
+        other=0,
+    )
+    q = _decode_e4m3fn(q_byte).to(tl.bfloat16)
+
+    k_byte = tl.load(
+        kv_fp8_ptr
+        + block_idx[:, None] * stride_kvf_block
+        + page_offset[:, None] * stride_kvf_s
+        + offs_d[None, :] * stride_kvf_d,
+        mask=(mask_n & mask_block)[:, None] & mask_d[None, :],
+        other=0,
+    )
+    k_scale = tl.load(
+        kv_scale_ptr
+        + block_idx * stride_kvs_block
+        + page_offset * stride_kvs_s,
+        mask=mask_n & mask_block,
+        other=0.0,
+    )
+    k = (_decode_e4m3fn(k_byte) * k_scale[:, None]).to(tl.bfloat16)
+
+    s = tl.dot(q, tl.trans(k))
+
+    w = tl.load(
+        weights_ptr + token_id * stride_w_t + offs_h * stride_w_h,
+        mask=mask_h,
+        other=0.0,
+    )
+    s = tl.where(s > 0, s, 0.0) * w[:, None]
+    out = tl.sum(s, axis=0)
+
+    k_offset = block_group * block_size + offs_n
+    valid = (
+        mask_n
+        & mask_block
+        & (k_offset < context_len)
+        & (k_offset <= q_offset)
+    )
+    out = tl.where(valid, out, float("-inf"))
+
+    tl.store(
+        logits_ptr + token_id * stride_l_t + k_offset * stride_l_n,
+        out,
+        mask=mask_n & mask_block,
+    )
+
+
 def fp8_paged_mqa_logits_triton(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -187,6 +303,7 @@ def fp8_paged_mqa_logits_triton(
     context_lens: torch.Tensor,
     block_tables: torch.Tensor,
     max_model_len: int,
+    logits_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Triton implementation of DeepGEMM's fp8_paged_mqa_logits.
 
@@ -220,16 +337,90 @@ def fp8_paged_mqa_logits_triton(
     kv_scale = kv_flat[:, k_end:].view(torch.float32)
     q_byte = q.view(torch.uint8)
 
-    logits = torch.full(
-        (B * next_n, max_model_len),
-        float("-inf"),
-        dtype=torch.float32,
-        device=q.device,
-    )
+    if logits_out is not None:
+        assert logits_out.dtype == torch.float32
+        assert logits_out.device == q.device
+        assert logits_out.shape[0] >= B * next_n
+        assert logits_out.shape[1] >= max_model_len
+        logits = logits_out[: B * next_n, :max_model_len]
+        if os.getenv("VLLM_SPARSE_INDEXER_DECODE_EMPTY_LOGITS", "0") != "1":
+            logits.fill_(float("-inf"))
+    elif os.getenv("VLLM_SPARSE_INDEXER_DECODE_EMPTY_LOGITS", "0") == "1":
+        logits = torch.empty(
+            (B * next_n, max_model_len),
+            dtype=torch.float32,
+            device=q.device,
+        )
+    else:
+        logits = torch.full(
+            (B * next_n, max_model_len),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q.device,
+        )
 
     BLOCK_H = max(16, triton.next_power_of_2(num_heads))
     BLOCK_D = triton.next_power_of_2(head_dim)
     BLOCK_N = triton.next_power_of_2(block_size)
+
+    block_pages = int(
+        os.getenv("VLLM_SPARSE_INDEXER_DECODE_LOGITS_BLOCK_PAGES", "1")
+        or "1"
+    )
+    if block_pages not in (1, 2, 4):
+        raise ValueError(
+            "VLLM_SPARSE_INDEXER_DECODE_LOGITS_BLOCK_PAGES must be one "
+            f"of 1, 2, or 4, got {block_pages}"
+        )
+    if block_pages > 1:
+        multi_block_n = triton.next_power_of_2(block_size * block_pages)
+        grid = (B * next_n, triton.cdiv(block_tables.shape[1], block_pages))
+        _fp8_paged_mqa_logits_multi_block_kernel[grid](
+            q_byte,
+            kv_byte,
+            kv_scale,
+            weights,
+            context_lens,
+            block_tables,
+            logits,
+            q_byte.stride(0),
+            q_byte.stride(1),
+            q_byte.stride(2),
+            q_byte.stride(3),
+            kv_byte.stride(0),
+            kv_byte.stride(1),
+            kv_byte.stride(2),
+            kv_scale.stride(0),
+            kv_scale.stride(1),
+            weights.stride(0),
+            weights.stride(1),
+            block_tables.stride(0),
+            block_tables.stride(1),
+            logits.stride(0),
+            logits.stride(1),
+            next_n=next_n,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            block_size=block_size,
+            block_table_blocks=block_tables.shape[1],
+            BLOCK_H=BLOCK_H,
+            BLOCK_D=BLOCK_D,
+            BLOCK_N=multi_block_n,
+            BLOCK_PAGES=block_pages,
+            num_warps=int(
+                os.getenv(
+                    "VLLM_SPARSE_INDEXER_DECODE_LOGITS_BLOCK_PAGES_WARPS",
+                    "4",
+                )
+            ),
+            num_stages=int(
+                os.getenv(
+                    "VLLM_SPARSE_INDEXER_DECODE_LOGITS_BLOCK_PAGES_STAGES",
+                    "3",
+                )
+            ),
+        )
+        return logits
 
     grid = (B * next_n, block_tables.shape[1])
     _fp8_paged_mqa_logits_kernel[grid](

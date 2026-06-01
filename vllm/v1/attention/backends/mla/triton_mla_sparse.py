@@ -44,6 +44,13 @@ _INDEXER_NUM_HEADS = 64
 _INDEXER_HEAD_DIM = 128
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
 class TritonMLASparseMetadataBuilder(XPUMLASparseMetadataBuilder):
     """Metadata builder advertising cudagraph support for the CUDA/Triton
     sparse MLA path. The XPU base keeps `AttentionCGSupport.NEVER` because
@@ -87,6 +94,21 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 sm_scale=self.softmax_scale,
                 num_kv_splits=splits,
                 sm_count=self._sm_count,
+            )
+        if os.getenv("VLLM_SPARSE_MLA_FUSED_REQ_TO_GLOBAL", "0") == "1":
+            req_id = torch.zeros(1, dtype=torch.int32, device=device)
+            block_table = torch.zeros(1, 1, dtype=torch.int32, device=device)
+            triton_sparse_mla_attention(
+                q,
+                kv,
+                indices,
+                sm_scale=self.softmax_scale,
+                num_kv_splits=1,
+                sm_count=self._sm_count,
+                assume_valid_indices=True,
+                req_id=req_id,
+                block_table=block_table,
+                block_size=64,
             )
         extra_warmup_shapes = os.getenv("VLLM_SPARSE_MLA_WARMUP_NUM_TOKENS")
         if extra_warmup_shapes:
@@ -175,7 +197,29 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
             -1, 1, kv_c_and_k_pe_cache.shape[-1]
         )
-        topk_indices = topk_indices.view(num_tokens, 1, -1)
+        use_fused_req_to_global = (
+            os.getenv("VLLM_SPARSE_MLA_FUSED_REQ_TO_GLOBAL", "0") == "1"
+            and attn_metadata.full_topk_start <= 0
+            and num_tokens
+            <= int(os.getenv("VLLM_SPARSE_MLA_FUSED_REQ_TO_GLOBAL_MAX_TOKENS", "1"))
+        )
+        if use_fused_req_to_global:
+            topk_indices = topk_indices.view(num_tokens, 1, -1)
+            sparse_kwargs = {
+                "req_id": attn_metadata.req_id_per_token,
+                "block_table": attn_metadata.block_table,
+                "block_size": attn_metadata.block_size,
+            }
+        else:
+            topk_indices = triton_convert_req_index_to_global_index(
+                attn_metadata.req_id_per_token,
+                attn_metadata.block_table,
+                topk_indices,
+                BLOCK_SIZE=attn_metadata.block_size,
+                NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
+                BLOCK_N=_env_int("VLLM_SPARSE_MLA_REQ_TO_GLOBAL_BLOCK_N", 128),
+            ).view(num_tokens, 1, -1)
+            sparse_kwargs = {}
         out_heads = q_nope.shape[1] if return_lse else self.num_heads
         if (
             os.getenv("VLLM_SPARSE_MLA_ASSUME_VALID_DYNAMIC", "0") == "1"
@@ -191,6 +235,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                     sm_count=self._sm_count,
                     assume_valid_indices=True,
                     return_lse=return_lse,
+                    **sparse_kwargs,
                 )
                 if return_lse:
                     output, lse = result
@@ -205,6 +250,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                     sm_count=self._sm_count,
                     valid_index_base_seq_len=attn_metadata.base_seq_len,
                     return_lse=return_lse,
+                    **sparse_kwargs,
                 )
                 if return_lse:
                     output, lse = result
@@ -224,6 +270,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                     sm_count=self._sm_count,
                     assume_valid_indices=True,
                     return_lse=return_lse,
+                    **sparse_kwargs,
                 )
                 if return_lse:
                     output, lse = result
@@ -246,6 +293,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                         sm_count=self._sm_count,
                         valid_index_base_seq_len=attn_metadata.base_seq_len,
                         return_lse=True,
+                        **sparse_kwargs,
                     )
                     output, lse = result
                     return output[:, :out_heads, :], lse[:, :out_heads]
@@ -274,6 +322,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
             sm_scale=self.softmax_scale,
             sm_count=self._sm_count,
             return_lse=return_lse,
+            **sparse_kwargs,
         )
         if return_lse:
             output, lse = result
@@ -295,18 +344,10 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
-        topk_indices_global = triton_convert_req_index_to_global_index(
-            attn_metadata.req_id_per_token,
-            attn_metadata.block_table,
-            topk_indices,
-            BLOCK_SIZE=attn_metadata.block_size,
-            NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
-        )
-
         result = self._forward_bf16_kv(
             q,
             kv_c_and_k_pe_cache,
-            topk_indices_global,
+            topk_indices,
             attn_metadata,
             return_lse=self.need_to_return_lse_for_decode,
         )

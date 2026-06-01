@@ -10,6 +10,9 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
+from vllm.v1.attention.backends.mla.sparse_utils import (
+    triton_convert_req_index_to_global_index,
+)
 from vllm.v1.attention.ops.triton_sparse_mla_kernel import (
     _DIM_QK,
     triton_sparse_mla_attention,
@@ -114,3 +117,51 @@ def test_short_prefill_no_nan(num_kv_splits, kv_cache):
     )
     assert not torch.isnan(out).any()
     assert not torch.isinf(out).any()
+
+
+def test_fused_req_to_global_matches_preconverted(kv_cache):
+    torch.manual_seed(1)
+    num_tokens, num_heads, topk = 2, 16, 2048
+    block_size = 64
+    q = torch.randn(num_tokens, num_heads, _DIM_QK, dtype=torch.bfloat16, device="cuda")
+    req_id = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    block_table = torch.stack(
+        (
+            torch.arange(0, kv_cache.shape[0] // block_size, device="cuda"),
+            torch.arange(1, kv_cache.shape[0] // block_size + 1, device="cuda"),
+        )
+    ).to(torch.int32)
+    max_local_len = (block_table.shape[1] - 1) * block_size
+    indices_local = torch.randint(
+        0, max_local_len, (num_tokens, topk), dtype=torch.int32, device="cuda"
+    )
+    indices_global = triton_convert_req_index_to_global_index(
+        req_id,
+        block_table,
+        indices_local,
+        BLOCK_SIZE=block_size,
+        NUM_TOPK_TOKENS=topk,
+    ).view(num_tokens, 1, topk)
+    indices_local = indices_local.view(num_tokens, 1, topk)
+
+    out_ref = triton_sparse_mla_attention(
+        q,
+        kv_cache,
+        indices_global,
+        sm_scale=0.1,
+        num_kv_splits=1,
+        assume_valid_indices=True,
+    )
+    out = triton_sparse_mla_attention(
+        q,
+        kv_cache,
+        indices_local,
+        sm_scale=0.1,
+        num_kv_splits=1,
+        assume_valid_indices=True,
+        req_id=req_id,
+        block_table=block_table,
+        block_size=block_size,
+    )
+
+    torch.testing.assert_close(out.float(), out_ref.float(), atol=5e-2, rtol=5e-3)
