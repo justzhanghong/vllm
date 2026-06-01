@@ -1077,13 +1077,23 @@ class DeepseekV2DecoderLayer(nn.Module):
         capture_mode = os.environ.get("VLLM_NORM_CAPTURE_MODE", "")
         capture_layer_env = os.environ.get("VLLM_NORM_CAPTURE_LAYER") or "36"
         capture_hook = os.environ.get("VLLM_NORM_CAPTURE_HOOK", "model.norm")
-        expected_hook = (
-            f"model.layers.{int(capture_layer_env)}.post_attention_layernorm"
+        capture_layer = int(capture_layer_env)
+        expected_post_attention_hook = (
+            f"model.layers.{capture_layer}.post_attention_layernorm"
+        )
+        expected_input_layernorm_hook = (
+            f"model.layers.{capture_layer}.input_layernorm"
         )
         self._norm_capture_aux_runner_enabled = (
             capture_mode == "aux_runner"
-            and capture_hook == expected_hook
-            and layer_idx == int(capture_layer_env)
+            and capture_hook in (
+                expected_post_attention_hook,
+                expected_input_layernorm_hook,
+            )
+            and layer_idx == capture_layer
+        )
+        self._norm_capture_input_layernorm_enabled = (
+            capture_hook == expected_input_layernorm_hook
         )
         self._norm_capture_side_effect_enabled = capture_mode != "aux_runner"
 
@@ -1207,6 +1217,70 @@ class DeepseekV2DecoderLayer(nn.Module):
             path,
         )
 
+    def _capture_input_layernorm(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> None:
+        capture_dir = os.environ.get("VLLM_NORM_CAPTURE_DIR")
+        if not capture_dir:
+            return
+        capture_hook = os.environ.get("VLLM_NORM_CAPTURE_HOOK", "model.norm")
+        target_layer_env = os.environ.get("VLLM_NORM_CAPTURE_LAYER") or "4"
+        target_layer = int(target_layer_env)
+        expected_hook = f"model.layers.{target_layer}.input_layernorm"
+        if capture_hook != expected_hook or self.layer_idx != target_layer:
+            return
+        tp_rank = get_tensor_model_parallel_rank()
+        target_tp_rank = os.environ.get("VLLM_NORM_CAPTURE_TP_RANK")
+        if target_tp_rank is not None and tp_rank != int(target_tp_rank):
+            return
+        pp_group = get_pp_group()
+        pp_rank = pp_group.rank_in_group
+        pp_world_size = pp_group.world_size
+        global_rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            else None
+        )
+        os.makedirs(capture_dir, exist_ok=True)
+        counter = getattr(self, "_input_layernorm_capture_counter", 0)
+        self._input_layernorm_capture_counter = counter + 1
+        tag = os.environ.get("VLLM_NORM_CAPTURE_TAG", "norm")
+        input_hidden_states = (
+            hidden_states if residual is None else hidden_states + residual
+        )
+        path = os.path.join(
+            capture_dir,
+            f"{tag}_layer{self.layer_idx:03d}_input_layernorm_input_"
+            f"tp{tp_rank}_pp{pp_rank}_{os.getpid()}_{counter:06d}_"
+            f"{time.time_ns()}.pt",
+        )
+        torch.save(
+            {
+                "hidden_states": input_hidden_states.detach().cpu().clone(),
+                "positions": positions.detach().cpu().clone(),
+                "shape": tuple(input_hidden_states.shape),
+                "dtype": str(input_hidden_states.dtype),
+                "tag": tag,
+                "pid": os.getpid(),
+                "counter": counter,
+                "time_ns": time.time_ns(),
+                "hook": expected_hook,
+                "hook_semantics": "input",
+                "capture_policy": "hidden_states_plus_residual_before_input_layernorm",
+                "layer_idx": self.layer_idx,
+                "tp_rank": tp_rank,
+                "tp_world_size": get_tensor_model_parallel_world_size(),
+                "pp_rank": pp_rank,
+                "pp_world_size": pp_world_size,
+                "global_rank": global_rank,
+            },
+            path,
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1214,6 +1288,20 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        norm_capture_hidden_states = None
+        if (
+            self._norm_capture_aux_runner_enabled
+            and self._norm_capture_input_layernorm_enabled
+        ):
+            norm_capture_hidden_states = (
+                hidden_states if residual is None else hidden_states + residual
+            ).clone()
+        elif (
+            self._norm_capture_side_effect_enabled
+            and self._norm_capture_input_layernorm_enabled
+        ):
+            self._capture_input_layernorm(positions, hidden_states, residual)
+
         # Self Attention
         if residual is None:
             residual = hidden_states.clone()
@@ -1244,10 +1332,15 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        norm_capture_hidden_states = None
-        if self._norm_capture_aux_runner_enabled:
+        if (
+            norm_capture_hidden_states is None
+            and self._norm_capture_aux_runner_enabled
+        ):
             norm_capture_hidden_states = hidden_states.clone()
-        elif self._norm_capture_side_effect_enabled:
+        elif (
+            self._norm_capture_side_effect_enabled
+            and not self._norm_capture_input_layernorm_enabled
+        ):
             self._capture_post_attention_layernorm(positions, hidden_states)
         hidden_states = self.mlp(hidden_states)
 

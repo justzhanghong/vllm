@@ -5787,6 +5787,7 @@ class GPUModelRunner(
         os.makedirs(capture_dir, exist_ok=True)
         tag = os.environ.get("VLLM_NORM_CAPTURE_TAG", "norm")
         hook = os.environ.get("VLLM_NORM_CAPTURE_HOOK", "model.norm")
+        hook_semantics = os.environ.get("VLLM_NORM_CAPTURE_HOOK_SEMANTICS", "")
         for hidden_states in aux_hidden_states:
             counter = self._norm_capture_aux_counter
             self._norm_capture_aux_counter += 1
@@ -5806,6 +5807,7 @@ class GPUModelRunner(
                     "counter": counter,
                     "time_ns": time.time_ns(),
                     "hook": hook,
+                    "hook_semantics": hook_semantics,
                     "tp_rank": tp_rank,
                     "tp_world_size": get_tp_group().world_size,
                     "pp_rank": pp_rank,
