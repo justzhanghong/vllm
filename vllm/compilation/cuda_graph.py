@@ -140,6 +140,7 @@ class CUDAGraphOptions:
     debug_log_enable: bool = True
     gc_disable: bool = False
     weak_ref_output: bool = True
+    strong_ref_entry_output: bool = False
 
 
 class CUDAGraphWrapper:
@@ -326,9 +327,13 @@ class CUDAGraphWrapper:
                         # any other cuda graph.
                         output = weak_ref_tensors(output)
 
-            # here we always use weak ref for the output
-            # to save memory
-            entry.output = weak_ref_tensors(output)
+            # Keep the historical weak-ref behavior by default to save memory.
+            # FULL graph stability diagnostics can request a strong reference
+            # for outputs that cross pipeline/sampling boundaries after replay.
+            if self.cudagraph_options.strong_ref_entry_output:
+                entry.output = output
+            else:
+                entry.output = weak_ref_tensors(output)
             entry.cudagraph = cudagraph
 
             compilation_counter.num_cudagraph_captured += 1

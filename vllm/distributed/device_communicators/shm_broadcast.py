@@ -29,7 +29,6 @@ from zmq import (  # type: ignore
 import vllm.envs as envs
 from vllm.distributed.utils import StatelessProcessGroup, sched_yield
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
 from vllm.utils.network_utils import (
     get_ip,
     get_open_zmq_inproc_path,
@@ -771,6 +770,18 @@ class MessageQueue:
             raise RuntimeError("Only readers can dequeue")
         return obj
 
+    def can_dequeue(self) -> bool:
+        """Return true when dequeue can read without waiting."""
+        if self._is_local_reader:
+            with self.buffer.get_metadata(self.current_idx) as metadata_buffer:
+                memory_fence()
+                read_flag = metadata_buffer[self.local_reader_rank + 1]
+                written_flag = metadata_buffer[0]
+                return bool(written_flag and not read_flag)
+        if self._is_remote_reader:
+            return bool(self.remote_socket.poll(timeout=0))
+        raise RuntimeError("Only readers can dequeue")
+
     @staticmethod
     def recv(socket: zmq.Socket, timeout: float | None) -> Any:
         timeout_ms = None if timeout is None else int(timeout * 1000)
@@ -815,9 +826,22 @@ class MessageQueue:
             The MessageQueue instance for the calling process,
             and a list of handles (only non-empty for the reader process).
         """
-        local_size = current_platform.device_count()
-        rank = dist.get_rank()
-        same_node = rank // local_size == reader_rank // local_size
+        if isinstance(pg, ProcessGroup):
+            group_rank = dist.get_rank(pg)
+            global_rank = dist.get_rank()
+            global_ranks = dist.get_process_group_ranks(pg)
+            reader_rank_in_group = global_ranks.index(reader_rank)
+            is_reader_rank = global_rank == reader_rank
+        else:
+            group_rank = pg.rank
+            reader_rank_in_group = reader_rank
+            is_reader_rank = group_rank == reader_rank
+
+        from vllm.distributed.parallel_state import in_the_same_node_as
+
+        same_node = in_the_same_node_as(
+            pg, source_rank=reader_rank_in_group
+        )[group_rank]
         buffer_io = MessageQueue(
             n_reader=1,
             n_local_reader=1 if same_node else 0,
@@ -825,7 +849,7 @@ class MessageQueue:
             max_chunks=max_chunks,
         )
         handle = buffer_io.export_handle()
-        handles = [None] * dist.get_world_size(pg) if rank == reader_rank else None
+        handles = [None] * dist.get_world_size(pg) if is_reader_rank else None
         dist.gather_object(handle, handles, dst=reader_rank, group=pg)
         if blocking:
             buffer_io.wait_until_ready()

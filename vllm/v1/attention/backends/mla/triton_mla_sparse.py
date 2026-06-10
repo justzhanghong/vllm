@@ -44,11 +44,37 @@ _INDEXER_NUM_HEADS = 64
 _INDEXER_HEAD_DIM = 128
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default) == "1"
+
+
 def _env_int(name: str, default: int) -> int:
     value = os.getenv(name)
     if value is None or value == "":
         return default
     return int(value)
+
+
+_FUSED_REQ_TO_GLOBAL = _env_flag("VLLM_SPARSE_MLA_FUSED_REQ_TO_GLOBAL")
+_FUSED_REQ_TO_GLOBAL_MAX_TOKENS = _env_int(
+    "VLLM_SPARSE_MLA_FUSED_REQ_TO_GLOBAL_MAX_TOKENS",
+    1,
+)
+_REQ_TO_GLOBAL_BLOCK_N = _env_int("VLLM_SPARSE_MLA_REQ_TO_GLOBAL_BLOCK_N", 128)
+_ASSUME_VALID_DYNAMIC = _env_flag("VLLM_SPARSE_MLA_ASSUME_VALID_DYNAMIC")
+_ASSUME_VALID_SPLIT = _env_flag("VLLM_SPARSE_MLA_ASSUME_VALID_SPLIT")
+_ASSUME_VALID_NOMASK = _env_flag("VLLM_SPARSE_MLA_ASSUME_VALID_NOMASK")
+_ASSUME_VALID_AFTER_TOPK_NOMASK = _env_flag(
+    "VLLM_SPARSE_MLA_ASSUME_VALID_AFTER_TOPK_NOMASK"
+)
+_SPARSE_MLA_WARMUP_NUM_TOKENS = os.getenv("VLLM_SPARSE_MLA_WARMUP_NUM_TOKENS")
+_FORCE_PREFIX_MASK_DECODE = _env_flag(
+    "VLLM_SPARSE_MLA_FORCE_PREFIX_MASK_DECODE"
+)
+_FORCE_PREFIX_MASK_DECODE_MAX_TOKENS = _env_int(
+    "VLLM_SPARSE_MLA_FORCE_PREFIX_MASK_DECODE_MAX_TOKENS",
+    4,
+)
 
 
 class TritonMLASparseMetadataBuilder(XPUMLASparseMetadataBuilder):
@@ -95,7 +121,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 num_kv_splits=splits,
                 sm_count=self._sm_count,
             )
-        if os.getenv("VLLM_SPARSE_MLA_FUSED_REQ_TO_GLOBAL", "0") == "1":
+        if _FUSED_REQ_TO_GLOBAL:
             req_id = torch.zeros(1, dtype=torch.int32, device=device)
             block_table = torch.zeros(1, 1, dtype=torch.int32, device=device)
             triton_sparse_mla_attention(
@@ -110,7 +136,17 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 block_table=block_table,
                 block_size=64,
             )
-        extra_warmup_shapes = os.getenv("VLLM_SPARSE_MLA_WARMUP_NUM_TOKENS")
+        if _FORCE_PREFIX_MASK_DECODE:
+            triton_sparse_mla_attention(
+                q,
+                kv,
+                indices,
+                sm_scale=self.softmax_scale,
+                num_kv_splits=1,
+                sm_count=self._sm_count,
+                valid_index_base_seq_len=topk,
+            )
+        extra_warmup_shapes = _SPARSE_MLA_WARMUP_NUM_TOKENS
         if extra_warmup_shapes:
             for shape in extra_warmup_shapes.split(","):
                 num_tokens = int(shape.strip())
@@ -134,7 +170,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                     num_kv_splits=1,
                     sm_count=self._sm_count,
                 )
-                if os.getenv("VLLM_SPARSE_MLA_ASSUME_VALID_NOMASK", "0") == "1":
+                if _ASSUME_VALID_NOMASK:
                     triton_sparse_mla_attention(
                         q,
                         kv,
@@ -144,13 +180,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                         sm_count=self._sm_count,
                         assume_valid_indices=True,
                     )
-                    if (
-                        os.getenv(
-                            "VLLM_SPARSE_MLA_ASSUME_VALID_AFTER_TOPK_NOMASK",
-                            "0",
-                        )
-                        == "1"
-                    ):
+                    if _ASSUME_VALID_AFTER_TOPK_NOMASK:
                         triton_sparse_mla_attention(
                             q,
                             kv,
@@ -198,10 +228,10 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
             -1, 1, kv_c_and_k_pe_cache.shape[-1]
         )
         use_fused_req_to_global = (
-            os.getenv("VLLM_SPARSE_MLA_FUSED_REQ_TO_GLOBAL", "0") == "1"
+            _FUSED_REQ_TO_GLOBAL
             and attn_metadata.full_topk_start <= 0
             and num_tokens
-            <= int(os.getenv("VLLM_SPARSE_MLA_FUSED_REQ_TO_GLOBAL_MAX_TOKENS", "1"))
+            <= _FUSED_REQ_TO_GLOBAL_MAX_TOKENS
         )
         if use_fused_req_to_global:
             topk_indices = topk_indices.view(num_tokens, 1, -1)
@@ -217,16 +247,34 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 topk_indices,
                 BLOCK_SIZE=attn_metadata.block_size,
                 NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
-                BLOCK_N=_env_int("VLLM_SPARSE_MLA_REQ_TO_GLOBAL_BLOCK_N", 128),
+                BLOCK_N=_REQ_TO_GLOBAL_BLOCK_N,
             ).view(num_tokens, 1, -1)
             sparse_kwargs = {}
         out_heads = q_nope.shape[1] if return_lse else self.num_heads
         if (
-            os.getenv("VLLM_SPARSE_MLA_ASSUME_VALID_DYNAMIC", "0") == "1"
+            _ASSUME_VALID_DYNAMIC
             and attn_metadata.num_reqs == 1
         ):
             full_topk_start = attn_metadata.full_topk_start
             if full_topk_start <= 0:
+                if (
+                    _FORCE_PREFIX_MASK_DECODE
+                    and num_tokens <= _FORCE_PREFIX_MASK_DECODE_MAX_TOKENS
+                ):
+                    result = triton_sparse_mla_attention(
+                        q,
+                        kv_c_and_k_pe_cache,
+                        topk_indices,
+                        sm_scale=self.softmax_scale,
+                        sm_count=self._sm_count,
+                        valid_index_base_seq_len=attn_metadata.base_seq_len,
+                        return_lse=return_lse,
+                        **sparse_kwargs,
+                    )
+                    if return_lse:
+                        output, lse = result
+                        return output[:, :out_heads, :], lse[:, :out_heads]
+                    return result[:, :out_heads, :]
                 result = triton_sparse_mla_attention(
                     q,
                     kv_c_and_k_pe_cache,
@@ -257,7 +305,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                     return output[:, :out_heads, :], lse[:, :out_heads]
                 return result[:, :out_heads, :]
         if (
-            os.getenv("VLLM_SPARSE_MLA_ASSUME_VALID_SPLIT", "0") == "1"
+            _ASSUME_VALID_SPLIT
             and attn_metadata.num_reqs == 1
         ):
             full_topk_start = attn_metadata.full_topk_start

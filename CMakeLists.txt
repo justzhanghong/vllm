@@ -312,6 +312,9 @@ set(VLLM_EXT_SRC
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   list(APPEND VLLM_EXT_SRC
     "csrc/fp8_mqa_logits.cu"
+    "csrc/sparse_mla_m1_final_cuda.cu"
+    "csrc/sparse_mla_m1_coop_final_cuda.cu"
+    "csrc/sparse_mla_m1_splitmerge_final_cuda.cu"
     "csrc/minimax_reduce_rms_kernel.cu")
 
   SET(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")

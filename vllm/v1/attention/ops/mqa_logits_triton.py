@@ -25,6 +25,35 @@ from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default) == "1"
+
+
+def _env_int(name: str, default: str) -> int:
+    return int(os.getenv(name, default) or default)
+
+
+_DECODE_EMPTY_LOGITS = _env_flag("VLLM_SPARSE_INDEXER_DECODE_EMPTY_LOGITS")
+_DECODE_LOGITS_BLOCK_PAGES = _env_int(
+    "VLLM_SPARSE_INDEXER_DECODE_LOGITS_BLOCK_PAGES",
+    "1",
+)
+_DECODE_LOGITS_BLOCK_PAGES_WARPS = _env_int(
+    "VLLM_SPARSE_INDEXER_DECODE_LOGITS_BLOCK_PAGES_WARPS",
+    "4",
+)
+_DECODE_LOGITS_BLOCK_PAGES_STAGES = _env_int(
+    "VLLM_SPARSE_INDEXER_DECODE_LOGITS_BLOCK_PAGES_STAGES",
+    "3",
+)
+_DECODE_TOPK_TILE_SELECT_CANDIDATES = _env_int(
+    "VLLM_SPARSE_INDEXER_DECODE_TOPK_TILE_SELECT_CANDIDATES",
+    "16",
+)
+_DECODE_FP8_LUT = _env_flag("VLLM_SPARSE_INDEXER_DECODE_FP8_LUT")
+_FP8_E4M3FN_LUT_CACHE: dict[tuple[str, int | None], torch.Tensor] = {}
+
 # Paged decode config sweep. `num_warps=4` dominated in A100/SM80 bench
 # across {2,4,8}×{2,4}; the sub-optimal warps=2/8 picks were 1.5–1.7× slower
 # at the autotune key shape (num_heads=32, head_dim=128, block_size=64), and
@@ -77,6 +106,41 @@ def _decode_e4m3fn(u):
     return sign_f * mant_f * factor
 
 
+@triton.jit
+def _decode_e4m3fn_lut(u, lut_ptr):
+    return tl.load(lut_ptr + u.to(tl.int32))
+
+
+def _fp8_e4m3fn_lut(device: torch.device) -> torch.Tensor:
+    cache_key = (device.type, device.index)
+    cached = _FP8_E4M3FN_LUT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    u = torch.arange(256, device=device, dtype=torch.int32)
+    sign = torch.where((u >> 7) != 0, -1.0, 1.0)
+    exp_bits = (u >> 3) & 0x0F
+    mant = u & 0x07
+    is_normal = exp_bits != 0
+    mant_f = torch.where(
+        is_normal,
+        (8 + mant).to(torch.float32) * 0.125,
+        mant.to(torch.float32) * 0.125,
+    )
+    eff_exp = torch.where(is_normal, exp_bits, torch.ones_like(exp_bits))
+    factor = torch.exp2((eff_exp - 7).to(torch.float32))
+    lut = (sign * mant_f * factor).to(torch.float32).contiguous()
+    _FP8_E4M3FN_LUT_CACHE[cache_key] = lut
+    return lut
+
+
+@triton.jit
+def _topk_step0_hist_bin(x):
+    x_f16 = x.to(tl.float16)
+    bits = x_f16.to(tl.uint16, bitcast=True).to(tl.uint32)
+    ordered = tl.where((bits & 0x8000) != 0, bits, (~bits) & 0x7FFF)
+    return ordered >> 5
+
+
 @triton.autotune(
     configs=_PAGED_AUTOTUNE_CONFIGS,
     key=["num_heads", "head_dim", "block_size"],
@@ -90,6 +154,12 @@ def _fp8_paged_mqa_logits_kernel(
     context_lens_ptr,
     block_tables_ptr,
     logits_ptr,
+    topk_hist_ptr,
+    topk_bins_ptr,
+    topk_tile_logits_ptr,
+    topk_tile_indices_ptr,
+    topk_tile_cutoffs_ptr,
+    fp8_lut_ptr,
     stride_q_b,
     stride_q_n,
     stride_q_h,
@@ -105,6 +175,14 @@ def _fp8_paged_mqa_logits_kernel(
     stride_bt_k,
     stride_l_t,
     stride_l_n,
+    stride_hist_t,
+    stride_bins_t,
+    stride_tile_logits_t,
+    stride_tile_logits_c,
+    stride_tile_indices_t,
+    stride_tile_indices_c,
+    stride_tile_cutoffs_t,
+    stride_tile_cutoffs_g,
     next_n: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -112,6 +190,13 @@ def _fp8_paged_mqa_logits_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    Q_BF16: tl.constexpr,
+    TOPK_HIST_FUSION: tl.constexpr,
+    TOPK_BIN_FUSION: tl.constexpr,
+    TOPK_TILE_SELECT: tl.constexpr,
+    TOPK_TILE_SELECT_CANDIDATES: tl.constexpr,
+    STORE_LOGITS: tl.constexpr,
+    FP8_LUT_DECODE: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     block_rk = tl.program_id(1)
@@ -121,6 +206,30 @@ def _fp8_paged_mqa_logits_kernel(
 
     context_len = tl.load(context_lens_ptr + batch_id)
     if block_rk * block_size >= context_len:
+        if TOPK_TILE_SELECT:
+            group_id = block_rk
+            for candidate_id in range(0, TOPK_TILE_SELECT_CANDIDATES):
+                candidate_col = (
+                    group_id * TOPK_TILE_SELECT_CANDIDATES + candidate_id
+                )
+                tl.store(
+                    topk_tile_logits_ptr
+                    + token_id * stride_tile_logits_t
+                    + candidate_col * stride_tile_logits_c,
+                    float("-inf"),
+                )
+                tl.store(
+                    topk_tile_indices_ptr
+                    + token_id * stride_tile_indices_t
+                    + candidate_col * stride_tile_indices_c,
+                    -1,
+                )
+            tl.store(
+                topk_tile_cutoffs_ptr
+                + token_id * stride_tile_cutoffs_t
+                + group_id * stride_tile_cutoffs_g,
+                float("-inf"),
+            )
         return
 
     q_offset = context_len - next_n + next_n_id
@@ -136,13 +245,28 @@ def _fp8_paged_mqa_logits_kernel(
     mask_d = offs_d < head_dim
     mask_n = offs_n < block_size
 
-    q_base = q_ptr + batch_id * stride_q_b + next_n_id * stride_q_n
-    q_byte = tl.load(
-        q_base + offs_h[:, None] * stride_q_h + offs_d[None, :] * stride_q_d,
-        mask=mask_h[:, None] & mask_d[None, :],
-        other=0,
-    )
-    q = _decode_e4m3fn(q_byte).to(tl.bfloat16)
+    if Q_BF16:
+        q_base = q_ptr + token_id * stride_q_n
+        q = tl.load(
+            q_base
+            + offs_h[:, None] * stride_q_h
+            + offs_d[None, :] * stride_q_d,
+            mask=mask_h[:, None] & mask_d[None, :],
+            other=0.0,
+        ).to(tl.bfloat16)
+    else:
+        q_base = q_ptr + batch_id * stride_q_b + next_n_id * stride_q_n
+        q_byte = tl.load(
+            q_base
+            + offs_h[:, None] * stride_q_h
+            + offs_d[None, :] * stride_q_d,
+            mask=mask_h[:, None] & mask_d[None, :],
+            other=0,
+        )
+        if FP8_LUT_DECODE:
+            q = _decode_e4m3fn_lut(q_byte, fp8_lut_ptr).to(tl.bfloat16)
+        else:
+            q = _decode_e4m3fn(q_byte).to(tl.bfloat16)
 
     kvf_base = kv_fp8_ptr + block_idx * stride_kvf_block
     k_byte = tl.load(
@@ -157,7 +281,11 @@ def _fp8_paged_mqa_logits_kernel(
         other=0.0,
     )
     # Scale in fp32 for precision, then cast to bf16 for the matmul.
-    k = (_decode_e4m3fn(k_byte) * k_scale[:, None]).to(tl.bfloat16)
+    if FP8_LUT_DECODE:
+        k_decoded = _decode_e4m3fn_lut(k_byte, fp8_lut_ptr)
+    else:
+        k_decoded = _decode_e4m3fn(k_byte)
+    k = (k_decoded * k_scale[:, None]).to(tl.bfloat16)
 
     s = tl.dot(q, tl.trans(k))
 
@@ -173,11 +301,71 @@ def _fp8_paged_mqa_logits_kernel(
     valid = mask_n & (k_offset < context_len) & (k_offset <= q_offset)
     out = tl.where(valid, out, float("-inf"))
 
-    tl.store(
-        logits_ptr + token_id * stride_l_t + k_offset * stride_l_n,
-        out,
-        mask=mask_n,
-    )
+    if TOPK_HIST_FUSION or TOPK_BIN_FUSION:
+        hist_bin = _topk_step0_hist_bin(out)
+
+    if TOPK_HIST_FUSION:
+        tl.atomic_add(
+            topk_hist_ptr + token_id * stride_hist_t + hist_bin,
+            1,
+            mask=valid,
+        )
+
+    if TOPK_BIN_FUSION:
+        tl.store(
+            topk_bins_ptr + token_id * stride_bins_t + k_offset,
+            hist_bin.to(tl.int16),
+            mask=valid,
+        )
+
+    if TOPK_TILE_SELECT:
+        select_vals = tl.where(valid, out, float("-inf"))
+        last_candidate = float("-inf")
+        group_id = block_rk
+        offs_candidate = tl.arange(0, BLOCK_N)
+        for candidate_id in range(0, TOPK_TILE_SELECT_CANDIDATES):
+            candidate_val, candidate_pos = tl.max(
+                select_vals,
+                axis=0,
+                return_indices=True,
+            )
+            candidate_idx = tl.max(
+                tl.where(offs_candidate == candidate_pos, k_offset, 0),
+                axis=0,
+            )
+            candidate_idx = tl.where(candidate_val == float("-inf"), -1, candidate_idx)
+            candidate_col = group_id * TOPK_TILE_SELECT_CANDIDATES + candidate_id
+            tl.store(
+                topk_tile_logits_ptr
+                + token_id * stride_tile_logits_t
+                + candidate_col * stride_tile_logits_c,
+                candidate_val,
+            )
+            tl.store(
+                topk_tile_indices_ptr
+                + token_id * stride_tile_indices_t
+                + candidate_col * stride_tile_indices_c,
+                candidate_idx,
+            )
+            select_vals = tl.where(
+                offs_candidate == candidate_pos,
+                float("-inf"),
+                select_vals,
+            )
+            last_candidate = candidate_val
+        tl.store(
+            topk_tile_cutoffs_ptr
+            + token_id * stride_tile_cutoffs_t
+            + group_id * stride_tile_cutoffs_g,
+            last_candidate,
+        )
+
+    if STORE_LOGITS:
+        tl.store(
+            logits_ptr + token_id * stride_l_t + k_offset * stride_l_n,
+            out,
+            mask=mask_n,
+        )
 
 
 @triton.jit
@@ -189,6 +377,12 @@ def _fp8_paged_mqa_logits_multi_block_kernel(
     context_lens_ptr,
     block_tables_ptr,
     logits_ptr,
+    topk_hist_ptr,
+    topk_bins_ptr,
+    topk_tile_logits_ptr,
+    topk_tile_indices_ptr,
+    topk_tile_cutoffs_ptr,
+    fp8_lut_ptr,
     stride_q_b,
     stride_q_n,
     stride_q_h,
@@ -204,6 +398,14 @@ def _fp8_paged_mqa_logits_multi_block_kernel(
     stride_bt_k,
     stride_l_t,
     stride_l_n,
+    stride_hist_t,
+    stride_bins_t,
+    stride_tile_logits_t,
+    stride_tile_logits_c,
+    stride_tile_indices_t,
+    stride_tile_indices_c,
+    stride_tile_cutoffs_t,
+    stride_tile_cutoffs_g,
     next_n: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -213,6 +415,13 @@ def _fp8_paged_mqa_logits_multi_block_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_PAGES: tl.constexpr,
+    Q_BF16: tl.constexpr,
+    TOPK_HIST_FUSION: tl.constexpr,
+    TOPK_BIN_FUSION: tl.constexpr,
+    TOPK_TILE_SELECT: tl.constexpr,
+    TOPK_TILE_SELECT_CANDIDATES: tl.constexpr,
+    STORE_LOGITS: tl.constexpr,
+    FP8_LUT_DECODE: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     block_group = tl.program_id(1) * BLOCK_PAGES
@@ -222,6 +431,30 @@ def _fp8_paged_mqa_logits_multi_block_kernel(
 
     context_len = tl.load(context_lens_ptr + batch_id)
     if block_group * block_size >= context_len:
+        if TOPK_TILE_SELECT:
+            group_id = tl.program_id(1)
+            for candidate_id in range(0, TOPK_TILE_SELECT_CANDIDATES):
+                candidate_col = (
+                    group_id * TOPK_TILE_SELECT_CANDIDATES + candidate_id
+                )
+                tl.store(
+                    topk_tile_logits_ptr
+                    + token_id * stride_tile_logits_t
+                    + candidate_col * stride_tile_logits_c,
+                    float("-inf"),
+                )
+                tl.store(
+                    topk_tile_indices_ptr
+                    + token_id * stride_tile_indices_t
+                    + candidate_col * stride_tile_indices_c,
+                    -1,
+                )
+            tl.store(
+                topk_tile_cutoffs_ptr
+                + token_id * stride_tile_cutoffs_t
+                + group_id * stride_tile_cutoffs_g,
+                float("-inf"),
+            )
         return
 
     q_offset = context_len - next_n + next_n_id
@@ -245,13 +478,28 @@ def _fp8_paged_mqa_logits_multi_block_kernel(
         other=0,
     )
 
-    q_base = q_ptr + batch_id * stride_q_b + next_n_id * stride_q_n
-    q_byte = tl.load(
-        q_base + offs_h[:, None] * stride_q_h + offs_d[None, :] * stride_q_d,
-        mask=mask_h[:, None] & mask_d[None, :],
-        other=0,
-    )
-    q = _decode_e4m3fn(q_byte).to(tl.bfloat16)
+    if Q_BF16:
+        q_base = q_ptr + token_id * stride_q_n
+        q = tl.load(
+            q_base
+            + offs_h[:, None] * stride_q_h
+            + offs_d[None, :] * stride_q_d,
+            mask=mask_h[:, None] & mask_d[None, :],
+            other=0.0,
+        ).to(tl.bfloat16)
+    else:
+        q_base = q_ptr + batch_id * stride_q_b + next_n_id * stride_q_n
+        q_byte = tl.load(
+            q_base
+            + offs_h[:, None] * stride_q_h
+            + offs_d[None, :] * stride_q_d,
+            mask=mask_h[:, None] & mask_d[None, :],
+            other=0,
+        )
+        if FP8_LUT_DECODE:
+            q = _decode_e4m3fn_lut(q_byte, fp8_lut_ptr).to(tl.bfloat16)
+        else:
+            q = _decode_e4m3fn(q_byte).to(tl.bfloat16)
 
     k_byte = tl.load(
         kv_fp8_ptr
@@ -268,7 +516,11 @@ def _fp8_paged_mqa_logits_multi_block_kernel(
         mask=mask_n & mask_block,
         other=0.0,
     )
-    k = (_decode_e4m3fn(k_byte) * k_scale[:, None]).to(tl.bfloat16)
+    if FP8_LUT_DECODE:
+        k_decoded = _decode_e4m3fn_lut(k_byte, fp8_lut_ptr)
+    else:
+        k_decoded = _decode_e4m3fn(k_byte)
+    k = (k_decoded * k_scale[:, None]).to(tl.bfloat16)
 
     s = tl.dot(q, tl.trans(k))
 
@@ -289,11 +541,71 @@ def _fp8_paged_mqa_logits_multi_block_kernel(
     )
     out = tl.where(valid, out, float("-inf"))
 
-    tl.store(
-        logits_ptr + token_id * stride_l_t + k_offset * stride_l_n,
-        out,
-        mask=mask_n & mask_block,
-    )
+    if TOPK_HIST_FUSION or TOPK_BIN_FUSION:
+        hist_bin = _topk_step0_hist_bin(out)
+
+    if TOPK_HIST_FUSION:
+        tl.atomic_add(
+            topk_hist_ptr + token_id * stride_hist_t + hist_bin,
+            1,
+            mask=valid,
+        )
+
+    if TOPK_BIN_FUSION:
+        tl.store(
+            topk_bins_ptr + token_id * stride_bins_t + k_offset,
+            hist_bin.to(tl.int16),
+            mask=valid,
+        )
+
+    if TOPK_TILE_SELECT:
+        select_vals = tl.where(valid, out, float("-inf"))
+        last_candidate = float("-inf")
+        group_id = tl.program_id(1)
+        offs_candidate = tl.arange(0, BLOCK_N)
+        for candidate_id in range(0, TOPK_TILE_SELECT_CANDIDATES):
+            candidate_val, candidate_pos = tl.max(
+                select_vals,
+                axis=0,
+                return_indices=True,
+            )
+            candidate_idx = tl.max(
+                tl.where(offs_candidate == candidate_pos, k_offset, 0),
+                axis=0,
+            )
+            candidate_idx = tl.where(candidate_val == float("-inf"), -1, candidate_idx)
+            candidate_col = group_id * TOPK_TILE_SELECT_CANDIDATES + candidate_id
+            tl.store(
+                topk_tile_logits_ptr
+                + token_id * stride_tile_logits_t
+                + candidate_col * stride_tile_logits_c,
+                candidate_val,
+            )
+            tl.store(
+                topk_tile_indices_ptr
+                + token_id * stride_tile_indices_t
+                + candidate_col * stride_tile_indices_c,
+                candidate_idx,
+            )
+            select_vals = tl.where(
+                offs_candidate == candidate_pos,
+                float("-inf"),
+                select_vals,
+            )
+            last_candidate = candidate_val
+        tl.store(
+            topk_tile_cutoffs_ptr
+            + token_id * stride_tile_cutoffs_t
+            + group_id * stride_tile_cutoffs_g,
+            last_candidate,
+        )
+
+    if STORE_LOGITS:
+        tl.store(
+            logits_ptr + token_id * stride_l_t + k_offset * stride_l_n,
+            out,
+            mask=mask_n & mask_block,
+        )
 
 
 def fp8_paged_mqa_logits_triton(
@@ -304,6 +616,13 @@ def fp8_paged_mqa_logits_triton(
     block_tables: torch.Tensor,
     max_model_len: int,
     logits_out: torch.Tensor | None = None,
+    q_bf16: torch.Tensor | None = None,
+    topk_histogram: torch.Tensor | None = None,
+    topk_bins: torch.Tensor | None = None,
+    topk_tile_candidate_logits: torch.Tensor | None = None,
+    topk_tile_candidate_indices: torch.Tensor | None = None,
+    topk_tile_candidate_cutoffs: torch.Tensor | None = None,
+    store_logits: bool = True,
 ) -> torch.Tensor:
     """Triton implementation of DeepGEMM's fp8_paged_mqa_logits.
 
@@ -313,6 +632,19 @@ def fp8_paged_mqa_logits_triton(
         weights:       [B*next_n, H] float32
         context_lens:  [B] int32
         block_tables:  [B, max_blocks] int32
+        topk_histogram: optional [B*next_n, 2048] int32 step-0 TopK histogram
+        topk_bins:      optional [B*next_n, max_model_len] int16 step-0 bins
+        topk_tile_candidate_logits:
+                       optional compact [B*next_n, tile_groups*candidates]
+                       float32 candidate logits
+        topk_tile_candidate_indices:
+                       optional compact [B*next_n, tile_groups*candidates]
+                       int32 global candidate indices
+        topk_tile_candidate_cutoffs:
+                       optional [B*next_n, tile_groups] float32 local cutoffs
+        store_logits: whether to write the full logits matrix. This must stay
+                      true for normal service paths because candidate TopK may
+                      need full logits for exact fallback.
     Returns:
         logits:        [B*next_n, max_model_len] float32
     """
@@ -335,7 +667,26 @@ def fp8_paged_mqa_logits_triton(
         (kv_flat.stride(0), head_dim, 1),
     )
     kv_scale = kv_flat[:, k_end:].view(torch.float32)
-    q_byte = q.view(torch.uint8)
+    use_q_bf16 = q_bf16 is not None
+    if use_q_bf16:
+        assert q_bf16 is not None
+        assert q_bf16.dtype == torch.bfloat16
+        assert q_bf16.device == q.device
+        assert q_bf16.shape[0] >= num_heads
+        assert q_bf16.shape[1] >= B * next_n
+        assert q_bf16.shape[2] >= head_dim
+        q_source = q_bf16
+        q_stride_b = 0
+        q_stride_n = q_bf16.stride(1)
+        q_stride_h = q_bf16.stride(0)
+        q_stride_d = q_bf16.stride(2)
+    else:
+        q_byte = q.view(torch.uint8)
+        q_source = q_byte
+        q_stride_b = q_byte.stride(0)
+        q_stride_n = q_byte.stride(1)
+        q_stride_h = q_byte.stride(2)
+        q_stride_d = q_byte.stride(3)
 
     if logits_out is not None:
         assert logits_out.dtype == torch.float32
@@ -343,9 +694,9 @@ def fp8_paged_mqa_logits_triton(
         assert logits_out.shape[0] >= B * next_n
         assert logits_out.shape[1] >= max_model_len
         logits = logits_out[: B * next_n, :max_model_len]
-        if os.getenv("VLLM_SPARSE_INDEXER_DECODE_EMPTY_LOGITS", "0") != "1":
+        if not _DECODE_EMPTY_LOGITS:
             logits.fill_(float("-inf"))
-    elif os.getenv("VLLM_SPARSE_INDEXER_DECODE_EMPTY_LOGITS", "0") == "1":
+    elif _DECODE_EMPTY_LOGITS:
         logits = torch.empty(
             (B * next_n, max_model_len),
             dtype=torch.float32,
@@ -359,34 +710,123 @@ def fp8_paged_mqa_logits_triton(
             device=q.device,
         )
 
+    use_topk_histogram = topk_histogram is not None
+    if use_topk_histogram:
+        assert topk_histogram is not None
+        assert topk_histogram.dtype == torch.int32
+        assert topk_histogram.device == q.device
+        assert topk_histogram.dim() == 2
+        assert topk_histogram.shape[0] >= B * next_n
+        assert topk_histogram.shape[1] >= 2048
+        assert topk_histogram.is_contiguous()
+        topk_hist = topk_histogram[: B * next_n, :2048]
+        topk_hist_ptr = topk_hist
+        topk_hist_stride_t = topk_hist.stride(0)
+    else:
+        topk_hist_ptr = logits
+        topk_hist_stride_t = 0
+
+    use_topk_bins = topk_bins is not None
+    if use_topk_bins:
+        assert topk_bins is not None
+        assert topk_bins.dtype == torch.int16
+        assert topk_bins.device == q.device
+        assert topk_bins.dim() == 2
+        assert topk_bins.shape[0] >= B * next_n
+        assert topk_bins.shape[1] >= max_model_len
+        assert topk_bins.stride(1) == 1
+        topk_bin_view = topk_bins[: B * next_n, :max_model_len]
+        topk_bins_ptr = topk_bin_view
+        topk_bins_stride_t = topk_bin_view.stride(0)
+    else:
+        topk_bins_ptr = logits
+        topk_bins_stride_t = 0
+
+    use_topk_tile_select = (
+        topk_tile_candidate_logits is not None
+        or topk_tile_candidate_indices is not None
+        or topk_tile_candidate_cutoffs is not None
+    )
+    if use_topk_tile_select:
+        assert topk_tile_candidate_logits is not None
+        assert topk_tile_candidate_indices is not None
+        assert topk_tile_candidate_cutoffs is not None
+        assert topk_tile_candidate_logits.dtype == torch.float32
+        assert topk_tile_candidate_indices.dtype == torch.int32
+        assert topk_tile_candidate_cutoffs.dtype == torch.float32
+        assert topk_tile_candidate_logits.device == q.device
+        assert topk_tile_candidate_indices.device == q.device
+        assert topk_tile_candidate_cutoffs.device == q.device
+        assert topk_tile_candidate_logits.dim() == 2
+        assert topk_tile_candidate_indices.dim() == 2
+        assert topk_tile_candidate_cutoffs.dim() == 2
+        assert topk_tile_candidate_logits.shape[0] >= B * next_n
+        assert topk_tile_candidate_indices.shape[0] >= B * next_n
+        assert topk_tile_candidate_cutoffs.shape[0] >= B * next_n
+        assert topk_tile_candidate_logits.stride(1) == 1
+        assert topk_tile_candidate_indices.stride(1) == 1
+        assert topk_tile_candidate_cutoffs.stride(1) == 1
+        topk_tile_logits_ptr = topk_tile_candidate_logits[: B * next_n]
+        topk_tile_indices_ptr = topk_tile_candidate_indices[: B * next_n]
+        topk_tile_cutoffs_ptr = topk_tile_candidate_cutoffs[: B * next_n]
+        topk_tile_logits_stride_t = topk_tile_logits_ptr.stride(0)
+        topk_tile_logits_stride_c = topk_tile_logits_ptr.stride(1)
+        topk_tile_indices_stride_t = topk_tile_indices_ptr.stride(0)
+        topk_tile_indices_stride_c = topk_tile_indices_ptr.stride(1)
+        topk_tile_cutoffs_stride_t = topk_tile_cutoffs_ptr.stride(0)
+        topk_tile_cutoffs_stride_g = topk_tile_cutoffs_ptr.stride(1)
+    else:
+        topk_tile_logits_ptr = logits
+        topk_tile_indices_ptr = logits
+        topk_tile_cutoffs_ptr = logits
+        topk_tile_logits_stride_t = 0
+        topk_tile_logits_stride_c = 0
+        topk_tile_indices_stride_t = 0
+        topk_tile_indices_stride_c = 0
+        topk_tile_cutoffs_stride_t = 0
+        topk_tile_cutoffs_stride_g = 0
+    fp8_lut = _fp8_e4m3fn_lut(q.device) if _DECODE_FP8_LUT else logits
+
     BLOCK_H = max(16, triton.next_power_of_2(num_heads))
     BLOCK_D = triton.next_power_of_2(head_dim)
     BLOCK_N = triton.next_power_of_2(block_size)
 
-    block_pages = int(
-        os.getenv("VLLM_SPARSE_INDEXER_DECODE_LOGITS_BLOCK_PAGES", "1")
-        or "1"
-    )
-    if block_pages not in (1, 2, 4):
+    block_pages = _DECODE_LOGITS_BLOCK_PAGES
+    if block_pages not in (1, 2, 4, 8):
         raise ValueError(
             "VLLM_SPARSE_INDEXER_DECODE_LOGITS_BLOCK_PAGES must be one "
-            f"of 1, 2, or 4, got {block_pages}"
+            f"of 1, 2, 4, or 8, got {block_pages}"
         )
-    if block_pages > 1:
+    tile_groups = triton.cdiv(block_tables.shape[1], block_pages)
+    if use_topk_tile_select:
+        required_candidates = tile_groups * _DECODE_TOPK_TILE_SELECT_CANDIDATES
+        assert topk_tile_candidate_logits is not None
+        assert topk_tile_candidate_indices is not None
+        assert topk_tile_candidate_cutoffs is not None
+        assert topk_tile_candidate_logits.shape[1] >= required_candidates
+        assert topk_tile_candidate_indices.shape[1] >= required_candidates
+        assert topk_tile_candidate_cutoffs.shape[1] >= tile_groups
+    if block_pages > 1 or use_topk_histogram:
         multi_block_n = triton.next_power_of_2(block_size * block_pages)
-        grid = (B * next_n, triton.cdiv(block_tables.shape[1], block_pages))
+        grid = (B * next_n, tile_groups)
         _fp8_paged_mqa_logits_multi_block_kernel[grid](
-            q_byte,
+            q_source,
             kv_byte,
             kv_scale,
             weights,
             context_lens,
             block_tables,
             logits,
-            q_byte.stride(0),
-            q_byte.stride(1),
-            q_byte.stride(2),
-            q_byte.stride(3),
+            topk_hist_ptr,
+            topk_bins_ptr,
+            topk_tile_logits_ptr,
+            topk_tile_indices_ptr,
+            topk_tile_cutoffs_ptr,
+            fp8_lut,
+            q_stride_b,
+            q_stride_n,
+            q_stride_h,
+            q_stride_d,
             kv_byte.stride(0),
             kv_byte.stride(1),
             kv_byte.stride(2),
@@ -398,6 +838,14 @@ def fp8_paged_mqa_logits_triton(
             block_tables.stride(1),
             logits.stride(0),
             logits.stride(1),
+            topk_hist_stride_t,
+            topk_bins_stride_t,
+            topk_tile_logits_stride_t,
+            topk_tile_logits_stride_c,
+            topk_tile_indices_stride_t,
+            topk_tile_indices_stride_c,
+            topk_tile_cutoffs_stride_t,
+            topk_tile_cutoffs_stride_g,
             next_n=next_n,
             num_heads=num_heads,
             head_dim=head_dim,
@@ -407,34 +855,37 @@ def fp8_paged_mqa_logits_triton(
             BLOCK_D=BLOCK_D,
             BLOCK_N=multi_block_n,
             BLOCK_PAGES=block_pages,
-            num_warps=int(
-                os.getenv(
-                    "VLLM_SPARSE_INDEXER_DECODE_LOGITS_BLOCK_PAGES_WARPS",
-                    "4",
-                )
-            ),
-            num_stages=int(
-                os.getenv(
-                    "VLLM_SPARSE_INDEXER_DECODE_LOGITS_BLOCK_PAGES_STAGES",
-                    "3",
-                )
-            ),
+            Q_BF16=use_q_bf16,
+            TOPK_HIST_FUSION=use_topk_histogram,
+            TOPK_BIN_FUSION=use_topk_bins,
+            TOPK_TILE_SELECT=use_topk_tile_select,
+            TOPK_TILE_SELECT_CANDIDATES=_DECODE_TOPK_TILE_SELECT_CANDIDATES,
+            STORE_LOGITS=store_logits,
+            FP8_LUT_DECODE=_DECODE_FP8_LUT,
+            num_warps=_DECODE_LOGITS_BLOCK_PAGES_WARPS,
+            num_stages=_DECODE_LOGITS_BLOCK_PAGES_STAGES,
         )
         return logits
 
     grid = (B * next_n, block_tables.shape[1])
     _fp8_paged_mqa_logits_kernel[grid](
-        q_byte,
+        q_source,
         kv_byte,
         kv_scale,
         weights,
         context_lens,
         block_tables,
         logits,
-        q_byte.stride(0),
-        q_byte.stride(1),
-        q_byte.stride(2),
-        q_byte.stride(3),
+        topk_hist_ptr,
+        topk_bins_ptr,
+        topk_tile_logits_ptr,
+        topk_tile_indices_ptr,
+        topk_tile_cutoffs_ptr,
+        fp8_lut,
+        q_stride_b,
+        q_stride_n,
+        q_stride_h,
+        q_stride_d,
         kv_byte.stride(0),
         kv_byte.stride(1),
         kv_byte.stride(2),
@@ -446,6 +897,14 @@ def fp8_paged_mqa_logits_triton(
         block_tables.stride(1),
         logits.stride(0),
         logits.stride(1),
+        topk_hist_stride_t,
+        topk_bins_stride_t,
+        topk_tile_logits_stride_t,
+        topk_tile_logits_stride_c,
+        topk_tile_indices_stride_t,
+        topk_tile_indices_stride_c,
+        topk_tile_cutoffs_stride_t,
+        topk_tile_cutoffs_stride_g,
         next_n=next_n,
         num_heads=num_heads,
         head_dim=head_dim,
@@ -453,6 +912,13 @@ def fp8_paged_mqa_logits_triton(
         BLOCK_H=BLOCK_H,
         BLOCK_D=BLOCK_D,
         BLOCK_N=BLOCK_N,
+        Q_BF16=use_q_bf16,
+        TOPK_HIST_FUSION=use_topk_histogram,
+        TOPK_BIN_FUSION=use_topk_bins,
+        TOPK_TILE_SELECT=use_topk_tile_select,
+        TOPK_TILE_SELECT_CANDIDATES=_DECODE_TOPK_TILE_SELECT_CANDIDATES,
+        STORE_LOGITS=store_logits,
+        FP8_LUT_DECODE=_DECODE_FP8_LUT,
     )
     return logits
 

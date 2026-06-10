@@ -68,6 +68,13 @@ class GraphCaptureContext:
 
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
+_TENSOR_DICT_METADATA_CACHE_SENTINEL = "__vllm_tensor_dict_metadata_cache_v1__"
+
+
+def _pp_boundary_scope(name: str) -> contextlib.AbstractContextManager[Any]:
+    if not envs.VLLM_PP_BOUNDARY_PROFILING:
+        return nullcontext()
+    return torch.cuda.nvtx.range(f"vllm_pp_boundary:{name}")
 
 
 class Handle(Protocol):
@@ -334,6 +341,14 @@ class GroupCoordinator:
 
         self_device_group = None
         self_cpu_group = None
+        self_tensor_dict_pair_device_groups: dict[tuple[int, int], ProcessGroup] = {}
+        self_sampled_token_pair_device_group = None
+        enable_pp_pair_p2p = (
+            group_name == "pp" and envs.VLLM_PP_BATCH_P2P_TENSOR_DICT
+        )
+        enable_pp_sampled_token_pair_p2p = (
+            group_name == "pp" and envs.VLLM_PP_SAMPLED_TOKEN_PAIR_P2P
+        )
 
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
@@ -349,12 +364,39 @@ class GroupCoordinator:
                 self.rank_in_group = ranks.index(self.rank)
                 self_device_group = device_group
                 self_cpu_group = cpu_group
+            # Batch P2P only between adjacent PP ranks; the full PP group may
+            # require unrelated ranks to join the same NCCL P2P batch.
+            if enable_pp_pair_p2p and len(ranks) > 1:
+                seen_pair_keys: set[tuple[int, int]] = set()
+                for rank_index, rank in enumerate(ranks):
+                    peer_index = (rank_index + 1) % len(ranks)
+                    pair_key = tuple(sorted((rank_index, peer_index)))
+                    if pair_key in seen_pair_keys:
+                        continue
+                    seen_pair_keys.add(pair_key)
+                    pair_group = torch.distributed.new_group(
+                        [rank, ranks[peer_index]],
+                        backend=torch_distributed_backend,
+                    )
+                    if self.rank in (rank, ranks[peer_index]):
+                        self_tensor_dict_pair_device_groups[pair_key] = pair_group
+            if enable_pp_sampled_token_pair_p2p and len(ranks) > 1:
+                pair_ranks = [ranks[0], ranks[-1]]
+                pair_group = torch.distributed.new_group(
+                    pair_ranks, backend=torch_distributed_backend
+                )
+                if self.rank in pair_ranks:
+                    self_sampled_token_pair_device_group = pair_group
 
         assert self_cpu_group is not None
         assert self_device_group is not None
 
         self.cpu_group = self_cpu_group
         self.device_group = self_device_group
+        self._tensor_dict_pair_device_groups = self_tensor_dict_pair_device_groups
+        self._sampled_token_pair_device_group = (
+            self_sampled_token_pair_device_group
+        )
 
         from vllm.platforms import current_platform
 
@@ -399,6 +441,21 @@ class GroupCoordinator:
             and self.device_communicator
             and getattr(self.device_communicator, "supports_tensor_dict", False)
         )
+        self._tensor_dict_metadata_send_cache: dict[Any, list[tuple[str, Any]]] = {}
+        self._tensor_dict_metadata_recv_cache: dict[Any, list[tuple[str, Any]]] = {}
+
+    def _tensor_dict_pair_device_group(
+        self, peer_rank_in_group: int
+    ) -> ProcessGroup | None:
+        if not envs.VLLM_PP_BATCH_P2P_TENSOR_DICT:
+            return None
+        pair_key = tuple(sorted((self.rank_in_group, peer_rank_in_group)))
+        return self._tensor_dict_pair_device_groups.get(pair_key)
+
+    def sampled_token_pair_device_group(self) -> ProcessGroup | None:
+        if not envs.VLLM_PP_SAMPLED_TOKEN_PAIR_P2P:
+            return None
+        return self._sampled_token_pair_device_group
 
     def create_mq_broadcaster(
         self, writer_rank=0, external_writer_handle=None, blocking=True
@@ -805,10 +862,112 @@ class GroupCoordinator:
     ) -> bool:
         if all_gather_group is None:
             return False
+        if (
+            envs.VLLM_PP_DISABLE_INTERMEDIATE_ALLGATHER
+            and self.unique_name.startswith("pp:")
+        ):
+            return False
         use_all_gather = numel % all_gather_group.world_size == 0
         if all_gather_tensors is not None:
             use_all_gather = all_gather_tensors.get(key, use_all_gather)
         return use_all_gather
+
+    def _tensor_dict_metadata_cache_key(
+        self,
+        peer: int,
+        all_gather_group: "GroupCoordinator | None",
+        all_gather_tensors: dict[str, bool] | None,
+    ) -> tuple[Any, ...]:
+        all_gather_name = (
+            None if all_gather_group is None else all_gather_group.unique_name
+        )
+        all_gather_overrides = (
+            None
+            if all_gather_tensors is None
+            else tuple(sorted(all_gather_tensors.items()))
+        )
+        return (self.unique_name, self.rank_in_group, peer, all_gather_name,
+                all_gather_overrides)
+
+    def _decode_tensor_dict_metadata_cache_key(
+        self,
+        peer: int,
+        all_gather_group: "GroupCoordinator | None",
+        all_gather_tensors: dict[str, bool] | None,
+    ) -> tuple[Any, ...]:
+        return (
+            "decode_static",
+        ) + self._tensor_dict_metadata_cache_key(
+            peer, all_gather_group, all_gather_tensors
+        )
+
+    def _should_skip_decode_tensor_dict_metadata(
+        self,
+        scheduled_num_tokens: int | None,
+    ) -> bool:
+        return (
+            envs.VLLM_PP_DECODE_TENSOR_DICT_METADATA_SKIP
+            and self.unique_name.startswith("pp:")
+            and scheduled_num_tokens == 1
+        )
+
+    @staticmethod
+    def _tensor_dict_metadata_equal(
+        lhs: list[tuple[str, Any]] | None,
+        rhs: list[tuple[str, Any]],
+    ) -> bool:
+        if lhs is None:
+            return False
+        try:
+            return lhs == rhs
+        except Exception:
+            return False
+
+    def _pack_tensor_dict_metadata(
+        self,
+        metadata_list: list[tuple[str, Any]],
+        dst: int,
+        all_gather_group: "GroupCoordinator | None",
+        all_gather_tensors: dict[str, bool] | None,
+    ) -> Any:
+        if not envs.VLLM_PP_TENSOR_DICT_METADATA_CACHE:
+            return metadata_list
+        cache_key = self._tensor_dict_metadata_cache_key(
+            dst, all_gather_group, all_gather_tensors
+        )
+        cached = self._tensor_dict_metadata_send_cache.get(cache_key)
+        if self._tensor_dict_metadata_equal(cached, metadata_list):
+            return (_TENSOR_DICT_METADATA_CACHE_SENTINEL, False, None)
+        self._tensor_dict_metadata_send_cache[cache_key] = metadata_list
+        return (_TENSOR_DICT_METADATA_CACHE_SENTINEL, True, metadata_list)
+
+    def _unpack_tensor_dict_metadata(
+        self,
+        obj: Any,
+        src: int,
+        all_gather_group: "GroupCoordinator | None",
+        all_gather_tensors: dict[str, bool] | None,
+    ) -> list[tuple[str, Any]]:
+        if (
+            not isinstance(obj, tuple)
+            or len(obj) != 3
+            or obj[0] != _TENSOR_DICT_METADATA_CACHE_SENTINEL
+        ):
+            return obj
+        _, has_metadata, metadata_list = obj
+        cache_key = self._tensor_dict_metadata_cache_key(
+            src, all_gather_group, all_gather_tensors
+        )
+        if has_metadata:
+            self._tensor_dict_metadata_recv_cache[cache_key] = metadata_list
+            return metadata_list
+        cached = self._tensor_dict_metadata_recv_cache.get(cache_key)
+        if cached is None:
+            raise RuntimeError(
+                "Received cached tensor-dict metadata marker before the "
+                "initial metadata payload."
+            )
+        return cached
 
     def send_tensor_dict(
         self,
@@ -816,6 +975,7 @@ class GroupCoordinator:
         dst: int | None = None,
         all_gather_group: "GroupCoordinator | None" = None,
         all_gather_tensors: dict[str, bool] | None = None,
+        scheduled_num_tokens: int | None = None,
     ) -> dict[str, torch.Tensor | Any] | None:
         """Send the input tensor dictionary.
         NOTE: `dst` is the local rank of the source rank.
@@ -843,6 +1003,7 @@ class GroupCoordinator:
             dst=dst,
             all_gather_group=all_gather_group,
             all_gather_tensors=all_gather_tensors,
+            scheduled_num_tokens=scheduled_num_tokens,
         )
         for handle in handles:
             handle.wait()
@@ -854,6 +1015,7 @@ class GroupCoordinator:
         dst: int | None = None,
         all_gather_group: "GroupCoordinator | None" = None,
         all_gather_tensors: dict[str, bool] | None = None,
+        scheduled_num_tokens: int | None = None,
     ) -> list[Handle]:
         if self.world_size <= 1:
             return []
@@ -880,12 +1042,38 @@ class GroupCoordinator:
         metadata_group = self.cpu_group
 
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
-        self.send_object(metadata_list, dst=dst)
+        skip_metadata = False
+        if self._should_skip_decode_tensor_dict_metadata(scheduled_num_tokens):
+            cache_key = self._decode_tensor_dict_metadata_cache_key(
+                dst, all_gather_group, all_gather_tensors
+            )
+            cached = self._tensor_dict_metadata_send_cache.get(cache_key)
+            if self._tensor_dict_metadata_equal(cached, metadata_list):
+                skip_metadata = True
+                with _pp_boundary_scope("tensor_dict.isend_metadata_skip_cached"):
+                    pass
+            elif cached is None:
+                self._tensor_dict_metadata_send_cache[cache_key] = metadata_list
+            else:
+                raise RuntimeError(
+                    "PP decode tensor-dict metadata changed while "
+                    "VLLM_PP_DECODE_TENSOR_DICT_METADATA_SKIP is enabled."
+                )
+
+        if not skip_metadata:
+            with _pp_boundary_scope("tensor_dict.isend_metadata_send_object"):
+                self.send_object(
+                    self._pack_tensor_dict_metadata(
+                        metadata_list, dst, all_gather_group, all_gather_tensors
+                    ),
+                    dst=dst,
+                )
 
         tensor_keys = [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)]
         assert len(tensor_keys) == len(tensor_list)
 
         handles: list[Handle] = []
+        batched_p2p_ops: list[Any] = []
         for key, tensor in zip(tensor_keys, tensor_list):
             if tensor.numel() == 0:
                 continue
@@ -896,12 +1084,29 @@ class GroupCoordinator:
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
             comm_group = metadata_group if tensor.is_cpu else group
-            handle = torch.distributed.isend(
-                tensor, dst=self.ranks[dst], group=comm_group
-            )
+            batch_group = self._tensor_dict_pair_device_group(dst)
+            if tensor.is_cuda and batch_group is not None:
+                batched_p2p_ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.isend,
+                        tensor,
+                        self.ranks[dst],
+                        batch_group,
+                    )
+                )
+                tensor.record_stream(torch.cuda.current_stream(tensor.device))
+                continue
+            with _pp_boundary_scope("tensor_dict.isend_post_cuda_tensor"):
+                handle = torch.distributed.isend(
+                    tensor, dst=self.ranks[dst], group=comm_group
+                )
             if tensor.is_cuda:
                 tensor.record_stream(torch.cuda.current_stream(tensor.device))
             handles.append(handle)
+
+        if batched_p2p_ops:
+            with _pp_boundary_scope("tensor_dict.isend_batch_isend_irecv"):
+                handles.extend(torch.distributed.batch_isend_irecv(batched_p2p_ops))
 
         return handles
 
@@ -910,6 +1115,7 @@ class GroupCoordinator:
         src: int | None = None,
         all_gather_group: "GroupCoordinator | None" = None,
         all_gather_tensors: dict[str, bool] | None = None,
+        scheduled_num_tokens: int | None = None,
     ) -> dict[str, torch.Tensor | Any] | None:
         """Recv the input tensor dictionary.
         NOTE: `src` is the local rank of the source rank.
@@ -936,6 +1142,7 @@ class GroupCoordinator:
             src=src,
             all_gather_group=all_gather_group,
             all_gather_tensors=all_gather_tensors,
+            scheduled_num_tokens=scheduled_num_tokens,
         )
         for handle in handles:
             handle.wait()
@@ -948,6 +1155,7 @@ class GroupCoordinator:
         src: int | None = None,
         all_gather_group: "GroupCoordinator | None" = None,
         all_gather_tensors: dict[str, bool] | None = None,
+        scheduled_num_tokens: int | None = None,
     ) -> tuple[
         dict[str, torch.Tensor | Any] | None,
         list[Handle],
@@ -977,10 +1185,32 @@ class GroupCoordinator:
         group = self.device_group
         metadata_group = self.cpu_group
 
-        recv_metadata_list = self.recv_object(src=src)
+        cache_key = None
+        cached_metadata = None
+        if self._should_skip_decode_tensor_dict_metadata(scheduled_num_tokens):
+            cache_key = self._decode_tensor_dict_metadata_cache_key(
+                src, all_gather_group, all_gather_tensors
+            )
+            cached_metadata = self._tensor_dict_metadata_recv_cache.get(cache_key)
+
+        if cached_metadata is not None:
+            recv_metadata_list = cached_metadata
+            with _pp_boundary_scope("tensor_dict.irecv_metadata_skip_cached"):
+                pass
+        else:
+            with _pp_boundary_scope("tensor_dict.irecv_metadata_recv_object"):
+                recv_metadata_list = self._unpack_tensor_dict_metadata(
+                    self.recv_object(src=src),
+                    src,
+                    all_gather_group,
+                    all_gather_tensors,
+                )
+            if cache_key is not None:
+                self._tensor_dict_metadata_recv_cache[cache_key] = recv_metadata_list
         tensor_dict: dict[str, Any] = {}
         handles: list[Handle] = []
         postprocess: list[Callable[[], None]] = []
+        batched_p2p_ops: list[Any] = []
 
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
@@ -999,10 +1229,22 @@ class GroupCoordinator:
                         all_gather_rank
                     ]
                     comm_group = metadata_group if slice_tensor.is_cpu else group
-                    handle = torch.distributed.irecv(
-                        slice_tensor, src=self.ranks[src], group=comm_group
-                    )
-                    handles.append(handle)
+                    batch_group = self._tensor_dict_pair_device_group(src)
+                    if slice_tensor.is_cuda and batch_group is not None:
+                        batched_p2p_ops.append(
+                            torch.distributed.P2POp(
+                                torch.distributed.irecv,
+                                slice_tensor,
+                                self.ranks[src],
+                                batch_group,
+                            )
+                        )
+                    else:
+                        with _pp_boundary_scope("tensor_dict.irecv_post_cuda_tensor"):
+                            handle = torch.distributed.irecv(
+                                slice_tensor, src=self.ranks[src], group=comm_group
+                            )
+                        handles.append(handle)
 
                     def _postprocess(
                         key: str = key,
@@ -1011,21 +1253,40 @@ class GroupCoordinator:
                         all_gather_group=all_gather_group,
                     ) -> None:
                         assert all_gather_group is not None
-                        tensor_dict[key] = all_gather_group.all_gather(
-                            slice_tensor, dim=0
-                        ).reshape(orig_shape)
+                        with _pp_boundary_scope(
+                            "tensor_dict.irecv_postprocess_allgather"
+                        ):
+                            tensor_dict[key] = all_gather_group.all_gather(
+                                slice_tensor, dim=0
+                            ).reshape(orig_shape)
 
                     postprocess.append(_postprocess)
                     tensor_dict[key] = slice_tensor
                 else:
                     comm_group = metadata_group if full_tensor.is_cpu else group
-                    handle = torch.distributed.irecv(
-                        full_tensor, src=self.ranks[src], group=comm_group
-                    )
-                    handles.append(handle)
+                    batch_group = self._tensor_dict_pair_device_group(src)
+                    if full_tensor.is_cuda and batch_group is not None:
+                        batched_p2p_ops.append(
+                            torch.distributed.P2POp(
+                                torch.distributed.irecv,
+                                full_tensor,
+                                self.ranks[src],
+                                batch_group,
+                            )
+                        )
+                    else:
+                        with _pp_boundary_scope("tensor_dict.irecv_post_cuda_tensor"):
+                            handle = torch.distributed.irecv(
+                                full_tensor, src=self.ranks[src], group=comm_group
+                            )
+                        handles.append(handle)
                     tensor_dict[key] = full_tensor
             else:
                 tensor_dict[key] = value
+
+        if batched_p2p_ops:
+            with _pp_boundary_scope("tensor_dict.irecv_batch_isend_irecv"):
+                handles.extend(torch.distributed.batch_isend_irecv(batched_p2p_ops))
 
         return tensor_dict, handles, postprocess
 

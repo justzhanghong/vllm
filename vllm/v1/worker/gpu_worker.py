@@ -65,6 +65,13 @@ from .utils import request_memory
 
 logger = init_logger(__name__)
 
+
+def _pp_boundary_scope(name: str) -> AbstractContextManager:
+    if not envs.VLLM_PP_BOUNDARY_PROFILING:
+        return nullcontext()
+    return torch.cuda.nvtx.range(f"vllm_pp_boundary:{name}")
+
+
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -88,11 +95,13 @@ class AsyncIntermediateTensors(IntermediateTensors):
         if self._comm_waited:
             return
         if self._comm_handles:
-            for handle in self._comm_handles:
-                handle.wait()
+            with _pp_boundary_scope("async_intermediate.recv_handle_wait"):
+                for handle in self._comm_handles:
+                    handle.wait()
         if self._comm_postprocess:
-            for fn in self._comm_postprocess:
-                fn()
+            with _pp_boundary_scope("async_intermediate.recv_postprocess"):
+                for fn in self._comm_postprocess:
+                    fn()
         self._comm_waited = True
 
     def __getattribute__(self, name: str):
@@ -153,6 +162,41 @@ class Worker(WorkerBase):
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
+        self._pp_send_tensor_refs: list[torch.Tensor] = []
+        self._pp_send_copy_buffers: dict[str, torch.Tensor] = {}
+
+    def _wait_for_pp_send_work(self) -> None:
+        if not self._pp_send_work:
+            self._pp_send_tensor_refs = []
+            return
+        with _pp_boundary_scope("worker.prev_send_handle_wait"):
+            for handle in self._pp_send_work:
+                handle.wait()
+        self._pp_send_work = []
+        self._pp_send_tensor_refs = []
+
+    def _copy_intermediate_tensors_for_pp_send(
+        self, tensors: dict[str, torch.Tensor | Any]
+    ) -> dict[str, torch.Tensor | Any]:
+        send_tensors: dict[str, torch.Tensor | Any] = {}
+        for key, value in tensors.items():
+            if not isinstance(value, torch.Tensor) or not value.is_cuda:
+                send_tensors[key] = value
+                continue
+
+            src = value.contiguous()
+            buf = self._pp_send_copy_buffers.get(key)
+            if (
+                buf is None
+                or buf.shape != src.shape
+                or buf.dtype != src.dtype
+                or buf.device != src.device
+            ):
+                buf = torch.empty_like(src)
+                self._pp_send_copy_buffers[key] = buf
+            buf.copy_(src, non_blocking=True)
+            send_tensors[key] = buf
+        return send_tensors
 
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
@@ -760,11 +804,11 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        # ensure any previous non-blocking PP sends are complete
-        if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
-            self._pp_send_work = []
+        # Ensure previous non-blocking PP sends are complete. The Stage50
+        # experiment can defer this wait until the next send boundary to test
+        # PP readiness overlap while keeping the default behavior unchanged.
+        if not envs.VLLM_PP_DEFER_SEND_WAIT:
+            self._wait_for_pp_send_work()
 
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
@@ -802,13 +846,19 @@ class Worker(WorkerBase):
                 )
             }
 
-        if forward_pass and not get_pp_group().is_first_rank:
-            tensor_dict, comm_handles, comm_postprocess = (
-                get_pp_group().irecv_tensor_dict(
-                    all_gather_group=get_tp_group(),
-                    all_gather_tensors=all_gather_tensors,
+        if (
+            forward_pass
+            and not get_pp_group().is_first_rank
+            and not envs.VLLM_PP_DEFER_INTERMEDIATE_RECV
+        ):
+            with _pp_boundary_scope("worker.irecv_tensor_dict"):
+                tensor_dict, comm_handles, comm_postprocess = (
+                    get_pp_group().irecv_tensor_dict(
+                        all_gather_group=get_tp_group(),
+                        all_gather_tensors=all_gather_tensors,
+                        scheduled_num_tokens=num_scheduled_tokens,
+                    )
                 )
-            )
             assert tensor_dict is not None
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
@@ -817,9 +867,10 @@ class Worker(WorkerBase):
             )
 
         with self.annotate_profile(scheduler_output):
-            output = self.model_runner.execute_model(
-                scheduler_output, intermediate_tensors
-            )
+            with _pp_boundary_scope("worker.execute_model"):
+                output = self.model_runner.execute_model(
+                    scheduler_output, intermediate_tensors
+                )
             if (
                 self.use_v2_model_runner
                 and self.model_runner.is_pooling_model
@@ -829,6 +880,8 @@ class Worker(WorkerBase):
             if isinstance(
                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
             ):
+                if envs.VLLM_PP_DEFER_SEND_WAIT:
+                    self._wait_for_pp_send_work()
                 return output
 
         assert isinstance(output, IntermediateTensors)
@@ -839,11 +892,36 @@ class Worker(WorkerBase):
         )
 
         # launch non-blocking send of intermediate tensors
-        self._pp_send_work = get_pp_group().isend_tensor_dict(
-            output.tensors,
-            all_gather_group=get_tp_group(),
-            all_gather_tensors=all_gather_tensors,
-        )
+        if envs.VLLM_PP_DEFER_SEND_WAIT:
+            self._wait_for_pp_send_work()
+        send_tensors = output.tensors
+        if envs.VLLM_PP_COPY_CUDAGRAPH_OUTPUT_BEFORE_SEND:
+            send_tensors = self._copy_intermediate_tensors_for_pp_send(
+                output.tensors
+            )
+        elif envs.VLLM_PP_CLONE_CUDAGRAPH_OUTPUT_BEFORE_SEND:
+            send_tensors = {
+                key: value.contiguous().clone()
+                if isinstance(value, torch.Tensor) and value.is_cuda
+                else value
+                for key, value in output.tensors.items()
+            }
+        with _pp_boundary_scope("worker.isend_tensor_dict"):
+            self._pp_send_work = get_pp_group().isend_tensor_dict(
+                send_tensors,
+                all_gather_group=get_tp_group(),
+                all_gather_tensors=all_gather_tensors,
+                scheduled_num_tokens=num_scheduled_tokens,
+            )
+        if (
+            envs.VLLM_PP_DEFER_SEND_WAIT
+            or envs.VLLM_PP_CLONE_CUDAGRAPH_OUTPUT_BEFORE_SEND
+            or envs.VLLM_PP_COPY_CUDAGRAPH_OUTPUT_BEFORE_SEND
+        ):
+            self._pp_send_tensor_refs = [
+                tensor for tensor in send_tensors.values()
+                if isinstance(tensor, torch.Tensor)
+            ]
 
         return None
 

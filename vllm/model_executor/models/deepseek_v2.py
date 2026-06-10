@@ -2023,7 +2023,8 @@ class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
 
 
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
-    pass
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
 
 # Compatibility with

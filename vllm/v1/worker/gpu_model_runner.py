@@ -9,7 +9,7 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import reduce
@@ -23,7 +23,11 @@ from tqdm import tqdm
 
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
-from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
+from vllm.compilation.cuda_graph import (
+    CUDAGraphOptions,
+    CUDAGraphStat,
+    CUDAGraphWrapper,
+)
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import (
     CompilationMode,
@@ -224,6 +228,12 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
+def _pp_boundary_scope(name: str):
+    if not envs.VLLM_PP_BOUNDARY_PROFILING:
+        return nullcontext()
+    return torch.cuda.nvtx.range(f"vllm_pp_boundary:{name}")
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
@@ -381,7 +391,8 @@ class ExecuteModelState(NamedTuple):
     sample_tokens(), after execute_model() returns None."""
 
     scheduler_output: "SchedulerOutput"
-    logits: torch.Tensor
+    logits: torch.Tensor | None
+    sampler_output: SamplerOutput | None
     spec_decode_metadata: SpecDecodeMetadata | None
     spec_decode_common_attn_metadata: CommonAttentionMetadata | None
     hidden_states: torch.Tensor
@@ -390,6 +401,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+    pp_sampled_token_broadcasted: bool
 
 
 class GPUModelRunner(
@@ -822,6 +834,64 @@ class GPUModelRunner(
             device="cpu",
             pin_memory=self.pin_memory,
         )
+        self.pp_sampled_token_ids_cpu: torch.Tensor | None = None
+        self.pp_sampled_token_ids_recv: torch.Tensor | None = None
+        self.pp_sampled_token_broadcast_handle: Any | None = None
+        self.pp_sampled_token_recv_handle: Any | None = None
+        self.pp_sampled_token_ids_send_ref: torch.Tensor | None = None
+        pp_group = get_pp_group()
+        if (
+            envs.VLLM_PP_CPU_SAMPLED_TOKEN_BROADCAST
+            or envs.VLLM_PP_CPU_FIRST_RANK_SAMPLED_TOKEN_P2P
+        ) and pp_group.world_size > 1:
+            self.pp_sampled_token_ids_cpu = torch.empty(
+                (self.max_num_reqs, 1),
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=self.pin_memory,
+            )
+            if envs.VLLM_PP_CPU_FIRST_RANK_SAMPLED_TOKEN_P2P:
+                logger.info("Using CPU/Gloo PP first-rank sampled-token P2P.")
+            else:
+                logger.info("Using CPU/Gloo PP sampled-token broadcast.")
+        if (
+            (
+                envs.VLLM_PP_SAMPLED_TOKEN_RECV_BUFFER
+                or envs.VLLM_PP_FIRST_RANK_ONLY_SAMPLED_TOKEN_P2P
+                or (
+                    envs.VLLM_PP_SAMPLED_TOKEN_PAIR_P2P
+                    and pp_group.is_first_rank
+                )
+                or envs.VLLM_PP_ASYNC_SAMPLED_TOKEN_BROADCAST
+                or envs.VLLM_PP_CPU_FIRST_RANK_SAMPLED_TOKEN_P2P
+                or envs.VLLM_PP_BROADCAST_SAMPLED_TOKEN_ONLY
+            )
+            and pp_group.world_size > 1
+            and not pp_group.is_last_rank
+        ):
+            self.pp_sampled_token_ids_recv = torch.empty(
+                (self.max_num_reqs, 1),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            if envs.VLLM_PP_FIRST_RANK_ONLY_SAMPLED_TOKEN_P2P:
+                self.pp_sampled_token_ids_recv.zero_()
+                logger.info(
+                    "Using first-rank-only PP sampled-token P2P buffer."
+                )
+            elif envs.VLLM_PP_SAMPLED_TOKEN_PAIR_P2P:
+                self.pp_sampled_token_ids_recv.zero_()
+                logger.info("Using PP sampled-token pair P2P recv buffer.")
+            elif envs.VLLM_PP_CPU_FIRST_RANK_SAMPLED_TOKEN_P2P:
+                logger.info(
+                    "Using CPU first-rank PP sampled-token P2P recv buffer."
+                )
+            elif envs.VLLM_PP_ASYNC_SAMPLED_TOKEN_BROADCAST:
+                logger.info("Using async GPU PP sampled-token broadcast.")
+            elif envs.VLLM_PP_BROADCAST_SAMPLED_TOKEN_ONLY:
+                logger.info("Using PP sampled-token-only output broadcast.")
+            else:
+                logger.info("Using preallocated GPU PP sampled-token recv buffer.")
 
         # Pre-allocated tensor for copying valid sampled token counts to CPU,
         # with dedicated stream for overlapping and event for coordination.
@@ -1623,65 +1693,72 @@ class GPUModelRunner(
         (-1 for new requests).
         """
 
+        with _pp_boundary_scope("prepare_input_ids.wait_sampled_token_recv"):
+            self._wait_pp_sampled_token_broadcast(recv=True, send=False)
+        if self._should_skip_middle_rank_sampled_token_tensor():
+            return
         if self.input_batch.prev_sampled_token_ids is None:
             # Normal scheduling case
-            self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
-            if self.enable_prompt_embeds:
-                self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
-                self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
+            with _pp_boundary_scope("prepare_input_ids.cpu_input_copy"):
+                self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
+                if self.enable_prompt_embeds:
+                    self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
+                    self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
             return
 
         # Async scheduling case, where some decode requests from the previous
         # iteration won't have entries in input_ids_cpu and need to be copied
         # on the GPU from prev_sampled_token_ids.
-        prev_positions = self.prev_positions.np[:num_reqs]
-        scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
-        sample_flattened_indices: list[int] = []
-        spec_flattened_indices: list[int] = []
-        prev_draft_token_indices: list[int] = []
-        prev_indices: list[int] = []
-        common_indices_match = True
-        max_flattened_index = -1
-        total_num_spec_tokens = 0
+        with _pp_boundary_scope("prepare_input_ids.map_prev_positions"):
+            prev_positions = self.prev_positions.np[:num_reqs]
+            scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+            sample_flattened_indices: list[int] = []
+            spec_flattened_indices: list[int] = []
+            prev_draft_token_indices: list[int] = []
+            prev_indices: list[int] = []
+            common_indices_match = True
+            max_flattened_index = -1
+            total_num_spec_tokens = 0
 
-        for cur_index in range(num_reqs):
-            prev_index = prev_positions[cur_index]
-            if prev_index < 0:
-                continue
-            prev_indices.append(prev_index)
-            req_id = self.input_batch.req_ids[cur_index]
-            # We need to compute the flattened input_ids index of the
-            # last token in each common request.
-            draft_len = len(scheduled_spec_tokens.get(req_id, ()))
-            total_num_spec_tokens += draft_len
-            flattened_index = cu_num_tokens[cur_index].item() - 1
-            # example: cu_num_tokens = [2, 5, 8], draft_tokens = [1, 2, 2]
-            # sample_flattened_indices = [0, 2, 5]
-            # spec_flattened_indices = [1,   3, 4,    6, 7]
-            sample_flattened_indices.append(flattened_index - draft_len)
-            spec_flattened_indices.extend(
-                range(flattened_index - draft_len + 1, flattened_index + 1)
-            )
-            start = prev_index * self.num_spec_tokens
-            # prev_draft_token_indices is used to find which draft_tokens_id
-            # should be copied to input_ids
-            # example: prev draft_tokens_id [[1,2], [3,4], [5, 6]]
-            # flatten draft_tokens_id [1,2,3,4,5,6]
-            # draft_len of each request [1, 2, 1]
-            # then prev_draft_token_indices is [0,   2, 3,   4]
-            prev_draft_token_indices.extend(range(start, start + draft_len))
-            common_indices_match &= prev_index == flattened_index
-            max_flattened_index = max(max_flattened_index, flattened_index)
+            for cur_index in range(num_reqs):
+                prev_index = prev_positions[cur_index]
+                if prev_index < 0:
+                    continue
+                prev_indices.append(prev_index)
+                req_id = self.input_batch.req_ids[cur_index]
+                # We need to compute the flattened input_ids index of the
+                # last token in each common request.
+                draft_len = len(scheduled_spec_tokens.get(req_id, ()))
+                total_num_spec_tokens += draft_len
+                flattened_index = cu_num_tokens[cur_index].item() - 1
+                # example: cu_num_tokens = [2, 5, 8], draft_tokens = [1, 2, 2]
+                # sample_flattened_indices = [0, 2, 5]
+                # spec_flattened_indices = [1,   3, 4,    6, 7]
+                sample_flattened_indices.append(flattened_index - draft_len)
+                spec_flattened_indices.extend(
+                    range(flattened_index - draft_len + 1, flattened_index + 1)
+                )
+                start = prev_index * self.num_spec_tokens
+                # prev_draft_token_indices is used to find which draft_tokens_id
+                # should be copied to input_ids
+                # example: prev draft_tokens_id [[1,2], [3,4], [5, 6]]
+                # flatten draft_tokens_id [1,2,3,4,5,6]
+                # draft_len of each request [1, 2, 1]
+                # then prev_draft_token_indices is [0,   2, 3,   4]
+                prev_draft_token_indices.extend(range(start, start + draft_len))
+                common_indices_match &= prev_index == flattened_index
+                max_flattened_index = max(max_flattened_index, flattened_index)
 
         num_common_tokens = len(sample_flattened_indices)
         total_without_spec = total_num_scheduled_tokens - total_num_spec_tokens
         if num_common_tokens < total_without_spec:
             # If not all requests are decodes from the last iteration,
             # we need to copy the input_ids_cpu to the GPU first.
-            self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
-            if self.enable_prompt_embeds:
-                self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
-                self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
+            with _pp_boundary_scope("prepare_input_ids.cpu_input_copy_partial"):
+                self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
+                if self.enable_prompt_embeds:
+                    self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
+                    self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
         if num_common_tokens == 0:
             # No requests in common with the previous iteration
             # So input_ids.cpu will have all the input ids.
@@ -1691,49 +1768,60 @@ class GPUModelRunner(
             # and no reordering happened.
             # The indices are both the same permutation of 0..N-1 so
             # we can copy directly using a single slice.
-            self.input_ids.gpu[:num_common_tokens].copy_(
-                self.input_batch.prev_sampled_token_ids[:num_common_tokens, 0],
-                non_blocking=True,
-            )
-            if self.enable_prompt_embeds:
-                self.is_token_ids.gpu[:num_common_tokens] = True
+            with _pp_boundary_scope("prepare_input_ids.prev_token_direct_copy"):
+                self.input_ids.gpu[:num_common_tokens].copy_(
+                    self.input_batch.prev_sampled_token_ids[
+                        :num_common_tokens, 0
+                    ],
+                    non_blocking=True,
+                )
+                if self.enable_prompt_embeds:
+                    self.is_token_ids.gpu[:num_common_tokens] = True
             return
         # Upload the index tensors asynchronously so the scatter can be non-blocking.
-        sampled_tokens_index_tensor = torch.tensor(
-            sample_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
-        prev_common_req_indices_tensor = torch.tensor(
-            prev_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
-        self.input_ids.gpu.scatter_(
-            dim=0,
-            index=sampled_tokens_index_tensor,
-            src=self.input_batch.prev_sampled_token_ids[
-                prev_common_req_indices_tensor, 0
-            ],
-        )
+        with _pp_boundary_scope("prepare_input_ids.prev_token_scatter"):
+            sampled_tokens_index_tensor = torch.tensor(
+                sample_flattened_indices,
+                dtype=torch.int64,
+                pin_memory=self.pin_memory,
+            ).to(self.device, non_blocking=True)
+            prev_common_req_indices_tensor = torch.tensor(
+                prev_indices, dtype=torch.int64, pin_memory=self.pin_memory
+            ).to(self.device, non_blocking=True)
+            self.input_ids.gpu.scatter_(
+                dim=0,
+                index=sampled_tokens_index_tensor,
+                src=self.input_batch.prev_sampled_token_ids[
+                    prev_common_req_indices_tensor, 0
+                ],
+            )
 
         # Scatter the draft tokens after the sampled tokens are scattered.
         if self._draft_token_ids is None or not spec_flattened_indices:
             return
 
-        assert isinstance(self._draft_token_ids, torch.Tensor)
-        draft_tokens_index_tensor = torch.tensor(
-            spec_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
-        prev_draft_token_indices_tensor = torch.tensor(
-            prev_draft_token_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
+        with _pp_boundary_scope("prepare_input_ids.draft_token_scatter"):
+            assert isinstance(self._draft_token_ids, torch.Tensor)
+            draft_tokens_index_tensor = torch.tensor(
+                spec_flattened_indices,
+                dtype=torch.int64,
+                pin_memory=self.pin_memory,
+            ).to(self.device, non_blocking=True)
+            prev_draft_token_indices_tensor = torch.tensor(
+                prev_draft_token_indices,
+                dtype=torch.int64,
+                pin_memory=self.pin_memory,
+            ).to(self.device, non_blocking=True)
 
-        # because input_ids dtype is torch.int32,
-        # so convert draft_token_ids to torch.int32 here.
-        draft_token_ids = self._draft_token_ids.to(dtype=torch.int32)
+            # because input_ids dtype is torch.int32,
+            # so convert draft_token_ids to torch.int32 here.
+            draft_token_ids = self._draft_token_ids.to(dtype=torch.int32)
 
-        self.input_ids.gpu.scatter_(
-            dim=0,
-            index=draft_tokens_index_tensor,
-            src=draft_token_ids.flatten()[prev_draft_token_indices_tensor],
-        )
+            self.input_ids.gpu.scatter_(
+                dim=0,
+                index=draft_tokens_index_tensor,
+                src=draft_token_ids.flatten()[prev_draft_token_indices_tensor],
+            )
 
     def _get_encoder_seq_lens(
         self,
@@ -1797,6 +1885,15 @@ class GPUModelRunner(
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
+
+        fastpath_result = self._try_prepare_inputs_decode_fastpath(
+            scheduler_output,
+            num_scheduled_tokens,
+            num_reqs,
+            total_num_scheduled_tokens,
+        )
+        if fastpath_result is not None:
+            return fastpath_result
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
@@ -2090,6 +2187,109 @@ class GPUModelRunner(
             logits_indices,
             spec_decode_metadata,
         )
+
+    def _try_prepare_inputs_decode_fastpath(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_scheduled_tokens: np.ndarray,
+        num_reqs: int,
+        total_num_scheduled_tokens: int,
+    ) -> tuple[torch.Tensor, SpecDecodeMetadata | None] | None:
+        if not envs.VLLM_STAGE50_DECODE_PREP_FASTPATH:
+            return None
+        if (
+            not self.use_async_scheduling
+            or num_reqs != 1
+            or total_num_scheduled_tokens != 1
+            or int(num_scheduled_tokens[0]) != 1
+        ):
+            return None
+        if (
+            self.speculative_config is not None
+            or self.num_spec_tokens
+            or self.use_async_spec_decode
+            or scheduler_output.scheduled_spec_decode_tokens
+        ):
+            return None
+        if (
+            self.enable_prompt_embeds
+            or self.input_batch.req_prompt_embeds
+            or self.uses_mrope
+            or self.uses_xdrope_dim > 0
+            or scheduler_output.scheduled_encoder_inputs
+            or self.lora_config
+            or self.is_mm_prefix_lm
+            or self.cache_config.mamba_cache_mode == "align"
+        ):
+            return None
+        if self.input_batch.prev_sampled_token_ids is None:
+            return None
+
+        req_id = self.input_batch.req_ids[0]
+        prev_req_id_to_index = self.input_batch.prev_req_id_to_index
+        if not prev_req_id_to_index or prev_req_id_to_index.get(req_id) != 0:
+            return None
+        if (
+            self.input_batch.num_computed_tokens_cpu[0]
+            < self.input_batch.num_prompt_tokens[0]
+        ):
+            return None
+        req_state = self.requests.get(req_id)
+        if req_state is None:
+            return None
+        if self.num_accepted_tokens_event is not None:
+            return None
+
+        self.input_batch.block_table.commit_block_table(num_reqs, only_if_dirty=True)
+
+        self.query_start_loc.np[0] = 0
+        self.query_start_loc.np[1] = 1
+        self.query_start_loc.copy_to_gpu(2)
+        query_start_loc = self.query_start_loc.gpu[:2]
+
+        next_seq_len = int(self.input_batch.num_computed_tokens_cpu[0]) + 1
+        self.optimistic_seq_lens_cpu[0] = next_seq_len
+
+        self.prev_positions.np[0] = 0
+
+        self.discard_request_mask.np[0] = next_seq_len < req_state.num_tokens
+        self.discard_request_mask.copy_to_gpu(num_reqs)
+
+        self.num_accepted_tokens.np[0] = 1
+
+        self.num_computed_tokens[:1].copy_(
+            self.input_batch.num_computed_tokens_cpu_tensor[:1],
+            non_blocking=True,
+        )
+        self.num_scheduled_tokens.np[0] = 1
+        self.num_scheduled_tokens.copy_to_gpu(num_reqs)
+        self.positions[:1].copy_(
+            self.input_batch.num_computed_tokens_cpu_tensor[:1],
+            non_blocking=True,
+        )
+        self.seq_lens[:1].copy_(
+            self.optimistic_seq_lens_cpu[:1],
+            non_blocking=True,
+        )
+
+        with _pp_boundary_scope("decode_fastpath.compute_slot_mapping"):
+            self.input_batch.block_table.compute_slot_mapping(
+                num_reqs,
+                query_start_loc,
+                self.positions[:1],
+            )
+
+        with _pp_boundary_scope("decode_fastpath.wait_sampled_token_recv"):
+            self._wait_pp_sampled_token_broadcast(recv=True, send=False)
+        if self._should_skip_middle_rank_sampled_token_tensor():
+            return query_start_loc[1:] - 1, None
+        with _pp_boundary_scope("decode_fastpath.prev_token_copy"):
+            self.input_ids.gpu[:1].copy_(
+                self.input_batch.prev_sampled_token_ids[:1, 0],
+                non_blocking=True,
+            )
+
+        return self.query_pos.gpu[:1], None
 
     def _build_attention_metadata(
         self,
@@ -3107,6 +3307,47 @@ class GPUModelRunner(
             }
         )
 
+    def _recv_pp_intermediate_tensors_deferred(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_input_tokens: int,
+    ) -> IntermediateTensors:
+        """Receive PP intermediate tensors after local input prep.
+
+        The default worker path receives metadata at the start of
+        Worker.execute_model. This guarded Stage50 path posts the receive only
+        when the model runner actually needs the tensors, allowing local
+        decode input/attention metadata work to overlap upstream PP readiness.
+        """
+        all_gather_tensors = {}
+        if self.compilation_config.pass_config.enable_sp:
+            all_gather_tensors = {
+                "residual": not is_residual_scattered_for_sp(
+                    self.vllm_config, num_input_tokens
+                )
+            }
+
+        with _pp_boundary_scope("worker.irecv_tensor_dict_deferred"):
+            tensor_dict, comm_handles, comm_postprocess = (
+                get_pp_group().irecv_tensor_dict(
+                    all_gather_group=get_tp_group(),
+                    all_gather_tensors=all_gather_tensors,
+                    scheduled_num_tokens=scheduler_output.total_num_scheduled_tokens,
+                )
+            )
+        assert tensor_dict is not None
+        if comm_handles:
+            with _pp_boundary_scope(
+                "async_intermediate.recv_handle_wait_deferred"
+            ):
+                for handle in comm_handles:
+                    handle.wait()
+        if comm_postprocess:
+            with _pp_boundary_scope("async_intermediate.recv_postprocess_deferred"):
+                for fn in comm_postprocess:
+                    fn()
+        return IntermediateTensors(tensor_dict)
+
     def eplb_step(self, is_dummy: bool = False, is_profile: bool = False) -> None:
         """
         Step for the EPLB (Expert Parallelism Load Balancing) state.
@@ -3319,7 +3560,11 @@ class GPUModelRunner(
         if is_first_rank:
             intermediate_tensors = None
         else:
-            assert intermediate_tensors is not None
+            if intermediate_tensors is None:
+                assert envs.VLLM_PP_DEFER_INTERMEDIATE_RECV
+                intermediate_tensors = self._recv_pp_intermediate_tensors_deferred(
+                    scheduler_output, num_input_tokens
+                )
             intermediate_tensors = self.sync_and_slice_intermediate_tensors(
                 num_input_tokens, intermediate_tensors, True
             )
@@ -3831,6 +4076,124 @@ class GPUModelRunner(
                 return False
         return has_valid_req
 
+    def _should_broadcast_pp_sampled_token_only(
+        self,
+        scheduler_output: "SchedulerOutput",
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> bool:
+        if not envs.VLLM_PP_BROADCAST_SAMPLED_TOKEN_ONLY:
+            return False
+        pp = get_pp_group()
+        if not self.broadcast_pp_output or pp.world_size <= 1:
+            return False
+        if not self.use_async_scheduling:
+            return False
+        if self.is_pooling_model:
+            return False
+        if self.speculative_config is not None or self.num_spec_tokens:
+            return False
+        if spec_decode_metadata is not None:
+            return False
+        if (
+            scheduler_output.has_structured_output_requests
+            or scheduler_output.pending_structured_output_tokens
+        ):
+            return False
+        if self.num_prompt_logprobs:
+            return False
+
+        sampling_metadata = self.input_batch.sampling_metadata
+        if (
+            not sampling_metadata.all_greedy
+            or sampling_metadata.all_random
+            or sampling_metadata.max_num_logprobs is not None
+            or sampling_metadata.logprob_token_ids
+            or sampling_metadata.allowed_token_ids_mask is not None
+            or sampling_metadata.bad_words_token_ids
+            or not sampling_metadata.no_penalties
+        ):
+            return False
+        return True
+
+    def _should_use_pp3_greedy_local_argmax(
+        self,
+        scheduler_output: "SchedulerOutput",
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        output_logits_required: bool = False,
+    ) -> bool:
+        if not envs.VLLM_STAGE50_PP3_GREEDY_LOCAL_ARGMAX:
+            return False
+        if output_logits_required:
+            return False
+        pp = get_pp_group()
+        if pp.world_size <= 1 or not pp.is_last_rank:
+            return False
+        if not self.use_async_scheduling:
+            return False
+        if self.is_pooling_model:
+            return False
+        if self.speculative_config is not None or self.num_spec_tokens:
+            return False
+        if spec_decode_metadata is not None:
+            return False
+        if (
+            scheduler_output.has_structured_output_requests
+            or scheduler_output.pending_structured_output_tokens
+        ):
+            return False
+        if self.num_prompt_logprobs:
+            return False
+
+        sampling_metadata = self.input_batch.sampling_metadata
+        if (
+            not sampling_metadata.all_greedy
+            or sampling_metadata.all_random
+            or sampling_metadata.max_num_logprobs is not None
+            or sampling_metadata.logprob_token_ids
+            or sampling_metadata.allowed_token_ids_mask is not None
+            or sampling_metadata.bad_words_token_ids
+            or not sampling_metadata.no_penalties
+            or sampling_metadata.spec_token_ids
+            or any(sampling_metadata.logitsprocs.all)
+        ):
+            return False
+        return hasattr(self.model, "get_top_tokens")
+
+    def _pp3_greedy_local_argmax_sample(
+        self, sample_hidden_states: torch.Tensor
+    ) -> SamplerOutput:
+        self.input_batch.update_async_output_token_ids()
+        sampled = self.model.get_top_tokens(sample_hidden_states)
+        return SamplerOutput(
+            sampled_token_ids=sampled.to(torch.int32).unsqueeze(-1),
+            logprobs_tensors=None,
+        )
+
+    def _should_inline_pp_sample_broadcast(
+        self,
+        scheduler_output: "SchedulerOutput",
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> bool:
+        if not envs.VLLM_PP_INLINE_SAMPLE_BROADCAST:
+            return False
+        pp = get_pp_group()
+        if self.broadcast_pp_output or pp.world_size <= 1 or not pp.is_last_rank:
+            return False
+        if not self.use_async_scheduling:
+            return False
+        if self.is_pooling_model:
+            return False
+        if self.speculative_config is not None or self.num_spec_tokens:
+            return False
+        if spec_decode_metadata is not None:
+            return False
+        if (
+            scheduler_output.has_structured_output_requests
+            or scheduler_output.pending_structured_output_tokens
+        ):
+            return False
+        return True
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -4135,13 +4498,55 @@ class GPUModelRunner(
                         kv_connector_output,
                     )
 
+                sampler_output = None
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                if self._should_use_pp3_greedy_local_argmax(
+                    scheduler_output, spec_decode_metadata
+                ):
+                    with _pp_boundary_scope(
+                        "gpu_model_runner.pp3_greedy_local_argmax"
+                    ):
+                        sampler_output = self._pp3_greedy_local_argmax_sample(
+                            sample_hidden_states
+                        )
+                    logits = None
+                else:
+                    with _pp_boundary_scope("gpu_model_runner.compute_logits"):
+                        logits = self.model.compute_logits(sample_hidden_states)
+                pp_sampled_token_broadcasted = False
+                if self._should_inline_pp_sample_broadcast(
+                    scheduler_output, spec_decode_metadata
+                ):
+                    if deferred_state_corrections_fn:
+                        deferred_state_corrections_fn()
+                        deferred_state_corrections_fn = None
+                    with record_function_or_nullcontext(
+                        "gpu_model_runner: inline_sample"
+                    ):
+                        if sampler_output is None:
+                            with _pp_boundary_scope("gpu_model_runner.sample"):
+                                sampler_output = self._sample(
+                                    logits, spec_decode_metadata
+                                )
+                    with _pp_boundary_scope(
+                        "gpu_model_runner.pp_broadcast_prev_sampled_token_ids"
+                    ):
+                        self._pp_broadcast_prev_sampled_token_ids(
+                            sampler_output.sampled_token_ids
+                        )
+                    pp_sampled_token_broadcasted = True
             else:
                 # Rare case.
                 assert not self.is_pooling_model
 
                 sample_hidden_states = hidden_states[logits_indices]
+                sampler_output = None
+                pp_sampled_token_broadcasted = False
+                broadcast_sampled_token_only = (
+                    self._should_broadcast_pp_sampled_token_only(
+                        scheduler_output, spec_decode_metadata
+                    )
+                )
                 if not get_pp_group().is_last_rank:
                     all_gather_tensors = {
                         "residual": not is_residual_scattered_for_sp(
@@ -4155,21 +4560,62 @@ class GPUModelRunner(
                     )
                     logits = None
                 else:
-                    logits = self.model.compute_logits(sample_hidden_states)
+                    if self._should_use_pp3_greedy_local_argmax(
+                        scheduler_output,
+                        spec_decode_metadata,
+                        output_logits_required=not broadcast_sampled_token_only,
+                    ):
+                        with _pp_boundary_scope(
+                            "gpu_model_runner.pp3_greedy_local_argmax"
+                        ):
+                            sampler_output = self._pp3_greedy_local_argmax_sample(
+                                sample_hidden_states
+                            )
+                        logits = None
+                    else:
+                        with _pp_boundary_scope("gpu_model_runner.compute_logits"):
+                            logits = self.model.compute_logits(sample_hidden_states)
 
                 model_output_broadcast_data: dict[str, Any] = {}
-                if logits is not None:
-                    model_output_broadcast_data["logits"] = logits.contiguous()
+                if broadcast_sampled_token_only:
+                    if get_pp_group().is_last_rank:
+                        if deferred_state_corrections_fn:
+                            deferred_state_corrections_fn()
+                            deferred_state_corrections_fn = None
+                        if sampler_output is None:
+                            with _pp_boundary_scope("gpu_model_runner.sample"):
+                                sampler_output = self._sample(
+                                    logits, spec_decode_metadata
+                                )
+                        model_output_broadcast_data["sampled_token_ids"] = (
+                            sampler_output.sampled_token_ids.contiguous()
+                        )
+                    broadcasted = get_pp_group().broadcast_tensor_dict(
+                        model_output_broadcast_data,
+                        src=len(get_pp_group().ranks) - 1,
+                    )
+                    assert broadcasted is not None
+                    sampled_token_ids = broadcasted["sampled_token_ids"]
+                    if not get_pp_group().is_last_rank:
+                        sampler_output = SamplerOutput(
+                            sampled_token_ids=sampled_token_ids,
+                            logprobs_tensors=None,
+                        )
+                    logits = None
+                else:
+                    if logits is not None:
+                        model_output_broadcast_data["logits"] = logits.contiguous()
 
-                broadcasted = get_pp_group().broadcast_tensor_dict(
-                    model_output_broadcast_data, src=len(get_pp_group().ranks) - 1
-                )
-                assert broadcasted is not None
-                logits = broadcasted["logits"]
+                    broadcasted = get_pp_group().broadcast_tensor_dict(
+                        model_output_broadcast_data, src=len(get_pp_group().ranks) - 1
+                    )
+                    assert broadcasted is not None
+                    logits = broadcasted["logits"]
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,
+            sampler_output,
             spec_decode_metadata,
             spec_decode_common_attn_metadata,
             hidden_states,
@@ -4178,6 +4624,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            pp_sampled_token_broadcasted,
         )
         self.kv_connector_output = kv_connector_output
 
@@ -4197,7 +4644,10 @@ class GPUModelRunner(
             self.kv_connector_output = None
             # receive sampled token ids from the last PP rank.
             if self.use_async_scheduling and get_pp_group().world_size > 1:
-                self._pp_receive_prev_sampled_token_ids_to_input_batch()
+                with _pp_boundary_scope(
+                    "gpu_model_runner.pp_receive_prev_sampled_token_ids"
+                ):
+                    self._pp_receive_prev_sampled_token_ids_to_input_batch()
             if not kv_connector_output:
                 return None  # type: ignore[return-value]
 
@@ -4214,6 +4664,7 @@ class GPUModelRunner(
         (
             scheduler_output,
             logits,
+            sampler_output,
             spec_decode_metadata,
             spec_decode_common_attn_metadata,
             hidden_states,
@@ -4222,31 +4673,67 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            pp_sampled_token_broadcasted,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
+            if sampler_output is not None:
+                raise RuntimeError(
+                    "PP sampled-token-only broadcast is incompatible with "
+                    "structured output grammar bitmasks."
+                )
             apply_grammar_bitmask(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
-        with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+        if sampler_output is None:
+            with record_function_or_nullcontext("gpu_model_runner: sample"):
+                with _pp_boundary_scope("gpu_model_runner.sample"):
+                    sampler_output = self._sample(logits, spec_decode_metadata)
 
-        self._update_states_after_model_execute(
-            sampler_output.sampled_token_ids, scheduler_output
-        )
+        if (
+            not pp_sampled_token_broadcasted
+            and self.use_async_scheduling
+            and envs.VLLM_PP_EARLY_SAMPLED_TOKEN_BROADCAST
+        ):
+            pp = get_pp_group()
+            if (
+                not self.broadcast_pp_output
+                and pp.world_size > 1
+                and pp.is_last_rank
+            ):
+                with _pp_boundary_scope(
+                    "gpu_model_runner.pp_broadcast_prev_sampled_token_ids"
+                ):
+                    self._pp_broadcast_prev_sampled_token_ids(
+                        sampler_output.sampled_token_ids
+                    )
+                pp_sampled_token_broadcasted = True
+
+        with _pp_boundary_scope("gpu_model_runner.update_states_after_model_execute"):
+            self._update_states_after_model_execute(
+                sampler_output.sampled_token_ids, scheduler_output
+            )
         if self.use_async_scheduling:
             pp = get_pp_group()
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
             # PP outputs have been broadcasted to all ranks at logits computation.
             # Therefore, here is no need to send sampled token ids again in this case.
-            if not self.broadcast_pp_output and pp.world_size > 1 and pp.is_last_rank:
-                self._pp_broadcast_prev_sampled_token_ids(
-                    sampler_output.sampled_token_ids
-                )
+            if (
+                not pp_sampled_token_broadcasted
+                and not self.broadcast_pp_output
+                and pp.world_size > 1
+                and pp.is_last_rank
+            ):
+                with _pp_boundary_scope(
+                    "gpu_model_runner.pp_broadcast_prev_sampled_token_ids"
+                ):
+                    self._pp_broadcast_prev_sampled_token_ids(
+                        sampler_output.sampled_token_ids
+                    )
 
         self._draft_token_ids = None
         self._draft_token_req_ids = None
@@ -4442,9 +4929,213 @@ class GPUModelRunner(
         if not self._is_all_reqs_chunked_prefill() and not (
             self._should_skip_pp_final_sampled_token_broadcast(sampled_token_ids)
         ):
-            torch.distributed.broadcast(
-                sampled_token_ids, src=pp.rank, group=pp.device_group
+            with _pp_boundary_scope("sampled_token.send_wait_before_issue"):
+                self._wait_pp_sampled_token_broadcast(send=True, recv=False)
+            if self._should_use_cpu_first_rank_sampled_token_p2p(
+                sampled_token_ids
+            ):
+                with _pp_boundary_scope("sampled_token.cpu_first_rank_p2p_send"):
+                    cpu_tokens = self.pp_sampled_token_ids_cpu[
+                        : sampled_token_ids.shape[0]
+                    ]
+                    cpu_tokens.copy_(sampled_token_ids, non_blocking=False)
+                    torch.distributed.send(
+                        cpu_tokens, dst=pp.first_rank, group=pp.cpu_group
+                    )
+                return
+            if self._should_use_sampled_token_pair_p2p(sampled_token_ids):
+                with _pp_boundary_scope("sampled_token.pair_p2p_send"):
+                    pair_group = pp.sampled_token_pair_device_group()
+                    assert pair_group is not None
+                    torch.distributed.send(
+                        sampled_token_ids, dst=pp.first_rank, group=pair_group
+                    )
+                return
+            if self._should_use_first_rank_only_sampled_token_p2p(
+                sampled_token_ids
+            ):
+                with _pp_boundary_scope("sampled_token.first_rank_p2p_send"):
+                    torch.distributed.send(
+                        sampled_token_ids, dst=pp.first_rank, group=pp.device_group
+                    )
+                return
+            if self._should_use_cpu_sampled_token_broadcast(sampled_token_ids):
+                with _pp_boundary_scope("sampled_token.cpu_broadcast_send"):
+                    cpu_tokens = self.pp_sampled_token_ids_cpu[
+                        : sampled_token_ids.shape[0]
+                    ]
+                    cpu_tokens.copy_(sampled_token_ids, non_blocking=False)
+                    torch.distributed.broadcast(
+                        cpu_tokens, src=pp.last_rank, group=pp.cpu_group
+                    )
+                return
+            if self._should_use_async_sampled_token_broadcast(sampled_token_ids):
+                with _pp_boundary_scope("sampled_token.async_broadcast_issue"):
+                    self.pp_sampled_token_ids_send_ref = sampled_token_ids
+                    self.pp_sampled_token_broadcast_handle = (
+                        torch.distributed.broadcast(
+                            sampled_token_ids,
+                            src=pp.rank,
+                            group=pp.device_group,
+                            async_op=True,
+                        )
+                    )
+                return
+            with _pp_boundary_scope("sampled_token.device_broadcast_blocking_send"):
+                torch.distributed.broadcast(
+                    sampled_token_ids, src=pp.rank, group=pp.device_group
+                )
+
+    def _wait_pp_sampled_token_broadcast(
+        self, *, recv: bool = True, send: bool = True
+    ) -> None:
+        if recv and self.pp_sampled_token_recv_handle is not None:
+            with _pp_boundary_scope("sampled_token.async_recv_handle_wait"):
+                self.pp_sampled_token_recv_handle.wait()
+            self.pp_sampled_token_recv_handle = None
+        if send and self.pp_sampled_token_broadcast_handle is not None:
+            with _pp_boundary_scope("sampled_token.async_send_handle_wait"):
+                self.pp_sampled_token_broadcast_handle.wait()
+            self.pp_sampled_token_broadcast_handle = None
+            self.pp_sampled_token_ids_send_ref = None
+
+    def _should_use_first_rank_only_sampled_token_p2p(
+        self, sampled_token_ids: torch.Tensor | None = None
+    ) -> bool:
+        pp = get_pp_group()
+        if not envs.VLLM_PP_FIRST_RANK_ONLY_SAMPLED_TOKEN_P2P:
+            return False
+        if (
+            pp.world_size <= 1
+            or envs.VLLM_PP_CPU_SAMPLED_TOKEN_BROADCAST
+            or envs.VLLM_PP_CPU_FIRST_RANK_SAMPLED_TOKEN_P2P
+        ):
+            return False
+        if self.speculative_config is not None or self.num_spec_tokens:
+            return False
+        return (
+            sampled_token_ids is None
+            or (
+                sampled_token_ids.dim() == 2
+                and sampled_token_ids.shape[-1] == 1
             )
+        )
+
+    def _should_use_cpu_first_rank_sampled_token_p2p(
+        self, sampled_token_ids: torch.Tensor | None = None
+    ) -> bool:
+        pp = get_pp_group()
+        if not envs.VLLM_PP_CPU_FIRST_RANK_SAMPLED_TOKEN_P2P:
+            return False
+        if pp.world_size <= 1 or self.pp_sampled_token_ids_cpu is None:
+            return False
+        if (
+            envs.VLLM_PP_CPU_SAMPLED_TOKEN_BROADCAST
+            or envs.VLLM_PP_FIRST_RANK_ONLY_SAMPLED_TOKEN_P2P
+            or envs.VLLM_PP_ASYNC_SAMPLED_TOKEN_BROADCAST
+        ):
+            return False
+        if self.speculative_config is not None or self.num_spec_tokens:
+            return False
+        return (
+            sampled_token_ids is None
+            or (
+                sampled_token_ids.dim() == 2
+                and sampled_token_ids.shape[-1] == 1
+                and sampled_token_ids.numel()
+                <= self.pp_sampled_token_ids_cpu.numel()
+            )
+        )
+
+    def _should_use_sampled_token_pair_p2p(
+        self, sampled_token_ids: torch.Tensor | None = None
+    ) -> bool:
+        pp = get_pp_group()
+        if not envs.VLLM_PP_SAMPLED_TOKEN_PAIR_P2P:
+            return False
+        if pp.world_size <= 1:
+            return False
+        if (
+            (pp.is_first_rank or pp.is_last_rank)
+            and pp.sampled_token_pair_device_group() is None
+        ):
+            return False
+        if (
+            envs.VLLM_PP_CPU_SAMPLED_TOKEN_BROADCAST
+            or envs.VLLM_PP_CPU_FIRST_RANK_SAMPLED_TOKEN_P2P
+            or envs.VLLM_PP_FIRST_RANK_ONLY_SAMPLED_TOKEN_P2P
+            or envs.VLLM_PP_ASYNC_SAMPLED_TOKEN_BROADCAST
+        ):
+            return False
+        if self.speculative_config is not None or self.num_spec_tokens:
+            return False
+        return (
+            sampled_token_ids is None
+            or (
+                sampled_token_ids.dim() == 2
+                and sampled_token_ids.shape[-1] == 1
+            )
+        )
+
+    def _should_use_cpu_sampled_token_broadcast(
+        self, sampled_token_ids: torch.Tensor
+    ) -> bool:
+        return (
+            envs.VLLM_PP_CPU_SAMPLED_TOKEN_BROADCAST
+            and self.pp_sampled_token_ids_cpu is not None
+            and sampled_token_ids.dim() == 2
+            and sampled_token_ids.shape[-1] == 1
+            and sampled_token_ids.numel() <= self.pp_sampled_token_ids_cpu.numel()
+        )
+
+    def _should_use_async_sampled_token_broadcast(
+        self, sampled_token_ids: torch.Tensor | None = None
+    ) -> bool:
+        if not envs.VLLM_PP_ASYNC_SAMPLED_TOKEN_BROADCAST:
+            return False
+        pp = get_pp_group()
+        if pp.world_size <= 1:
+            return False
+        if (
+            envs.VLLM_PP_CPU_SAMPLED_TOKEN_BROADCAST
+            or envs.VLLM_PP_CPU_FIRST_RANK_SAMPLED_TOKEN_P2P
+            or envs.VLLM_PP_FIRST_RANK_ONLY_SAMPLED_TOKEN_P2P
+        ):
+            return False
+        if self.speculative_config is not None or self.num_spec_tokens:
+            return False
+        return (
+            sampled_token_ids is None
+            or (
+                sampled_token_ids.dim() == 2
+                and sampled_token_ids.shape[-1] == 1
+            )
+        )
+
+    def _should_skip_middle_rank_sampled_token_tensor(self) -> bool:
+        if not (
+            envs.VLLM_PP_MIDDLE_RANK_SKIP_SAMPLED_TOKEN
+            or envs.VLLM_PP_CPU_FIRST_RANK_SAMPLED_TOKEN_P2P
+            or envs.VLLM_PP_SAMPLED_TOKEN_PAIR_P2P
+        ):
+            return False
+        pp = get_pp_group()
+        if pp.world_size <= 2 or pp.is_first_rank or pp.is_last_rank:
+            return False
+        if not (
+            envs.VLLM_PP_FIRST_RANK_ONLY_SAMPLED_TOKEN_P2P
+            or envs.VLLM_PP_CPU_FIRST_RANK_SAMPLED_TOKEN_P2P
+            or envs.VLLM_PP_SAMPLED_TOKEN_PAIR_P2P
+        ):
+            return False
+        if (
+            envs.VLLM_PP_CPU_SAMPLED_TOKEN_BROADCAST
+            or envs.VLLM_PP_ASYNC_SAMPLED_TOKEN_BROADCAST
+        ):
+            return False
+        if self.speculative_config is not None or self.num_spec_tokens:
+            return False
+        return True
 
     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
         """Receive sampled token ids broadcast from last PP stage"""
@@ -4452,18 +5143,76 @@ class GPUModelRunner(
         assert not pp.is_last_rank
         num_reqs = self.input_batch.num_reqs
         # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
-        recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
+        if (
+            self.pp_sampled_token_ids_recv is not None
+            and num_reqs <= self.pp_sampled_token_ids_recv.shape[0]
+        ):
+            recv = self.pp_sampled_token_ids_recv[:num_reqs]
+        else:
+            recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
         skip_final_sampled_token = (
             self._should_skip_pp_final_sampled_token_broadcast()
         )
         # skip for chunked prefill.
         if not self._is_all_reqs_chunked_prefill() and not skip_final_sampled_token:
-            torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
+            with _pp_boundary_scope("sampled_token.recv_wait_before_issue"):
+                self._wait_pp_sampled_token_broadcast(recv=True, send=False)
+            if self._should_use_cpu_first_rank_sampled_token_p2p():
+                if pp.is_first_rank:
+                    assert recv is not None
+                    with _pp_boundary_scope(
+                        "sampled_token.cpu_first_rank_p2p_recv"
+                    ):
+                        cpu_tokens = self.pp_sampled_token_ids_cpu[:num_reqs]
+                        torch.distributed.recv(
+                            cpu_tokens, src=pp.last_rank, group=pp.cpu_group
+                        )
+                        recv.copy_(cpu_tokens, non_blocking=True)
+            elif self._should_use_sampled_token_pair_p2p():
+                if pp.is_first_rank:
+                    with _pp_boundary_scope("sampled_token.pair_p2p_recv"):
+                        pair_group = pp.sampled_token_pair_device_group()
+                        assert pair_group is not None
+                        torch.distributed.recv(
+                            recv, src=pp.last_rank, group=pair_group
+                        )
+            elif self._should_use_first_rank_only_sampled_token_p2p():
+                if pp.is_first_rank:
+                    with _pp_boundary_scope("sampled_token.first_rank_p2p_recv"):
+                        torch.distributed.recv(
+                            recv, src=pp.last_rank, group=pp.device_group
+                        )
+            elif (
+                envs.VLLM_PP_CPU_SAMPLED_TOKEN_BROADCAST
+                and self.pp_sampled_token_ids_cpu is not None
+                and num_reqs <= self.pp_sampled_token_ids_cpu.shape[0]
+            ):
+                with _pp_boundary_scope("sampled_token.cpu_broadcast_recv"):
+                    cpu_tokens = self.pp_sampled_token_ids_cpu[:num_reqs]
+                    torch.distributed.broadcast(
+                        cpu_tokens, src=pp.last_rank, group=pp.cpu_group
+                    )
+                    recv.copy_(cpu_tokens, non_blocking=True)
+            elif self._should_use_async_sampled_token_broadcast():
+                with _pp_boundary_scope("sampled_token.async_broadcast_recv_issue"):
+                    self.pp_sampled_token_recv_handle = torch.distributed.broadcast(
+                        recv, src=pp.last_rank, group=pp.device_group, async_op=True
+                    )
+            else:
+                with _pp_boundary_scope(
+                    "sampled_token.device_broadcast_blocking_recv"
+                ):
+                    torch.distributed.broadcast(
+                        recv, src=pp.last_rank, group=pp.device_group
+                    )
         if skip_final_sampled_token:
             self.input_batch.prev_sampled_token_ids = None
             self.input_batch.prev_req_id_to_index = {}
             return
-        self.input_batch.prev_sampled_token_ids = recv
+        if self._should_skip_middle_rank_sampled_token_tensor():
+            self.input_batch.prev_sampled_token_ids = None
+        else:
+            self.input_batch.prev_sampled_token_ids = recv
 
         # construct `prev_req_id_to_index` here so `_prepare_input_ids`
         # can map req_id -> previous batch row
@@ -4987,8 +5736,20 @@ class GPUModelRunner(
             cudagraph_mode.has_full_cudagraphs()
             and not self.parallel_config.use_ubatching
         ):
+            cudagraph_options = None
+            if envs.VLLM_FULL_CUDAGRAPH_STRONG_OUTPUT:
+                cudagraph_options = CUDAGraphOptions(
+                    weak_ref_output=False,
+                    strong_ref_entry_output=True,
+                )
+                logger.info(
+                    "Using strong output references for FULL CUDA graph replay"
+                )
             self.model = CUDAGraphWrapper(
-                self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
+                self.model,
+                self.vllm_config,
+                runtime_mode=CUDAGraphMode.FULL,
+                cudagraph_options=cudagraph_options,
             )
         elif self.parallel_config.use_ubatching:
             if cudagraph_mode.has_full_cudagraphs():

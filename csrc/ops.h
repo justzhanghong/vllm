@@ -116,6 +116,28 @@ void top_k_per_row_decode(const torch::Tensor& logits, int64_t next_n,
                           int64_t numRows, int64_t stride0, int64_t stride1,
                           int64_t topK);
 
+void top_k_per_row_decode_from_hist(const torch::Tensor& logits, int64_t next_n,
+                                    const torch::Tensor& seqLens,
+                                    const torch::Tensor& firstPassHistogram,
+                                    torch::Tensor& indices, int64_t numRows,
+                                    int64_t stride0, int64_t stride1,
+                                    int64_t topK);
+
+void top_k_per_row_decode_from_bins(const torch::Tensor& logits, int64_t next_n,
+                                    const torch::Tensor& seqLens,
+                                    const torch::Tensor& firstPassBins,
+                                    torch::Tensor& indices, int64_t numRows,
+                                    int64_t stride0, int64_t stride1,
+                                    int64_t topK);
+
+void top_k_per_row_decode_from_candidates(
+    const torch::Tensor& logits, int64_t next_n, const torch::Tensor& seqLens,
+    const torch::Tensor& candidateLogits,
+    const torch::Tensor& candidateIndices,
+    const torch::Tensor& candidateCutoffs, torch::Tensor& fallbackFlags,
+    torch::Tensor& indices, int64_t numRows, int64_t stride0, int64_t stride1,
+    int64_t topK);
+
 void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
                      torch::Tensor& output, torch::Tensor& workspace, int64_t k,
                      int64_t max_seq_len);
@@ -161,6 +183,31 @@ void fp8_mqa_logits_cuda_v7_bf16_qk(const torch::Tensor& q_bf16,
                                     const torch::Tensor& cu_seqlen_ks,
                                     const torch::Tensor& cu_seqlen_ke,
                                     torch::Tensor& logits);
+
+void sparse_mla_m1_final_cuda(const torch::Tensor& q_nope,
+                              const torch::Tensor& q_pe,
+                              const torch::Tensor& kv,
+                              const torch::Tensor& indices,
+                              torch::Tensor& scores, torch::Tensor& norm,
+                              torch::Tensor& out, double sm_scale);
+
+void sparse_mla_m1_coop_final_cuda(const torch::Tensor& q_nope,
+                                   const torch::Tensor& q_pe,
+                                   const torch::Tensor& kv,
+                                   const torch::Tensor& indices,
+                                   torch::Tensor& partial_acc,
+                                   torch::Tensor& partial_meta,
+                                   torch::Tensor& out, double sm_scale,
+                                   int64_t num_splits);
+
+void sparse_mla_m1_splitmerge_final_cuda(const torch::Tensor& q_nope,
+                                         const torch::Tensor& q_pe,
+                                         const torch::Tensor& kv,
+                                         const torch::Tensor& indices,
+                                         torch::Tensor& partial_acc,
+                                         torch::Tensor& partial_meta,
+                                         torch::Tensor& out, double sm_scale,
+                                         int64_t num_splits);
 #endif
 
 void rms_norm_static_fp8_quant(torch::Tensor& out, torch::Tensor& input,

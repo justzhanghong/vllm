@@ -50,6 +50,69 @@ elif current_platform.is_xpu():
 logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
+TOPK_HIST_BINS = 2048
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default) == "1"
+
+
+def _env_int(name: str, default: str = "0") -> int:
+    return int(os.getenv(name, default) or default)
+
+
+# Stage TPOT services restart per candidate, so these sparse DSA decode
+# controls are fixed for the process lifetime.
+_DECODE_LOGITS_WORKSPACE = _env_flag(
+    "VLLM_SPARSE_INDEXER_DECODE_LOGITS_WORKSPACE"
+)
+_DECODE_PREDEQUANT_Q = _env_flag(
+    "VLLM_SPARSE_INDEXER_DECODE_PREDEQUANT_Q"
+)
+_DECODE_TRIM_LOGITS = _env_flag("VLLM_SPARSE_INDEXER_DECODE_TRIM_LOGITS")
+_DECODE_LOGITS_BUCKET_SIZE = _env_int(
+    "VLLM_SPARSE_INDEXER_DECODE_LOGITS_BUCKET_SIZE",
+    "8192",
+)
+_DECODE_TRIM_BLOCK_TABLE = _env_flag(
+    "VLLM_SPARSE_INDEXER_DECODE_TRIM_BLOCK_TABLE"
+)
+_DECODE_TOPK_BACKEND = os.getenv(
+    "VLLM_SPARSE_INDEXER_DECODE_TOPK_BACKEND",
+    "persistent",
+)
+_DECODE_TOPK_PAD_LOGITS_LEN = _env_int(
+    "VLLM_SPARSE_INDEXER_DECODE_TOPK_PAD_LOGITS_LEN",
+    "0",
+)
+_DECODE_TOPK_HIST_FUSION = _env_flag(
+    "VLLM_SPARSE_INDEXER_DECODE_TOPK_HIST_FUSION"
+)
+_DECODE_TOPK_BIN_FUSION = _env_flag(
+    "VLLM_SPARSE_INDEXER_DECODE_TOPK_BIN_FUSION"
+)
+_DECODE_TOPK_TILE_SELECT = _env_flag(
+    "VLLM_SPARSE_INDEXER_DECODE_TOPK_TILE_SELECT"
+)
+_DECODE_TOPK_TILE_SELECT_NO_STORE = _env_flag(
+    "VLLM_SPARSE_INDEXER_DECODE_TOPK_TILE_SELECT_NO_STORE"
+)
+_DECODE_TOPK_TILE_SELECT_NO_STORE_CHECK = _env_flag(
+    "VLLM_SPARSE_INDEXER_DECODE_TOPK_TILE_SELECT_NO_STORE_CHECK",
+    "1",
+)
+_DECODE_TOPK_TILE_SELECT_CANDIDATES = _env_int(
+    "VLLM_SPARSE_INDEXER_DECODE_TOPK_TILE_SELECT_CANDIDATES",
+    "16",
+)
+_DECODE_LOGITS_BLOCK_PAGES = _env_int(
+    "VLLM_SPARSE_INDEXER_DECODE_LOGITS_BLOCK_PAGES",
+    "1",
+)
+_SKIP_PREFILL_TOPK_CLEAR = _env_flag(
+    "VLLM_SPARSE_INDEXER_SKIP_PREFILL_TOPK_CLEAR"
+)
+_SKIP_DECODE_TOPK_CLEAR = _env_flag("VLLM_SPARSE_INDEXER_SKIP_DECODE_TOPK_CLEAR")
 
 
 def sparse_attn_indexer(
@@ -80,13 +143,42 @@ def sparse_attn_indexer(
             ((total_seq_lens, 4), torch.uint8),
             ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
         ]
-        use_decode_logits_workspace = (
-            os.getenv("VLLM_SPARSE_INDEXER_DECODE_LOGITS_WORKSPACE", "0")
-            == "1"
-        )
         max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
-        if use_decode_logits_workspace:
+        if _DECODE_LOGITS_WORKSPACE:
             workspace_shapes.append(((max_logits_elems,), torch.uint8))
+        if _DECODE_PREDEQUANT_Q:
+            workspace_shapes.append(
+                (
+                    (q_fp8.shape[1], hidden_states.shape[0], q_fp8.shape[2]),
+                    torch.bfloat16,
+                )
+            )
+        if _DECODE_TOPK_HIST_FUSION:
+            workspace_shapes.append(
+                ((hidden_states.shape[0], TOPK_HIST_BINS), torch.int32)
+            )
+        if _DECODE_TOPK_BIN_FUSION:
+            workspace_shapes.append(
+                ((hidden_states.shape[0], max_model_len), torch.int16)
+            )
+        if _DECODE_TOPK_TILE_SELECT:
+            tile_width = max(1, _DECODE_LOGITS_BLOCK_PAGES) * 64
+            tile_groups = (max_model_len + tile_width - 1) // tile_width
+            tile_candidates = max(1, _DECODE_TOPK_TILE_SELECT_CANDIDATES)
+            workspace_shapes.extend(
+                (
+                    (
+                        (hidden_states.shape[0], tile_groups * tile_candidates),
+                        torch.float32,
+                    ),
+                    (
+                        (hidden_states.shape[0], tile_groups * tile_candidates),
+                        torch.int32,
+                    ),
+                    ((hidden_states.shape[0], tile_groups), torch.float32),
+                    ((hidden_states.shape[0],), torch.int32),
+                )
+            )
         if (
             envs.VLLM_SPARSE_INDEXER_MQA_LOGITS_BACKEND == "cuda_v7"
             and os.getenv("VLLM_MQA_CUDA_V7_PREDEQUANT_K", "0") == "1"
@@ -108,7 +200,7 @@ def sparse_attn_indexer(
 
         # Dummy allocation to simulate for peak logits tensor memory during inference.
         # FP8 elements so elements == bytes
-        if not use_decode_logits_workspace:
+        if not _DECODE_LOGITS_WORKSPACE:
             _ = torch.empty(
                 max_logits_elems, dtype=torch.uint8, device=hidden_states.device
             )
@@ -154,12 +246,12 @@ def sparse_attn_indexer(
     skip_prefill_topk_clear = (
         has_prefill
         and not has_decode
-        and os.getenv("VLLM_SPARSE_INDEXER_SKIP_PREFILL_TOPK_CLEAR", "0") == "1"
+        and _SKIP_PREFILL_TOPK_CLEAR
     )
     skip_decode_topk_clear = (
         has_decode
         and not has_prefill
-        and os.getenv("VLLM_SPARSE_INDEXER_SKIP_DECODE_TOPK_CLEAR", "0") == "1"
+        and _SKIP_DECODE_TOPK_CLEAR
     )
     if not (skip_prefill_topk_clear or skip_decode_topk_clear):
         topk_indices_buffer[: hidden_states.shape[0]] = -1
@@ -602,13 +694,8 @@ def sparse_attn_indexer(
         # fp8_paged_mqa_logits and all topk kernels accept both shapes.
         decode_block_table = decode_metadata.block_table
         decode_logits_len = max_model_len
-        if os.getenv("VLLM_SPARSE_INDEXER_DECODE_TRIM_LOGITS", "0") == "1":
-            bucket_size = int(
-                os.getenv(
-                    "VLLM_SPARSE_INDEXER_DECODE_LOGITS_BUCKET_SIZE", "8192"
-                )
-                or "0"
-            )
+        if _DECODE_TRIM_LOGITS:
+            bucket_size = _DECODE_LOGITS_BUCKET_SIZE
             active_len = max(int(attn_metadata_narrowed.max_seq_len), topk_tokens)
             if bucket_size > 0:
                 active_len = (
@@ -619,7 +706,7 @@ def sparse_attn_indexer(
             max_blocks = (decode_logits_len + block_size - 1) // block_size
             decode_block_table = decode_block_table[:, :max_blocks]
         if (
-            os.getenv("VLLM_SPARSE_INDEXER_DECODE_TRIM_BLOCK_TABLE", "0") == "1"
+            _DECODE_TRIM_BLOCK_TABLE
             and attn_metadata_narrowed.max_seq_len < max_model_len
         ):
             block_size = int(kv_cache.shape[1])
@@ -628,14 +715,9 @@ def sparse_attn_indexer(
             ) // block_size
             decode_block_table = decode_block_table[:, :max_blocks]
         topk_workspace: torch.Tensor | None = None
-        decode_topk_backend = os.getenv(
-            "VLLM_SPARSE_INDEXER_DECODE_TOPK_BACKEND", "persistent"
-        )
+        decode_topk_backend = _DECODE_TOPK_BACKEND
         decode_topk_logits_len = decode_logits_len
-        topk_pad_logits_len = int(
-            os.getenv("VLLM_SPARSE_INDEXER_DECODE_TOPK_PAD_LOGITS_LEN", "0")
-            or "0"
-        )
+        topk_pad_logits_len = _DECODE_TOPK_PAD_LOGITS_LEN
         if (
             current_platform.is_cuda()
             and decode_topk_backend == "legacy"
@@ -645,6 +727,61 @@ def sparse_attn_indexer(
             # branch. MQA logits still computes decode_logits_len columns, and
             # topK only scans rowEnd <= seq_len <= decode_logits_len.
             decode_topk_logits_len = min(max_model_len, topk_pad_logits_len)
+        use_topk_hist_fusion = (
+            current_platform.is_cuda()
+            and _DECODE_TOPK_HIST_FUSION
+            and decode_topk_backend == "legacy"
+            and topk_tokens == TOPK_HIST_BINS
+            and next_n == 1
+            and seq_lens.dim() == 1
+            and not decode_metadata.requires_padding
+            and decode_topk_logits_len == decode_logits_len
+        )
+        use_topk_bin_fusion = (
+            current_platform.is_cuda()
+            and _DECODE_TOPK_BIN_FUSION
+            and not use_topk_hist_fusion
+            and decode_topk_backend == "legacy"
+            and topk_tokens == TOPK_HIST_BINS
+            and next_n == 1
+            and seq_lens.dim() == 1
+            and not decode_metadata.requires_padding
+            and decode_topk_logits_len == decode_logits_len
+        )
+        tile_select_candidates = max(1, _DECODE_TOPK_TILE_SELECT_CANDIDATES)
+        tile_select_block_pages = max(1, _DECODE_LOGITS_BLOCK_PAGES)
+        tile_select_block_size = int(kv_cache.shape[1])
+        tile_select_groups = (
+            decode_block_table.shape[1] + tile_select_block_pages - 1
+        ) // tile_select_block_pages
+        use_topk_tile_select = (
+            current_platform.is_cuda()
+            and _DECODE_TOPK_TILE_SELECT
+            and not use_topk_hist_fusion
+            and not use_topk_bin_fusion
+            and decode_topk_backend == "legacy"
+            and topk_tokens == TOPK_HIST_BINS
+            and next_n == 1
+            and seq_lens.dim() == 1
+            and not decode_metadata.requires_padding
+            and decode_topk_logits_len == decode_logits_len
+            and tile_select_groups * tile_select_candidates >= topk_tokens
+            and tile_select_block_size > 0
+        )
+        use_topk_tile_select_no_store = (
+            use_topk_tile_select and _DECODE_TOPK_TILE_SELECT_NO_STORE
+        )
+        if use_topk_tile_select_no_store:
+            logger.info_once(
+                "Sparse indexer decode TopK tile-select no-store is enabled; "
+                "fallback-free candidate proof is required before deployment."
+            )
+        topk_histogram: torch.Tensor | None = None
+        topk_bins: torch.Tensor | None = None
+        topk_tile_candidate_logits: torch.Tensor | None = None
+        topk_tile_candidate_indices: torch.Tensor | None = None
+        topk_tile_candidate_cutoffs: torch.Tensor | None = None
+        topk_tile_fallback_flags: torch.Tensor | None = None
         if is_deep_gemm_supported():
             logits = fp8_paged_mqa_logits(
                 padded_q_fp8_decode_tokens,
@@ -658,28 +795,107 @@ def sparse_attn_indexer(
             )
         else:
             logits_out: torch.Tensor | None = None
-            if (
-                current_platform.is_cuda()
-                and os.getenv(
-                    "VLLM_SPARSE_INDEXER_DECODE_LOGITS_WORKSPACE", "0"
-                )
-                == "1"
-            ):
+            q_bf16_decode: torch.Tensor | None = None
+            if current_platform.is_cuda():
                 workspace_manager = current_workspace_manager()
-                if decode_topk_backend == "legacy":
-                    (logits_out,) = workspace_manager.get_simultaneous(
+                workspace_shapes: list[tuple[tuple[int, ...], torch.dtype]] = []
+                if _DECODE_PREDEQUANT_Q:
+                    workspace_shapes.append(
                         (
-                            (num_padded_tokens, decode_topk_logits_len),
-                            torch.float32,
-                        ),
-                    )
-                else:
-                    logits_out, topk_workspace = (
-                        workspace_manager.get_simultaneous(
-                            ((num_padded_tokens, decode_logits_len), torch.float32),
-                            ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+                            (
+                                padded_q_fp8_decode_tokens.shape[2],
+                                num_padded_tokens,
+                                padded_q_fp8_decode_tokens.shape[3],
+                            ),
+                            torch.bfloat16,
                         )
                     )
+                if use_topk_hist_fusion:
+                    workspace_shapes.append(
+                        ((num_padded_tokens, TOPK_HIST_BINS), torch.int32)
+                    )
+                if use_topk_bin_fusion:
+                    workspace_shapes.append(
+                        ((num_padded_tokens, decode_logits_len), torch.int16)
+                    )
+                if use_topk_tile_select:
+                    workspace_shapes.extend(
+                        (
+                            (
+                                (
+                                    num_padded_tokens,
+                                    tile_select_groups * tile_select_candidates,
+                                ),
+                                torch.float32,
+                            ),
+                            (
+                                (
+                                    num_padded_tokens,
+                                    tile_select_groups * tile_select_candidates,
+                                ),
+                                torch.int32,
+                            ),
+                            (
+                                (num_padded_tokens, tile_select_groups),
+                                torch.float32,
+                            ),
+                            ((num_padded_tokens,), torch.int32),
+                        )
+                    )
+                if _DECODE_LOGITS_WORKSPACE:
+                    if decode_topk_backend == "legacy":
+                        workspace_shapes.append(
+                            (
+                                (num_padded_tokens, decode_topk_logits_len),
+                                torch.float32,
+                            )
+                        )
+                    else:
+                        workspace_shapes.extend(
+                            (
+                                (
+                                    (num_padded_tokens, decode_logits_len),
+                                    torch.float32,
+                                ),
+                                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+                            )
+                        )
+                if workspace_shapes:
+                    workspace_buffers = workspace_manager.get_simultaneous(
+                        *workspace_shapes
+                    )
+                    buffer_idx = 0
+                    if _DECODE_PREDEQUANT_Q:
+                        q_bf16_decode = workspace_buffers[buffer_idx]
+                        buffer_idx += 1
+                        q_decode_flat = padded_q_fp8_decode_tokens.reshape(
+                            num_padded_tokens,
+                            padded_q_fp8_decode_tokens.shape[2],
+                            padded_q_fp8_decode_tokens.shape[3],
+                        )
+                        fp8_mqa_dequant_q_cuda(q_decode_flat, q_bf16_decode)
+                    if use_topk_hist_fusion:
+                        topk_histogram = workspace_buffers[buffer_idx]
+                        buffer_idx += 1
+                        topk_histogram.zero_()
+                    if use_topk_bin_fusion:
+                        topk_bins = workspace_buffers[buffer_idx]
+                        buffer_idx += 1
+                    if use_topk_tile_select:
+                        topk_tile_candidate_logits = workspace_buffers[buffer_idx]
+                        buffer_idx += 1
+                        topk_tile_candidate_indices = workspace_buffers[buffer_idx]
+                        buffer_idx += 1
+                        topk_tile_candidate_cutoffs = workspace_buffers[buffer_idx]
+                        buffer_idx += 1
+                        topk_tile_fallback_flags = workspace_buffers[buffer_idx]
+                        buffer_idx += 1
+                    if _DECODE_LOGITS_WORKSPACE:
+                        if decode_topk_backend == "legacy":
+                            logits_out = workspace_buffers[buffer_idx]
+                        else:
+                            logits_out = workspace_buffers[buffer_idx]
+                            topk_workspace = workspace_buffers[buffer_idx + 1]
             logits = fp8_paged_mqa_logits_triton(
                 padded_q_fp8_decode_tokens,
                 kv_cache,
@@ -688,6 +904,13 @@ def sparse_attn_indexer(
                 decode_block_table,
                 max_model_len=decode_logits_len,
                 logits_out=logits_out,
+                q_bf16=q_bf16_decode,
+                topk_histogram=topk_histogram,
+                topk_bins=topk_bins,
+                topk_tile_candidate_logits=topk_tile_candidate_logits,
+                topk_tile_candidate_indices=topk_tile_candidate_indices,
+                topk_tile_candidate_cutoffs=topk_tile_candidate_cutoffs,
+                store_logits=not use_topk_tile_select_no_store,
             )
             if (
                 logits_out is not None
@@ -712,16 +935,72 @@ def sparse_attn_indexer(
                 attn_metadata_narrowed.max_seq_len,
             )
         elif current_platform.is_cuda():
-            torch.ops._C.top_k_per_row_decode(
-                logits,
-                next_n,
-                seq_lens,
-                topk_indices,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-                topk_tokens,
-            )
+            if (
+                use_topk_tile_select
+                and topk_tile_candidate_logits is not None
+                and topk_tile_candidate_indices is not None
+                and topk_tile_candidate_cutoffs is not None
+                and topk_tile_fallback_flags is not None
+            ):
+                torch.ops._C.top_k_per_row_decode_from_candidates(
+                    logits,
+                    next_n,
+                    seq_lens,
+                    topk_tile_candidate_logits,
+                    topk_tile_candidate_indices,
+                    topk_tile_candidate_cutoffs,
+                    topk_tile_fallback_flags,
+                    topk_indices,
+                    num_rows,
+                    logits.stride(0),
+                    logits.stride(1),
+                    topk_tokens,
+                )
+                if (
+                    use_topk_tile_select_no_store
+                    and _DECODE_TOPK_TILE_SELECT_NO_STORE_CHECK
+                    and int(topk_tile_fallback_flags.sum().item()) != 0
+                ):
+                    raise RuntimeError(
+                        "Decode TopK tile-select no-store fallback was "
+                        "required. Full logits were not stored, so this "
+                        "candidate must be rejected before service use."
+                    )
+            elif use_topk_hist_fusion and topk_histogram is not None:
+                torch.ops._C.top_k_per_row_decode_from_hist(
+                    logits,
+                    next_n,
+                    seq_lens,
+                    topk_histogram,
+                    topk_indices,
+                    num_rows,
+                    logits.stride(0),
+                    logits.stride(1),
+                    topk_tokens,
+                )
+            elif use_topk_bin_fusion and topk_bins is not None:
+                torch.ops._C.top_k_per_row_decode_from_bins(
+                    logits,
+                    next_n,
+                    seq_lens,
+                    topk_bins,
+                    topk_indices,
+                    num_rows,
+                    logits.stride(0),
+                    logits.stride(1),
+                    topk_tokens,
+                )
+            else:
+                torch.ops._C.top_k_per_row_decode(
+                    logits,
+                    next_n,
+                    seq_lens,
+                    topk_indices,
+                    num_rows,
+                    logits.stride(0),
+                    logits.stride(1),
+                    topk_tokens,
+                )
         else:
             if current_platform.is_xpu():
                 xpu_ops.top_k_per_row_decode(  # type: ignore[attr-defined]

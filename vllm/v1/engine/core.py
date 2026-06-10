@@ -465,6 +465,29 @@ class EngineCore:
         # Note that this is not blocking.
         assert len(batch_queue) < self.batch_queue_size
 
+        if envs.VLLM_STAGE50_PP_READY_FIRST_DRAIN and batch_queue:
+            oldest_future = batch_queue[-1][0]
+            try_drain_ready = getattr(oldest_future, "try_drain_ready", None)
+            if try_drain_ready is not None and try_drain_ready():
+                future, scheduler_output, exec_model_fut = batch_queue.pop()
+                with (
+                    self.log_error_detail(scheduler_output),
+                    self.log_iteration_details(scheduler_output),
+                ):
+                    model_output = future.result()
+                    if model_output is None:
+                        exec_model_fut.result()
+                        raise RuntimeError("unexpected error")
+
+                self._process_aborts_queue()
+                engine_core_outputs = self.scheduler.update_from_output(
+                    scheduler_output, model_output
+                )
+                return (
+                    engine_core_outputs,
+                    scheduler_output.total_num_scheduled_tokens > 0,
+                )
+
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():

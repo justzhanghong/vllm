@@ -48,6 +48,16 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_SAMPLER: bool | None = None
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_PP_SKIP_FINAL_MAX_TOKENS_BROADCAST: bool = False
+    VLLM_PP_CPU_SAMPLED_TOKEN_BROADCAST: bool = False
+    VLLM_PP_CPU_FIRST_RANK_SAMPLED_TOKEN_P2P: bool = False
+    VLLM_PP_SAMPLED_TOKEN_RECV_BUFFER: bool = False
+    VLLM_PP_SAMPLED_TOKEN_PAIR_P2P: bool = False
+    VLLM_PP_FIRST_RANK_ONLY_SAMPLED_TOKEN_P2P: bool = False
+    VLLM_PP_ASYNC_SAMPLED_TOKEN_BROADCAST: bool = False
+    VLLM_PP_EARLY_SAMPLED_TOKEN_BROADCAST: bool = False
+    VLLM_PP_INLINE_SAMPLE_BROADCAST: bool = False
+    VLLM_PP_MIDDLE_RANK_SKIP_SAMPLED_TOKEN: bool = False
+    VLLM_PP_BROADCAST_SAMPLED_TOKEN_ONLY: bool = False
     VLLM_PP_DIRECT_RECV_INTERMEDIATE: bool = False
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
@@ -62,6 +72,8 @@ if TYPE_CHECKING:
     VLLM_SPARSE_INDEXER_MQA_LOGITS_BACKEND: Literal[
         "auto", "cuda", "cuda_v5", "cuda_v7", "triton"
     ] = "auto"
+    VLLM_SPARSE_MLA_FORCE_PREFIX_MASK_DECODE: bool = False
+    VLLM_SPARSE_MLA_FORCE_PREFIX_MASK_DECODE_MAX_TOKENS: int = 4
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
@@ -87,6 +99,20 @@ if TYPE_CHECKING:
     VLLM_MAIN_CUDA_VERSION: str = "13.0"
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
+    VLLM_PP_BATCH_P2P_TENSOR_DICT: bool = False
+    VLLM_PP_TENSOR_DICT_METADATA_CACHE: bool = False
+    VLLM_PP_DECODE_TENSOR_DICT_METADATA_SKIP: bool = False
+    VLLM_PP_DISABLE_INTERMEDIATE_ALLGATHER: bool = False
+    VLLM_PP_DEFER_INTERMEDIATE_RECV: bool = False
+    VLLM_PP_DEFER_SEND_WAIT: bool = False
+    VLLM_PP_CLONE_CUDAGRAPH_OUTPUT_BEFORE_SEND: bool = False
+    VLLM_PP_COPY_CUDAGRAPH_OUTPUT_BEFORE_SEND: bool = False
+    VLLM_FULL_CUDAGRAPH_STRONG_OUTPUT: bool = False
+    VLLM_PP_MAX_CONCURRENT_BATCHES: int = 0
+    VLLM_PP_BOUNDARY_PROFILING: bool = False
+    VLLM_STAGE50_DECODE_PREP_FASTPATH: bool = False
+    VLLM_STAGE50_PP3_GREEDY_LOCAL_ARGMAX: bool = False
+    VLLM_STAGE50_PP_READY_FIRST_DRAIN: bool = False
     VLLM_FP8_MOE_DEQUANT_BF16: bool = False
     VLLM_FP8_SHARED_EXPERTS_DEQUANT_BF16: bool = False
     VLLM_FP8_MLP_LINEAR_DEQUANT_BF16: bool = False
@@ -530,6 +556,84 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+    # Batch CUDA tensor P2P operations in pipeline-parallel tensor-dict
+    # send/recv. This keeps metadata transfer and tensor values unchanged while
+    # allowing NCCL to initialize/use peer communicators as a grouped P2P call.
+    "VLLM_PP_BATCH_P2P_TENSOR_DICT": lambda: bool(
+        int(os.getenv("VLLM_PP_BATCH_P2P_TENSOR_DICT") or "0")
+    ),
+    # Cache pipeline-parallel tensor-dict metadata between adjacent PP ranks.
+    # Tensor payloads are still sent every call; full metadata is resent whenever
+    # keys, shapes, dtypes, devices, or non-tensor values change.
+    "VLLM_PP_TENSOR_DICT_METADATA_CACHE": lambda: bool(
+        int(os.getenv("VLLM_PP_TENSOR_DICT_METADATA_CACHE") or "0")
+    ),
+    # Skip the per-token CPU metadata object on PP decode tensor-dict
+    # send/recv when the same peer metadata has already been observed.
+    "VLLM_PP_DECODE_TENSOR_DICT_METADATA_SKIP": lambda: bool(
+        int(os.getenv("VLLM_PP_DECODE_TENSOR_DICT_METADATA_SKIP") or "0")
+    ),
+    # Disable tensor-dict all-gather optimization on PP intermediate activation
+    # send/recv. This preserves tensor values but trades more PP payload for
+    # fewer TP all-gather launches/synchronization points.
+    "VLLM_PP_DISABLE_INTERMEDIATE_ALLGATHER": lambda: bool(
+        int(os.getenv("VLLM_PP_DISABLE_INTERMEDIATE_ALLGATHER") or "0")
+    ),
+    # Defer receiving pipeline-parallel intermediate tensors until the model
+    # runner has completed local input/attention metadata preparation.
+    "VLLM_PP_DEFER_INTERMEDIATE_RECV": lambda: bool(
+        int(os.getenv("VLLM_PP_DEFER_INTERMEDIATE_RECV") or "0")
+    ),
+    # Defer waiting for the previous pipeline-parallel non-blocking tensor-dict
+    # send until the next send boundary. Disabled by default.
+    "VLLM_PP_DEFER_SEND_WAIT": lambda: bool(
+        int(os.getenv("VLLM_PP_DEFER_SEND_WAIT") or "0")
+    ),
+    # Clone CUDA tensors produced by full decode CUDA graph replay before PP
+    # tensor-dict send. This is a Stage50 stability probe and is disabled by
+    # default.
+    "VLLM_PP_CLONE_CUDAGRAPH_OUTPUT_BEFORE_SEND": lambda: bool(
+        int(os.getenv("VLLM_PP_CLONE_CUDAGRAPH_OUTPUT_BEFORE_SEND") or "0")
+    ),
+    # Copy CUDA tensors produced by full decode CUDA graph replay into stable
+    # worker-owned PP send buffers before tensor-dict send. This is a Stage50
+    # stability probe and is disabled by default.
+    "VLLM_PP_COPY_CUDAGRAPH_OUTPUT_BEFORE_SEND": lambda: bool(
+        int(os.getenv("VLLM_PP_COPY_CUDAGRAPH_OUTPUT_BEFORE_SEND") or "0")
+    ),
+    # Keep strong references to FULL CUDA graph outputs across replay. This is
+    # a Stage50 stability probe for outputs crossing PP/sampling boundaries.
+    "VLLM_FULL_CUDAGRAPH_STRONG_OUTPUT": lambda: bool(
+        int(os.getenv("VLLM_FULL_CUDAGRAPH_STRONG_OUTPUT") or "0")
+    ),
+    # Override PP async batch queue depth. 0 preserves the executor default,
+    # which uses pp_size concurrent batches for pipeline parallelism.
+    "VLLM_PP_MAX_CONCURRENT_BATCHES": lambda: int(
+        os.getenv("VLLM_PP_MAX_CONCURRENT_BATCHES") or "0"
+    ),
+    # Add NVTX ranges around pipeline-parallel tensor-dict boundaries for nsys
+    # bottleneck analysis. Disabled by default to avoid overhead in speed runs.
+    "VLLM_PP_BOUNDARY_PROFILING": lambda: bool(
+        int(os.getenv("VLLM_PP_BOUNDARY_PROFILING") or "0")
+    ),
+    # Stage50 scheduler/preprocess probe. In a guarded c1 steady decode batch,
+    # skip invariant CPU token-gather work and commit the PP block table only
+    # when its active rows changed. Disabled by default.
+    "VLLM_STAGE50_DECODE_PREP_FASTPATH": lambda: bool(
+        int(os.getenv("VLLM_STAGE50_DECODE_PREP_FASTPATH", "0"))
+    ),
+    # Stage50 PP3 greedy decode probe. On the final PP rank, compute greedy
+    # tokens with vocab-parallel local argmax reduction instead of materializing
+    # full logits and running the generic sampler. Disabled by default.
+    "VLLM_STAGE50_PP3_GREEDY_LOCAL_ARGMAX": lambda: bool(
+        int(os.getenv("VLLM_STAGE50_PP3_GREEDY_LOCAL_ARGMAX", "0"))
+    ),
+    # Stage50 PP batch queue scheduler probe. When the oldest queued response can
+    # be drained without blocking, update the scheduler before filling another
+    # batch. Disabled by default.
+    "VLLM_STAGE50_PP_READY_FIRST_DRAIN": lambda: bool(
+        int(os.getenv("VLLM_STAGE50_PP_READY_FIRST_DRAIN", "0"))
+    ),
     # GLM FP8 v2 experiment: dequantize block-FP8 MoE weights to BF16 after
     # loading and run the unquantized MoE kernel. Disabled by default.
     "VLLM_FP8_MOE_DEQUANT_BF16": lambda: bool(
@@ -757,6 +861,60 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PP_SKIP_FINAL_MAX_TOKENS_BROADCAST": lambda: bool(
         int(os.getenv("VLLM_PP_SKIP_FINAL_MAX_TOKENS_BROADCAST", "0"))
     ),
+    # Route PP async sampled-token broadcast for tiny [num_reqs, 1] tensors
+    # through the CPU/Gloo PP group instead of the device/NCCL PP group.
+    "VLLM_PP_CPU_SAMPLED_TOKEN_BROADCAST": lambda: bool(
+        int(os.getenv("VLLM_PP_CPU_SAMPLED_TOKEN_BROADCAST", "0"))
+    ),
+    # Route PP sampled-token transfer for tiny [num_reqs, 1] tensors through
+    # CPU/Gloo point-to-point from the last PP rank to the first PP rank only.
+    "VLLM_PP_CPU_FIRST_RANK_SAMPLED_TOKEN_P2P": lambda: bool(
+        int(os.getenv("VLLM_PP_CPU_FIRST_RANK_SAMPLED_TOKEN_P2P", "0"))
+    ),
+    # Reuse a preallocated GPU buffer for PP async sampled-token receive.
+    "VLLM_PP_SAMPLED_TOKEN_RECV_BUFFER": lambda: bool(
+        int(os.getenv("VLLM_PP_SAMPLED_TOKEN_RECV_BUFFER", "0"))
+    ),
+    # Send PP sampled tokens through a dedicated two-rank NCCL process group
+    # between the last PP rank and the first PP rank only.
+    "VLLM_PP_SAMPLED_TOKEN_PAIR_P2P": lambda: bool(
+        int(os.getenv("VLLM_PP_SAMPLED_TOKEN_PAIR_P2P", "0"))
+    ),
+    # Send PP async sampled tokens only from the last PP rank to the first PP
+    # rank. Middle PP ranks keep local placeholder tokens because only the
+    # first stage consumes token ids for text embedding in this path.
+    "VLLM_PP_FIRST_RANK_ONLY_SAMPLED_TOKEN_P2P": lambda: bool(
+        int(os.getenv("VLLM_PP_FIRST_RANK_ONLY_SAMPLED_TOKEN_P2P", "0"))
+    ),
+    # Launch PP GPU sampled-token broadcast asynchronously and defer receiver
+    # wait until input ids consume the received token tensor.
+    "VLLM_PP_ASYNC_SAMPLED_TOKEN_BROADCAST": lambda: bool(
+        int(os.getenv("VLLM_PP_ASYNC_SAMPLED_TOKEN_BROADCAST", "0"))
+    ),
+    # On the last PP rank, start the sampled-token broadcast before local
+    # bookkeeping/state update so receiver ranks do not wait on that host work.
+    "VLLM_PP_EARLY_SAMPLED_TOKEN_BROADCAST": lambda: bool(
+        int(os.getenv("VLLM_PP_EARLY_SAMPLED_TOKEN_BROADCAST", "0"))
+    ),
+    # On the last PP rank, perform sampling in execute_model() and immediately
+    # broadcast the sampled token before returning to the async scheduler.
+    # Guarded to plain PP decode paths without structured-output grammar.
+    "VLLM_PP_INLINE_SAMPLE_BROADCAST": lambda: bool(
+        int(os.getenv("VLLM_PP_INLINE_SAMPLE_BROADCAST", "0"))
+    ),
+    # With first-rank-only sampled-token P2P, middle PP ranks do not need the
+    # sampled token tensor for text embedding. Keep PP bookkeeping but skip the
+    # dummy token tensor and GPU input-id copy on those middle ranks.
+    "VLLM_PP_MIDDLE_RANK_SKIP_SAMPLED_TOKEN": lambda: bool(
+        int(os.getenv("VLLM_PP_MIDDLE_RANK_SKIP_SAMPLED_TOKEN", "0"))
+    ),
+    # In external-launcher PP output broadcast mode, sample on the last PP
+    # stage and broadcast only the tiny sampled-token tensor instead of full
+    # logits. This is guarded to plain greedy/no-logprobs generation in the
+    # model runner.
+    "VLLM_PP_BROADCAST_SAMPLED_TOKEN_ONLY": lambda: bool(
+        int(os.getenv("VLLM_PP_BROADCAST_SAMPLED_TOKEN_ONLY", "0"))
+    ),
     # In eager PP runs, use received intermediate tensors directly instead of
     # copying them into a persistent model-runner buffer.
     "VLLM_PP_DIRECT_RECV_INTERMEDIATE": lambda: bool(
@@ -944,6 +1102,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_SPARSE_INDEXER_MQA_LOGITS_BACKEND",
         "auto",
         ["auto", "cuda", "cuda_v5", "cuda_v7", "triton"],
+    ),
+    # Stage TPOT experiment: force small decode sparse MLA dispatch to the
+    # prefix-length mask path instead of the full-topk assume-valid path.
+    "VLLM_SPARSE_MLA_FORCE_PREFIX_MASK_DECODE": lambda: bool(
+        int(os.getenv("VLLM_SPARSE_MLA_FORCE_PREFIX_MASK_DECODE", "0"))
+    ),
+    "VLLM_SPARSE_MLA_FORCE_PREFIX_MASK_DECODE_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_SPARSE_MLA_FORCE_PREFIX_MASK_DECODE_MAX_TOKENS", "4")
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests

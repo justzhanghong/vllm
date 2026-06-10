@@ -71,10 +71,12 @@ class FutureWrapper(Future):
         self,
         futures_queue: deque["FutureWrapper"],
         get_response: Callable[[], Any],
+        response_ready: Callable[[], bool],
         aggregate: Callable = lambda x: x,
     ):
         self.futures_queue = futures_queue
         self.get_response = get_response
+        self.response_ready = response_ready
         self.aggregate = aggregate
         super().__init__()
         self.futures_queue.appendleft(self)
@@ -86,8 +88,21 @@ class FutureWrapper(Future):
         # Drain any futures ahead of us in the queue.
         while not self.done():
             future = self.futures_queue.pop()
-            future._wait_for_response()
+            if not future.done():
+                future._wait_for_response()
         return super().result()
+
+    def try_drain_ready(self) -> bool:
+        while not self.done() and self.futures_queue:
+            future = self.futures_queue[-1]
+            if future.done():
+                self.futures_queue.pop()
+                continue
+            if not future.response_ready():
+                break
+            self.futures_queue.pop()
+            future._wait_for_response()
+        return self.done()
 
     def _wait_for_response(self):
         try:
@@ -394,9 +409,13 @@ class MultiprocExecutor(Executor):
                 responses.append(result)
             return responses[0] if output_rank is not None else responses
 
+        def response_ready():
+            return all(mq.can_dequeue() for mq in response_mqs)
+
         future = FutureWrapper(
             self.futures_queue,
             get_response=get_response,
+            response_ready=response_ready,
             aggregate=aggregate,
         )
 
@@ -475,7 +494,12 @@ class MultiprocExecutor(Executor):
     def max_concurrent_batches(self) -> int:
         # PP requires PP-size concurrent batches to fill the pipeline.
         pp_size = self.parallel_config.pipeline_parallel_size
-        return 2 if pp_size <= 1 and self.scheduler_config.async_scheduling else pp_size
+        if pp_size > 1 and envs.VLLM_PP_MAX_CONCURRENT_BATCHES > 0:
+            return envs.VLLM_PP_MAX_CONCURRENT_BATCHES
+        return (
+            2 if pp_size <= 1 and self.scheduler_config.async_scheduling
+            else pp_size
+        )
 
     def _get_output_rank(self) -> int:
         # Only returns ModelRunnerOutput from TP rank=0 and PP rank=-1

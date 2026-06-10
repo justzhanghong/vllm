@@ -198,6 +198,28 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("top_k_per_row_decode", torch::kCUDA, &top_k_per_row_decode);
 
   ops.def(
+      "top_k_per_row_decode_from_hist(Tensor logits, int next_n, "
+      "Tensor seq_lens, Tensor first_pass_histogram, Tensor! indices, "
+      "int numRows, int stride0, int stride1, int topK) -> ()");
+  ops.impl("top_k_per_row_decode_from_hist", torch::kCUDA,
+           &top_k_per_row_decode_from_hist);
+
+  ops.def(
+      "top_k_per_row_decode_from_bins(Tensor logits, int next_n, "
+      "Tensor seq_lens, Tensor first_pass_bins, Tensor! indices, "
+      "int numRows, int stride0, int stride1, int topK) -> ()");
+  ops.impl("top_k_per_row_decode_from_bins", torch::kCUDA,
+           &top_k_per_row_decode_from_bins);
+
+  ops.def(
+      "top_k_per_row_decode_from_candidates(Tensor logits, int next_n, "
+      "Tensor seq_lens, Tensor candidate_logits, Tensor candidate_indices, "
+      "Tensor candidate_cutoffs, Tensor! fallback_flags, Tensor! indices, "
+      "int numRows, int stride0, int stride1, int topK) -> ()");
+  ops.impl("top_k_per_row_decode_from_candidates", torch::kCUDA,
+           &top_k_per_row_decode_from_candidates);
+
+  ops.def(
       "persistent_topk(Tensor logits, Tensor lengths, Tensor! output, "
       "Tensor workspace, int k, int max_seq_len) -> ()");
   ops.impl("persistent_topk", torch::kCUDA, &persistent_topk);
@@ -242,6 +264,27 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor! logits) -> ()");
   ops.impl("fp8_mqa_logits_cuda_v7_bf16_qk", torch::kCUDA,
            &fp8_mqa_logits_cuda_v7_bf16_qk);
+
+  ops.def(
+      "sparse_mla_m1_final_cuda(Tensor q_nope, Tensor q_pe, Tensor kv, "
+      "Tensor indices, Tensor! scores, Tensor! norm, Tensor! out, "
+      "float sm_scale) -> ()");
+  ops.impl("sparse_mla_m1_final_cuda", torch::kCUDA,
+           &sparse_mla_m1_final_cuda);
+
+  ops.def(
+      "sparse_mla_m1_coop_final_cuda(Tensor q_nope, Tensor q_pe, Tensor kv, "
+      "Tensor indices, Tensor! partial_acc, Tensor! partial_meta, Tensor! out, "
+      "float sm_scale, int num_splits) -> ()");
+  ops.impl("sparse_mla_m1_coop_final_cuda", torch::kCUDA,
+           &sparse_mla_m1_coop_final_cuda);
+
+  ops.def(
+      "sparse_mla_m1_splitmerge_final_cuda(Tensor q_nope, Tensor q_pe, "
+      "Tensor kv, Tensor indices, Tensor! partial_acc, Tensor! partial_meta, "
+      "Tensor! out, float sm_scale, int num_splits) -> ()");
+  ops.impl("sparse_mla_m1_splitmerge_final_cuda", torch::kCUDA,
+           &sparse_mla_m1_splitmerge_final_cuda);
 #endif
 
   // Layernorm-quant
