@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ast
+import os
+import time
 from importlib.util import find_spec
 from typing import Any, cast
 
@@ -421,6 +423,56 @@ class SpecDecodeBaseProposer:
         | None = None,
     ) -> torch.Tensor:
         batch_size = common_attn_metadata.batch_size()
+        mtp_propose_debug = (
+            self.method == "mtp"
+            and os.environ.get("VLLM_MTP_SAMPLE_TIMING_LOGS", "0") == "1"
+        )
+
+        def _tensor_shape(value: Any) -> tuple[int, ...] | None:
+            return tuple(value.shape) if torch.is_tensor(value) else None
+
+        def log_mtp_proposer_event(
+            phase: str,
+            start: float | None = None,
+            **extra: Any,
+        ) -> None:
+            if not mtp_propose_debug:
+                return
+            pp = get_pp_group()
+            elapsed_ms = None
+            if start is not None:
+                elapsed_ms = (time.perf_counter() - start) * 1000.0
+            logger.warning(
+                "MTP proposer event: phase=%s pp_rank=%s pp_world=%s "
+                "is_last=%s elapsed_ms=%s batch_size=%s max_seq_len=%s "
+                "num_actual_tokens=%s max_query_len=%s target_token_shape=%s "
+                "target_position_shape=%s target_hidden_shape=%s "
+                "next_token_shape=%s token_indices_shape=%s extra=%s",
+                phase,
+                pp.rank,
+                pp.world_size,
+                pp.is_last_rank,
+                None if elapsed_ms is None else round(elapsed_ms, 3),
+                batch_size,
+                common_attn_metadata.max_seq_len,
+                common_attn_metadata.num_actual_tokens,
+                common_attn_metadata.max_query_len,
+                _tensor_shape(target_token_ids),
+                _tensor_shape(target_positions),
+                _tensor_shape(target_hidden_states),
+                _tensor_shape(next_token_ids),
+                _tensor_shape(token_indices_to_sample),
+                extra,
+            )
+
+        log_mtp_proposer_event(
+            "enter",
+            max_model_len=self.max_model_len,
+            max_num_tokens=self.max_num_tokens,
+            num_speculative_tokens=self.num_speculative_tokens,
+            needs_extra_input_slots=self.needs_extra_input_slots,
+            parallel_drafting=self.parallel_drafting,
+        )
 
         if self.method in ("eagle3", "dflash"):
             assert isinstance(
@@ -435,7 +487,9 @@ class SpecDecodeBaseProposer:
                 target_hidden_states
             )
             assert target_hidden_states.shape[-1] == self.hidden_size
+            log_mtp_proposer_event("combine_hidden_states_done")
 
+        phase_start = time.perf_counter()
         num_tokens, token_indices_to_sample, common_attn_metadata = (
             self.set_inputs_first_pass(
                 target_token_ids=target_token_ids,
@@ -447,19 +501,58 @@ class SpecDecodeBaseProposer:
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             )
         )
+        log_mtp_proposer_event(
+            "set_inputs_first_pass_done",
+            phase_start,
+            num_tokens=num_tokens,
+            token_indices_shape=_tensor_shape(token_indices_to_sample),
+            updated_max_seq_len=common_attn_metadata.max_seq_len,
+            updated_num_actual_tokens=common_attn_metadata.num_actual_tokens,
+        )
 
+        phase_start = time.perf_counter()
         per_group_attn_metadata, per_layer_attn_metadata = (
             self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
         )
+        log_mtp_proposer_event(
+            "build_attn_metadata_done",
+            phase_start,
+            per_group_types=[type(md).__name__ for md in per_group_attn_metadata],
+            per_layer_count=len(per_layer_attn_metadata),
+        )
 
+        phase_start = time.perf_counter()
         cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
             self._determine_batch_execution_and_padding(num_tokens)
         )
+        log_mtp_proposer_event(
+            "determine_batch_execution_done",
+            phase_start,
+            cudagraph_runtime_mode=str(cudagraph_runtime_mode),
+            num_input_tokens=num_input_tokens,
+            num_tokens_across_dp=num_tokens_across_dp,
+        )
 
+        phase_start = time.perf_counter()
         model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
             num_tokens, num_input_tokens, mm_embed_inputs
         )
+        log_mtp_proposer_event(
+            "build_model_inputs_first_pass_done",
+            phase_start,
+            slot_mapping_size=slot_mapping_size,
+            input_ids_shape=_tensor_shape(model_kwargs.get("input_ids")),
+            positions_shape=_tensor_shape(model_kwargs.get("positions")),
+            inputs_embeds_shape=_tensor_shape(model_kwargs.get("inputs_embeds")),
+            hidden_states_shape=_tensor_shape(model_kwargs.get("hidden_states")),
+        )
 
+        phase_start = time.perf_counter()
+        log_mtp_proposer_event(
+            "model_forward_first_pass_enter",
+            num_input_tokens=num_input_tokens,
+            slot_mapping_size=slot_mapping_size,
+        )
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -476,12 +569,31 @@ class SpecDecodeBaseProposer:
                 hidden_states = last_hidden_states
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
+        log_mtp_proposer_event(
+            "model_forward_first_pass_done",
+            phase_start,
+            last_hidden_shape=_tensor_shape(last_hidden_states),
+            hidden_shape=_tensor_shape(hidden_states),
+        )
 
+        phase_start = time.perf_counter()
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
+        log_mtp_proposer_event(
+            "select_sample_hidden_states_done",
+            phase_start,
+            sample_hidden_shape=_tensor_shape(sample_hidden_states),
+        )
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
+            phase_start = time.perf_counter()
+            log_mtp_proposer_event("greedy_sample_enter")
             draft_token_ids = self._greedy_sample(sample_hidden_states)
+            log_mtp_proposer_event(
+                "greedy_sample_done",
+                phase_start,
+                draft_token_shape=_tensor_shape(draft_token_ids),
+            )
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         if self.uses_mrope:

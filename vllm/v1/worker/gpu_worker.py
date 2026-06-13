@@ -4,6 +4,7 @@
 
 import gc
 import os
+import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from datetime import timedelta
@@ -804,11 +805,63 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        mtp_debug_logs = (
+            getattr(self.model_runner, "speculative_config", None) is not None
+            and os.environ.get("VLLM_MTP_SAMPLE_TIMING_LOGS", "0") == "1"
+        )
+        mtp_debug_threshold_s = float(
+            os.environ.get("VLLM_MTP_SAMPLE_TIMING_THRESHOLD_S", "0.050")
+        )
+
+        def log_mtp_worker_event(phase: str) -> None:
+            if not mtp_debug_logs:
+                return
+            pp = get_pp_group()
+            logger.warning(
+                "MTP worker execute_model event: phase=%s pp_rank=%s "
+                "pp_world=%s is_first=%s is_last=%s total_tokens=%s "
+                "req_ids=%s spec_req_ids=%s",
+                phase,
+                pp.rank,
+                pp.world_size,
+                pp.is_first_rank,
+                pp.is_last_rank,
+                scheduler_output.total_num_scheduled_tokens,
+                list(scheduler_output.num_scheduled_tokens.keys())[:4],
+                list(scheduler_output.scheduled_spec_decode_tokens.keys())[:4],
+            )
+
+        def log_mtp_worker_timing(phase: str, start: float) -> None:
+            if not mtp_debug_logs:
+                return
+            elapsed = time.perf_counter() - start
+            if elapsed < mtp_debug_threshold_s:
+                return
+            pp = get_pp_group()
+            logger.warning(
+                "MTP worker execute_model timing: phase=%s elapsed=%.3fs "
+                "pp_rank=%s pp_world=%s is_first=%s is_last=%s "
+                "total_tokens=%s req_ids=%s",
+                phase,
+                elapsed,
+                pp.rank,
+                pp.world_size,
+                pp.is_first_rank,
+                pp.is_last_rank,
+                scheduler_output.total_num_scheduled_tokens,
+                list(scheduler_output.num_scheduled_tokens.keys())[:4],
+            )
+
+        log_mtp_worker_event("enter")
         # Ensure previous non-blocking PP sends are complete. The Stage50
         # experiment can defer this wait until the next send boundary to test
         # PP readiness overlap while keeping the default behavior unchanged.
         if not envs.VLLM_PP_DEFER_SEND_WAIT:
+            phase_start = time.perf_counter()
+            log_mtp_worker_event("prev_send_wait_enter")
             self._wait_for_pp_send_work()
+            log_mtp_worker_event("prev_send_wait_done")
+            log_mtp_worker_timing("prev_send_wait", phase_start)
 
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
@@ -851,6 +904,8 @@ class Worker(WorkerBase):
             and not get_pp_group().is_first_rank
             and not envs.VLLM_PP_DEFER_INTERMEDIATE_RECV
         ):
+            phase_start = time.perf_counter()
+            log_mtp_worker_event("irecv_tensor_dict_enter")
             with _pp_boundary_scope("worker.irecv_tensor_dict"):
                 tensor_dict, comm_handles, comm_postprocess = (
                     get_pp_group().irecv_tensor_dict(
@@ -859,6 +914,8 @@ class Worker(WorkerBase):
                         scheduled_num_tokens=num_scheduled_tokens,
                     )
                 )
+            log_mtp_worker_event("irecv_tensor_dict_done")
+            log_mtp_worker_timing("irecv_tensor_dict", phase_start)
             assert tensor_dict is not None
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
@@ -867,10 +924,14 @@ class Worker(WorkerBase):
             )
 
         with self.annotate_profile(scheduler_output):
+            phase_start = time.perf_counter()
+            log_mtp_worker_event("model_runner_execute_enter")
             with _pp_boundary_scope("worker.execute_model"):
                 output = self.model_runner.execute_model(
                     scheduler_output, intermediate_tensors
                 )
+            log_mtp_worker_event("model_runner_execute_done")
+            log_mtp_worker_timing("model_runner_execute", phase_start)
             if (
                 self.use_v2_model_runner
                 and self.model_runner.is_pooling_model
@@ -881,7 +942,12 @@ class Worker(WorkerBase):
                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
             ):
                 if envs.VLLM_PP_DEFER_SEND_WAIT:
+                    phase_start = time.perf_counter()
+                    log_mtp_worker_event("deferred_send_wait_enter")
                     self._wait_for_pp_send_work()
+                    log_mtp_worker_event("deferred_send_wait_done")
+                    log_mtp_worker_timing("deferred_send_wait", phase_start)
+                log_mtp_worker_event("return_model_runner_output")
                 return output
 
         assert isinstance(output, IntermediateTensors)
@@ -893,7 +959,11 @@ class Worker(WorkerBase):
 
         # launch non-blocking send of intermediate tensors
         if envs.VLLM_PP_DEFER_SEND_WAIT:
+            phase_start = time.perf_counter()
+            log_mtp_worker_event("pre_send_deferred_wait_enter")
             self._wait_for_pp_send_work()
+            log_mtp_worker_event("pre_send_deferred_wait_done")
+            log_mtp_worker_timing("pre_send_deferred_wait", phase_start)
         send_tensors = output.tensors
         if envs.VLLM_PP_COPY_CUDAGRAPH_OUTPUT_BEFORE_SEND:
             send_tensors = self._copy_intermediate_tensors_for_pp_send(
@@ -906,6 +976,8 @@ class Worker(WorkerBase):
                 else value
                 for key, value in output.tensors.items()
             }
+        phase_start = time.perf_counter()
+        log_mtp_worker_event("isend_tensor_dict_enter")
         with _pp_boundary_scope("worker.isend_tensor_dict"):
             self._pp_send_work = get_pp_group().isend_tensor_dict(
                 send_tensors,
@@ -913,6 +985,8 @@ class Worker(WorkerBase):
                 all_gather_tensors=all_gather_tensors,
                 scheduled_num_tokens=num_scheduled_tokens,
             )
+        log_mtp_worker_event("isend_tensor_dict_done")
+        log_mtp_worker_timing("isend_tensor_dict", phase_start)
         if (
             envs.VLLM_PP_DEFER_SEND_WAIT
             or envs.VLLM_PP_CLONE_CUDAGRAPH_OUTPUT_BEFORE_SEND
@@ -923,6 +997,7 @@ class Worker(WorkerBase):
                 if isinstance(tensor, torch.Tensor)
             ]
 
+        log_mtp_worker_event("return_none_after_isend")
         return None
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:

@@ -198,6 +198,12 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.pp_spec_broadcast import (
+    count_valid_sampled_tokens_per_req,
+    gather_valid_sampled_tokens_per_req,
+    num_computed_tokens_drift_correction,
+    select_latest_sampled_token_per_req,
+)
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     check_ubatch_thresholds,
@@ -244,12 +250,15 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         invalid_req_indices: list[int],
         async_output_copy_stream: torch.cuda.Stream,
         vocab_size: int,
+        sampled_token_ids_cpu: torch.Tensor | None = None,
+        logprobs_tensors_cpu: LogprobsTensors | None = None,
+        async_copy_ready_event: Any | None = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
 
         # Event on the copy stream so we can synchronize the non-blocking copy.
-        self.async_copy_ready_event = torch.Event()
+        self.async_copy_ready_event = async_copy_ready_event or torch.Event()
 
         # Keep a reference to the device tensor to avoid it being
         # deallocated until we finish copying it to the host.
@@ -257,31 +266,79 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         self.vocab_size = vocab_size
         self._logprobs_tensors = logprobs_tensors
 
-        # Initiate the copy on a separate stream, but do not synchronize it.
-        default_stream = torch.cuda.current_stream()
-        with torch.cuda.stream(async_output_copy_stream):
-            async_output_copy_stream.wait_stream(default_stream)
-            self.sampled_token_ids_cpu = self._sampled_token_ids.to(
-                "cpu", non_blocking=True
-            )
-            self._logprobs_tensors_cpu = (
-                self._logprobs_tensors.to_cpu_nonblocking()
-                if self._logprobs_tensors
-                else None
-            )
-            self.async_copy_ready_event.record()
+        if sampled_token_ids_cpu is not None:
+            self.sampled_token_ids_cpu = sampled_token_ids_cpu
+            self._logprobs_tensors_cpu = logprobs_tensors_cpu
+        else:
+            # Initiate the copy on a separate stream, but do not synchronize it.
+            default_stream = torch.cuda.current_stream()
+            with torch.cuda.stream(async_output_copy_stream):
+                async_output_copy_stream.wait_stream(default_stream)
+                self.sampled_token_ids_cpu = self._sampled_token_ids.to(
+                    "cpu", non_blocking=True
+                )
+                self._logprobs_tensors_cpu = (
+                    self._logprobs_tensors.to_cpu_nonblocking()
+                    if self._logprobs_tensors
+                    else None
+                )
+                self.async_copy_ready_event.record()
 
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
 
         This function blocks until the copy is finished.
         """
+        mtp_debug_logs = os.environ.get("VLLM_MTP_SAMPLE_TIMING_LOGS", "0") == "1"
+        pp = None
+        if mtp_debug_logs:
+            try:
+                pp = get_pp_group()
+                logger.warning(
+                    "MTP async output event: phase=get_output_enter "
+                    "pp_rank=%s pp_world=%s is_last=%s sampled_shape=%s",
+                    pp.rank,
+                    pp.world_size,
+                    pp.is_last_rank,
+                    tuple(self.sampled_token_ids_cpu.shape),
+                )
+            except Exception:
+                pp = None
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
+        sync_start = time.perf_counter()
+        if mtp_debug_logs:
+            logger.warning(
+                "MTP async output event: phase=copy_event_sync_enter "
+                "pp_rank=%s pp_world=%s is_last=%s max_gen_len=%s",
+                getattr(pp, "rank", None),
+                getattr(pp, "world_size", None),
+                getattr(pp, "is_last_rank", None),
+                max_gen_len,
+            )
         self.async_copy_ready_event.synchronize()
+        if mtp_debug_logs:
+            logger.warning(
+                "MTP async output event: phase=copy_event_sync_done "
+                "elapsed=%.3fs pp_rank=%s pp_world=%s is_last=%s",
+                time.perf_counter() - sync_start,
+                getattr(pp, "rank", None),
+                getattr(pp, "world_size", None),
+                getattr(pp, "is_last_rank", None),
+            )
 
         # Release the device tensors once the copy has completed.
         del self._logprobs_tensors
         del self._sampled_token_ids
+        parse_start = time.perf_counter()
+        if mtp_debug_logs:
+            logger.warning(
+                "MTP async output event: phase=parse_enter pp_rank=%s "
+                "pp_world=%s is_last=%s max_gen_len=%s",
+                getattr(pp, "rank", None),
+                getattr(pp, "world_size", None),
+                getattr(pp, "is_last_rank", None),
+                max_gen_len,
+            )
         if max_gen_len == 1:
             valid_sampled_token_ids = self.sampled_token_ids_cpu.tolist()
             for i in self._invalid_req_indices:
@@ -296,10 +353,27 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
                 self._invalid_req_indices,
                 logprobs_tensors=self._logprobs_tensors_cpu,
             )
+        if mtp_debug_logs:
+            logger.warning(
+                "MTP async output event: phase=parse_done elapsed=%.3fs "
+                "pp_rank=%s pp_world=%s is_last=%s",
+                time.perf_counter() - parse_start,
+                getattr(pp, "rank", None),
+                getattr(pp, "world_size", None),
+                getattr(pp, "is_last_rank", None),
+            )
 
         output = self._model_runner_output
         output.sampled_token_ids = valid_sampled_token_ids
         output.logprobs = logprobs_lists
+        if mtp_debug_logs:
+            logger.warning(
+                "MTP async output event: phase=get_output_done "
+                "pp_rank=%s pp_world=%s is_last=%s",
+                getattr(pp, "rank", None),
+                getattr(pp, "world_size", None),
+                getattr(pp, "is_last_rank", None),
+            )
         return output
 
 
@@ -602,6 +676,7 @@ class GPUModelRunner(
 
         self.num_spec_tokens = 0
         self.valid_sampled_token_count_gpu: torch.Tensor | None = None
+        self.valid_sampled_token_count_cpu_ready = False
         if self.speculative_config:
             self.num_spec_tokens = self.speculative_config.num_speculative_tokens
             draft_config = self.speculative_config.draft_model_config
@@ -811,6 +886,13 @@ class GPUModelRunner(
 
         # Cached outputs.
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
+        self._pp_prev_valid_sampled_count: dict[str, int] = {}
+        self._mtp_acceptance_log_every = int(
+            os.environ.get("VLLM_MTP_ACCEPTANCE_LOG_EVERY", "0") or 0
+        )
+        self._mtp_acceptance_log_steps = 0
+        self._mtp_acceptance_log_drafts = 0
+        self._mtp_acceptance_log_accepted = 0
         # N-gram GPU path: async D2H buffer/event for per-request valid draft counts.
         self._num_valid_draft_tokens: torch.Tensor | None = None
         self._num_valid_draft_tokens_cpu: torch.Tensor | None = None
@@ -836,6 +918,7 @@ class GPUModelRunner(
         )
         self.pp_sampled_token_ids_cpu: torch.Tensor | None = None
         self.pp_sampled_token_ids_recv: torch.Tensor | None = None
+        self.pp_mtp_sampled_token_state_recv: torch.Tensor | None = None
         self.pp_sampled_token_broadcast_handle: Any | None = None
         self.pp_sampled_token_recv_handle: Any | None = None
         self.pp_sampled_token_ids_send_ref: torch.Tensor | None = None
@@ -892,6 +975,16 @@ class GPUModelRunner(
                 logger.info("Using PP sampled-token-only output broadcast.")
             else:
                 logger.info("Using preallocated GPU PP sampled-token recv buffer.")
+        if (
+            self.num_spec_tokens
+            and pp_group.world_size > 1
+            and not pp_group.is_last_rank
+        ):
+            self.pp_mtp_sampled_token_state_recv = torch.empty(
+                (self.max_num_reqs, 2 * self.num_spec_tokens + 2),
+                dtype=torch.int32,
+                device=self.device,
+            )
 
         # Pre-allocated tensor for copying valid sampled token counts to CPU,
         # with dedicated stream for overlapping and event for coordination.
@@ -1135,6 +1228,31 @@ class GPUModelRunner(
             self.async_output_copy_stream = stream
         return stream
 
+    def _prestart_async_output_copy(
+        self,
+        sampled_token_ids: torch.Tensor,
+        logprobs_tensors: LogprobsTensors | None,
+    ) -> tuple[torch.Tensor, LogprobsTensors | None, Any]:
+        async_output_copy_stream = self._get_or_create_async_output_copy_stream()
+        async_copy_ready_event = torch.Event()
+        default_stream = torch.cuda.current_stream()
+        with torch.cuda.stream(async_output_copy_stream):
+            async_output_copy_stream.wait_stream(default_stream)
+            sampled_token_ids_cpu = sampled_token_ids.to(
+                "cpu", non_blocking=True
+            )
+            logprobs_tensors_cpu = (
+                logprobs_tensors.to_cpu_nonblocking()
+                if logprobs_tensors is not None
+                else None
+            )
+            async_copy_ready_event.record()
+        return (
+            sampled_token_ids_cpu,
+            logprobs_tensors_cpu,
+            async_copy_ready_event,
+        )
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -1322,9 +1440,23 @@ class GPUModelRunner(
                     optimistic_num_accepted = req_state.prev_num_draft_len
                     req_state.output_token_ids.extend([-1] * optimistic_num_accepted)
 
-                    deferred_spec_decode_corrections.append(
-                        (req_id, optimistic_num_accepted, req_state)
+                    skip_deferred_correction = (
+                        not is_last_rank
+                        and self._is_mtp_pp_sampled_state_enabled()
                     )
+                    if skip_deferred_correction:
+                        prev_valid = self._pp_prev_valid_sampled_count.get(req_id)
+                        if prev_valid is not None:
+                            num_computed_tokens -= (
+                                num_computed_tokens_drift_correction(
+                                    optimistic_num_accepted, prev_valid
+                                )
+                            )
+
+                    if not skip_deferred_correction:
+                        deferred_spec_decode_corrections.append(
+                            (req_id, optimistic_num_accepted, req_state)
+                        )
 
                     prev_req_index = (
                         self.input_batch.prev_req_id_to_index.get(req_id)
@@ -1770,9 +1902,9 @@ class GPUModelRunner(
             # we can copy directly using a single slice.
             with _pp_boundary_scope("prepare_input_ids.prev_token_direct_copy"):
                 self.input_ids.gpu[:num_common_tokens].copy_(
-                    self.input_batch.prev_sampled_token_ids[
-                        :num_common_tokens, 0
-                    ],
+                    select_latest_sampled_token_per_req(
+                        self.input_batch.prev_sampled_token_ids[:num_common_tokens]
+                    ),
                     non_blocking=True,
                 )
                 if self.enable_prompt_embeds:
@@ -1788,12 +1920,13 @@ class GPUModelRunner(
             prev_common_req_indices_tensor = torch.tensor(
                 prev_indices, dtype=torch.int64, pin_memory=self.pin_memory
             ).to(self.device, non_blocking=True)
+            latest_sampled_per_req = select_latest_sampled_token_per_req(
+                self.input_batch.prev_sampled_token_ids
+            )
             self.input_ids.gpu.scatter_(
                 dim=0,
                 index=sampled_tokens_index_tensor,
-                src=self.input_batch.prev_sampled_token_ids[
-                    prev_common_req_indices_tensor, 0
-                ],
+                src=latest_sampled_per_req[prev_common_req_indices_tensor],
             )
 
         # Scatter the draft tokens after the sampled tokens are scattered.
@@ -2504,7 +2637,11 @@ class GPUModelRunner(
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
-            if self.speculative_config and spec_decode_common_attn_metadata is None:
+            if (
+                self.speculative_config
+                and hasattr(self, "drafter")
+                and spec_decode_common_attn_metadata is None
+            ):
                 if isinstance(self.drafter, (EagleProposer, DFlashProposer)):
                     if self.drafter.kv_cache_gid == kv_cache_gid:
                         spec_decode_common_attn_metadata = cm
@@ -4090,10 +4227,15 @@ class GPUModelRunner(
             return False
         if self.is_pooling_model:
             return False
-        if self.speculative_config is not None or self.num_spec_tokens:
-            return False
         if spec_decode_metadata is not None:
             return False
+        if self.speculative_config is not None or self.num_spec_tokens:
+            # MTP still needs full logits on verification steps for rejection
+            # sampling. On first-token/no-draft steps there is no spec metadata
+            # and no scheduled draft input, so greedy argmax can use the same
+            # local-reduction fast path as regular decoding.
+            if scheduler_output.scheduled_spec_decode_tokens:
+                return False
         if (
             scheduler_output.has_structured_output_requests
             or scheduler_output.pending_structured_output_tokens
@@ -4132,10 +4274,23 @@ class GPUModelRunner(
             return False
         if self.is_pooling_model:
             return False
-        if self.speculative_config is not None or self.num_spec_tokens:
-            return False
         if spec_decode_metadata is not None:
             return False
+        if self.speculative_config is not None or self.num_spec_tokens:
+            kv_transfer_config = self.vllm_config.kv_transfer_config
+            kv_role = (
+                None
+                if kv_transfer_config is None
+                else getattr(kv_transfer_config, "kv_role", None)
+            )
+            if kv_role is not None and kv_role != "kv_consumer":
+                return False
+            # MTP verification still needs full logits for rejection sampling.
+            # The first-token/no-draft step has no spec metadata and no
+            # scheduled draft tokens, so it can use the greedy local argmax
+            # path just like regular greedy decoding.
+            if scheduler_output.scheduled_spec_decode_tokens:
+                return False
         if (
             scheduler_output.has_structured_output_requests
             or scheduler_output.pending_structured_output_tokens
@@ -4205,6 +4360,62 @@ class GPUModelRunner(
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        mtp_execute_logs = (
+            self.speculative_config is not None
+            and os.environ.get("VLLM_MTP_SAMPLE_TIMING_LOGS", "0") == "1"
+        )
+        mtp_execute_threshold_s = float(
+            os.environ.get("VLLM_MTP_SAMPLE_TIMING_THRESHOLD_S", "0.050")
+        )
+
+        def log_mtp_execute_event(phase: str) -> None:
+            if not mtp_execute_logs:
+                return
+            pp = get_pp_group()
+            logger.warning(
+                "MTP execute_model event: phase=%s pp_rank=%s pp_world=%s "
+                "is_first=%s is_last=%s total_tokens=%s num_reqs=%s "
+                "req_ids=%s spec_req_ids=%s",
+                phase,
+                pp.rank,
+                pp.world_size,
+                pp.is_first_rank,
+                pp.is_last_rank,
+                scheduler_output.total_num_scheduled_tokens,
+                self.input_batch.num_reqs,
+                list(scheduler_output.num_scheduled_tokens.keys())[:4],
+                list(scheduler_output.scheduled_spec_decode_tokens.keys())[:4],
+            )
+
+        def log_mtp_execute_timing(phase: str, start: float) -> None:
+            if not mtp_execute_logs:
+                return
+            elapsed = time.perf_counter() - start
+            if elapsed < mtp_execute_threshold_s:
+                return
+            pp = get_pp_group()
+            logger.warning(
+                "MTP execute_model timing: phase=%s elapsed=%.3fs "
+                "pp_rank=%s pp_world=%s is_first=%s is_last=%s "
+                "total_tokens=%s num_reqs=%s req_ids=%s",
+                phase,
+                elapsed,
+                pp.rank,
+                pp.world_size,
+                pp.is_first_rank,
+                pp.is_last_rank,
+                scheduler_output.total_num_scheduled_tokens,
+                self.input_batch.num_reqs,
+                list(scheduler_output.num_scheduled_tokens.keys())[:4],
+            )
+
+        log_mtp_execute_event("enter")
+
+        def should_run_mtp_deferred_corrections_before_forward() -> bool:
+            return (
+                os.environ.get("VLLM_MTP_EARLY_DEFERRED_CORRECTIONS", "0") == "1"
+                and self._is_mtp_pp_sampled_state_enabled()
+            )
 
         if self.routed_experts_initialized:
             capturer = RoutedExpertsCapturer.get_instance()
@@ -4212,6 +4423,10 @@ class GPUModelRunner(
                 capturer.clear_buffer()  # noqa
             else:
                 logger.error("RoutedExpertsCapturer not initialized.")
+
+        scheduler_output = self._sanitize_scheduled_spec_decode_tokens(
+            scheduler_output
+        )
 
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
@@ -4241,7 +4456,11 @@ class GPUModelRunner(
             self.synchronize_input_prep(),
         ):
             # Update persistent batch states.
+            phase_start = time.perf_counter()
+            log_mtp_execute_event("update_states_enter")
             deferred_state_corrections_fn = self._update_states(scheduler_output)
+            log_mtp_execute_event("update_states_done")
+            log_mtp_execute_timing("update_states", phase_start)
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -4283,10 +4502,14 @@ class GPUModelRunner(
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
+            phase_start = time.perf_counter()
+            log_mtp_execute_event("prepare_inputs_enter")
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+            log_mtp_execute_event("prepare_inputs_done")
+            log_mtp_execute_timing("prepare_inputs", phase_start)
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -4298,6 +4521,8 @@ class GPUModelRunner(
                     scheduler_output.num_common_prefix_blocks,
                 )
 
+            phase_start = time.perf_counter()
+            log_mtp_execute_event("determine_padding_enter")
             (
                 cudagraph_mode,
                 batch_desc,
@@ -4312,6 +4537,8 @@ class GPUModelRunner(
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
+            log_mtp_execute_event("determine_padding_done")
+            log_mtp_execute_timing("determine_padding", phase_start)
 
             logger.debug(
                 "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -4383,6 +4610,8 @@ class GPUModelRunner(
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
+            phase_start = time.perf_counter()
+            log_mtp_execute_event("slot_mappings_enter")
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
                 num_tokens_padded=num_tokens_padded
                 if pad_attn or has_separate_kv_update
@@ -4393,7 +4622,11 @@ class GPUModelRunner(
                 num_tokens_unpadded=num_tokens_unpadded,
                 ubatch_slices=ubatch_slices_padded,
             )
+            log_mtp_execute_event("slot_mappings_done")
+            log_mtp_execute_timing("slot_mappings", phase_start)
 
+            phase_start = time.perf_counter()
+            log_mtp_execute_event("attention_metadata_enter")
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
@@ -4409,7 +4642,11 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                 )
             )
+            log_mtp_execute_event("attention_metadata_done")
+            log_mtp_execute_timing("attention_metadata", phase_start)
 
+            phase_start = time.perf_counter()
+            log_mtp_execute_event("preprocess_enter")
             (
                 input_ids,
                 inputs_embeds,
@@ -4419,6 +4656,21 @@ class GPUModelRunner(
                 ec_connector_output,
             ) = self._preprocess(
                 scheduler_output, num_tokens_padded, intermediate_tensors
+            )
+            log_mtp_execute_event("preprocess_done")
+            log_mtp_execute_timing("preprocess", phase_start)
+
+        if (
+            deferred_state_corrections_fn
+            and should_run_mtp_deferred_corrections_before_forward()
+        ):
+            phase_start = time.perf_counter()
+            log_mtp_execute_event("early_deferred_state_corrections_enter")
+            deferred_state_corrections_fn()
+            deferred_state_corrections_fn = None
+            log_mtp_execute_event("early_deferred_state_corrections_done")
+            log_mtp_execute_timing(
+                "early_deferred_state_corrections", phase_start
             )
 
         # Set cudagraph mode to none if calc_kv_scales is true.
@@ -4438,9 +4690,14 @@ class GPUModelRunner(
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
-        # When spec decode is enabled, defer connector finalization
+        # When spec decode is active, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
-        defer_kv_connector_finalize = self.speculative_config is not None
+        # In MTP greedy-only mode, non-greedy batches must stay on the
+        # regular decode path for precision workloads.
+        defer_kv_connector_finalize = (
+            self.speculative_config is not None
+            and not self._is_mtp_disabled_for_current_batch()
+        )
         with (
             set_forward_context(
                 attn_metadata,
@@ -4459,6 +4716,8 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            phase_start = time.perf_counter()
+            log_mtp_execute_event("model_forward_enter")
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4466,8 +4725,12 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            log_mtp_execute_event("model_forward_done")
+            log_mtp_execute_timing("model_forward", phase_start)
+        log_mtp_execute_event("forward_context_done")
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+            log_mtp_execute_event("postprocess_enter")
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
                 hidden_states, aux_hidden_states = model_output
@@ -4487,6 +4750,7 @@ class GPUModelRunner(
                     assert isinstance(hidden_states, IntermediateTensors)
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
+                    log_mtp_execute_event("return_intermediate_tensors")
                     return hidden_states
 
                 if self.is_pooling_model:
@@ -4511,8 +4775,12 @@ class GPUModelRunner(
                         )
                     logits = None
                 else:
+                    phase_start = time.perf_counter()
+                    log_mtp_execute_event("compute_logits_enter")
                     with _pp_boundary_scope("gpu_model_runner.compute_logits"):
                         logits = self.model.compute_logits(sample_hidden_states)
+                    log_mtp_execute_event("compute_logits_done")
+                    log_mtp_execute_timing("compute_logits", phase_start)
                 pp_sampled_token_broadcasted = False
                 if self._should_inline_pp_sample_broadcast(
                     scheduler_output, spec_decode_metadata
@@ -4531,10 +4799,12 @@ class GPUModelRunner(
                     with _pp_boundary_scope(
                         "gpu_model_runner.pp_broadcast_prev_sampled_token_ids"
                     ):
-                        self._pp_broadcast_prev_sampled_token_ids(
-                            sampler_output.sampled_token_ids
+                        pp_sampled_token_broadcasted = (
+                            self._pp_broadcast_prev_sampled_token_ids(
+                                sampler_output.sampled_token_ids,
+                                allow_mtp_state=False,
+                            )
                         )
-                    pp_sampled_token_broadcasted = True
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -4573,8 +4843,12 @@ class GPUModelRunner(
                             )
                         logits = None
                     else:
+                        phase_start = time.perf_counter()
+                        log_mtp_execute_event("compute_logits_enter")
                         with _pp_boundary_scope("gpu_model_runner.compute_logits"):
                             logits = self.model.compute_logits(sample_hidden_states)
+                        log_mtp_execute_event("compute_logits_done")
+                        log_mtp_execute_timing("compute_logits", phase_start)
 
                 model_output_broadcast_data: dict[str, Any] = {}
                 if broadcast_sampled_token_only:
@@ -4612,6 +4886,7 @@ class GPUModelRunner(
                     assert broadcasted is not None
                     logits = broadcasted["logits"]
 
+        log_mtp_execute_event("set_execute_model_state_enter")
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,
@@ -4627,39 +4902,103 @@ class GPUModelRunner(
             pp_sampled_token_broadcasted,
         )
         self.kv_connector_output = kv_connector_output
+        log_mtp_execute_event("set_execute_model_state_done")
 
         # Now the batch has been launched we can wait for corrections from the
         # previous model forward without breaking async scheduling.
         if deferred_state_corrections_fn:
+            phase_start = time.perf_counter()
+            log_mtp_execute_event("deferred_state_corrections_enter")
             deferred_state_corrections_fn()
+            log_mtp_execute_event("deferred_state_corrections_done")
+            log_mtp_execute_timing("deferred_state_corrections", phase_start)
 
+        log_mtp_execute_event("return_none")
         return None
 
     @torch.inference_mode
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        mtp_timing_logs = (
+            self.speculative_config is not None
+            and os.environ.get("VLLM_MTP_SAMPLE_TIMING_LOGS", "0") == "1"
+        )
+        mtp_timing_threshold_s = float(
+            os.environ.get("VLLM_MTP_SAMPLE_TIMING_THRESHOLD_S", "0.050")
+        )
+        mtp_total_start = time.perf_counter() if mtp_timing_logs else 0.0
+
+        def log_mtp_timing(phase: str, start: float) -> None:
+            if not mtp_timing_logs:
+                return
+            elapsed = time.perf_counter() - start
+            if elapsed < mtp_timing_threshold_s:
+                return
+            pp = get_pp_group()
+            logger.warning(
+                "MTP sample_tokens timing: phase=%s elapsed=%.3fs "
+                "pp_rank=%s pp_world=%s is_first=%s is_last=%s "
+                "num_reqs=%s req_ids=%s",
+                phase,
+                elapsed,
+                pp.rank,
+                pp.world_size,
+                pp.is_first_rank,
+                pp.is_last_rank,
+                self.input_batch.num_reqs,
+                self.input_batch.req_ids[:4],
+            )
+
+        def log_mtp_event(phase: str) -> None:
+            if not mtp_timing_logs:
+                return
+            pp = get_pp_group()
+            logger.warning(
+                "MTP sample_tokens event: phase=%s pp_rank=%s pp_world=%s "
+                "is_first=%s is_last=%s num_reqs=%s req_ids=%s",
+                phase,
+                pp.rank,
+                pp.world_size,
+                pp.is_first_rank,
+                pp.is_last_rank,
+                self.input_batch.num_reqs,
+                self.input_batch.req_ids[:4],
+            )
+
         if self.execute_model_state is None:
+            log_mtp_event("enter_execute_state_none")
             kv_connector_output = self.kv_connector_output
             self.kv_connector_output = None
             # receive sampled token ids from the last PP rank.
             if self.use_async_scheduling and get_pp_group().world_size > 1:
+                log_mtp_event("receive_prev_sampled_token_ids_enter")
+                phase_start = time.perf_counter()
                 with _pp_boundary_scope(
                     "gpu_model_runner.pp_receive_prev_sampled_token_ids"
                 ):
                     self._pp_receive_prev_sampled_token_ids_to_input_batch()
+                log_mtp_event("receive_prev_sampled_token_ids_done")
+                log_mtp_timing("receive_prev_sampled_token_ids", phase_start)
             if not kv_connector_output:
+                log_mtp_event("return_none_execute_state_none")
+                log_mtp_timing("total", mtp_total_start)
                 return None  # type: ignore[return-value]
 
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
             if kv_connector_output.is_empty():
+                log_mtp_event("return_empty_execute_state_none")
+                log_mtp_timing("total", mtp_total_start)
                 return EMPTY_MODEL_RUNNER_OUTPUT
 
             output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
             output.kv_connector_output = kv_connector_output
+            log_mtp_event("return_kv_output_execute_state_none")
+            log_mtp_timing("total", mtp_total_start)
             return output
 
+        log_mtp_event("enter_execute_state")
         # Unpack ephemeral state.
         (
             scheduler_output,
@@ -4677,6 +5016,9 @@ class GPUModelRunner(
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
+        spec_config = self.speculative_config
+        if self._is_mtp_disabled_for_current_batch():
+            spec_config = None
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -4690,9 +5032,29 @@ class GPUModelRunner(
             )
 
         if sampler_output is None:
+            log_mtp_event("sample_enter")
+            phase_start = time.perf_counter()
             with record_function_or_nullcontext("gpu_model_runner: sample"):
                 with _pp_boundary_scope("gpu_model_runner.sample"):
                     sampler_output = self._sample(logits, spec_decode_metadata)
+            log_mtp_timing("sample", phase_start)
+
+        prestarted_async_output_copy = None
+        if (
+            self.use_async_scheduling
+            and spec_config is not None
+            and getattr(spec_config, "method", None) == "mtp"
+            and get_pp_group().world_size > 1
+            and os.environ.get("VLLM_MTP_PRESTART_ASYNC_OUTPUT_COPY", "0") == "1"
+        ):
+            phase_start = time.perf_counter()
+            log_mtp_event("prestart_async_output_copy_enter")
+            prestarted_async_output_copy = self._prestart_async_output_copy(
+                sampler_output.sampled_token_ids,
+                sampler_output.logprobs_tensors,
+            )
+            log_mtp_event("prestart_async_output_copy_done")
+            log_mtp_timing("prestart_async_output_copy", phase_start)
 
         if (
             not pp_sampled_token_broadcasted
@@ -4705,18 +5067,26 @@ class GPUModelRunner(
                 and pp.world_size > 1
                 and pp.is_last_rank
             ):
+                phase_start = time.perf_counter()
                 with _pp_boundary_scope(
                     "gpu_model_runner.pp_broadcast_prev_sampled_token_ids"
                 ):
-                    self._pp_broadcast_prev_sampled_token_ids(
-                        sampler_output.sampled_token_ids
+                    pp_sampled_token_broadcasted = (
+                        self._pp_broadcast_prev_sampled_token_ids(
+                            sampler_output.sampled_token_ids,
+                            allow_mtp_state=False,
+                        )
                     )
-                pp_sampled_token_broadcasted = True
+                log_mtp_timing(
+                    "early_broadcast_prev_sampled_token_ids", phase_start
+                )
 
+        phase_start = time.perf_counter()
         with _pp_boundary_scope("gpu_model_runner.update_states_after_model_execute"):
             self._update_states_after_model_execute(
                 sampler_output.sampled_token_ids, scheduler_output
             )
+        log_mtp_timing("update_states_after_model_execute", phase_start)
         if self.use_async_scheduling:
             pp = get_pp_group()
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
@@ -4728,20 +5098,28 @@ class GPUModelRunner(
                 and pp.world_size > 1
                 and pp.is_last_rank
             ):
+                phase_start = time.perf_counter()
                 with _pp_boundary_scope(
                     "gpu_model_runner.pp_broadcast_prev_sampled_token_ids"
                 ):
-                    self._pp_broadcast_prev_sampled_token_ids(
-                        sampler_output.sampled_token_ids
+                    pp_sampled_token_broadcasted = (
+                        self._pp_broadcast_prev_sampled_token_ids(
+                            sampler_output.sampled_token_ids,
+                            allow_mtp_state=False,
+                        )
                     )
+                log_mtp_timing("broadcast_prev_sampled_token_ids", phase_start)
 
         self._draft_token_ids = None
         self._draft_token_req_ids = None
         self.valid_sampled_token_count_gpu = None
+        self.valid_sampled_token_count_cpu_ready = False
         self.input_batch.prev_sampled_token_ids = None
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
+            log_mtp_event("propose_draft_token_ids_enter")
+            phase_start = time.perf_counter()
             with record_function_or_nullcontext("gpu_model_runner: draft"):
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
@@ -4755,8 +5133,8 @@ class GPUModelRunner(
                     slot_mappings,
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
+            log_mtp_timing("propose_draft_token_ids", phase_start)
 
-        spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
         if spec_config is not None:
             # Decide whether to run the drafter or zero out draft tokens.
@@ -4764,6 +5142,152 @@ class GPUModelRunner(
                 spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
                 <= self.effective_drafter_max_model_len
             )
+            skip_first_mtp_draft = False
+            if (
+                input_fits_in_drafter
+                and getattr(spec_config, "method", None) == "mtp"
+                and os.environ.get("VLLM_MTP_SKIP_FIRST_DRAFT", "0") == "1"
+            ):
+                kv_transfer_config = self.vllm_config.kv_transfer_config
+                kv_role = (
+                    None
+                    if kv_transfer_config is None
+                    else getattr(kv_transfer_config, "kv_role", None)
+                )
+                role = os.environ.get("VLLM_1P1D_ROLE", "")
+                is_decode_consumer = (
+                    role in ("", "decode", "nonpd")
+                    and kv_role in (None, "kv_consumer", "kv_both")
+                )
+                if is_decode_consumer and not self._is_all_reqs_chunked_prefill():
+                    discard_mask = self.discard_request_mask.np[
+                        : self.input_batch.num_reqs
+                    ]
+                    for req_idx, req_id in enumerate(self.input_batch.req_ids):
+                        if discard_mask[req_idx]:
+                            continue
+                        req_state = self.requests.get(req_id)
+                        if req_state is None or req_state.output_token_ids:
+                            continue
+                        if (
+                            self.input_batch.num_computed_tokens_cpu[req_idx]
+                            >= self.input_batch.num_prompt_tokens[req_idx]
+                        ):
+                            skip_first_mtp_draft = True
+                            break
+                if skip_first_mtp_draft:
+                    input_fits_in_drafter = False
+                    log_mtp_event("mtp_skip_first_draft")
+            mtp_max_drafter_seq_len = 0
+            if getattr(spec_config, "method", None) == "mtp":
+                try:
+                    mtp_max_drafter_seq_len = int(
+                        os.environ.get("VLLM_MTP_MAX_DRAFTER_SEQ_LEN", "0") or "0"
+                    )
+                except ValueError:
+                    mtp_max_drafter_seq_len = 0
+            if (
+                mtp_max_drafter_seq_len > 0
+                and spec_decode_common_attn_metadata is not None
+                and (
+                    spec_decode_common_attn_metadata.max_seq_len
+                    + self.num_spec_tokens
+                )
+                >= mtp_max_drafter_seq_len
+            ):
+                input_fits_in_drafter = False
+                log_mtp_event(
+                    "mtp_drafter_seq_len_guard_skip "
+                    f"max_seq_len={spec_decode_common_attn_metadata.max_seq_len} "
+                    f"projected_seq_len="
+                    f"{spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens} "
+                    f"limit={mtp_max_drafter_seq_len}"
+                )
+            if (
+                input_fits_in_drafter
+                and getattr(spec_config, "method", None) == "mtp"
+                and os.environ.get("VLLM_MTP_GREEDY_ONLY", "0") == "1"
+                and not self.input_batch.sampling_metadata.all_greedy
+            ):
+                input_fits_in_drafter = False
+                log_mtp_event("mtp_greedy_only_skip_draft")
+            mtp_skip_block_boundary_tokens = 0
+            if getattr(spec_config, "method", None) == "mtp":
+                try:
+                    mtp_skip_block_boundary_tokens = int(
+                        os.environ.get(
+                            "VLLM_MTP_SKIP_BLOCK_BOUNDARY_TOKENS", "0"
+                        )
+                        or "0"
+                    )
+                except ValueError:
+                    mtp_skip_block_boundary_tokens = 0
+            if (
+                input_fits_in_drafter
+                and (
+                    mtp_skip_block_boundary_tokens > 0
+                    or os.environ.get(
+                        "VLLM_MTP_SKIP_BLOCK_OFFSET_RANGES", ""
+                    ).strip()
+                )
+                and spec_decode_common_attn_metadata is not None
+            ):
+                block_size = int(
+                    getattr(getattr(self, "drafter", None), "block_size", 0)
+                    or getattr(self.cache_config, "block_size", 0)
+                    or 0
+                )
+                if block_size > 0:
+                    seq_len = int(spec_decode_common_attn_metadata.max_seq_len)
+                    projected_seq_len = seq_len + self.num_spec_tokens
+                    seq_offset = seq_len % block_size
+                    projected_offset = projected_seq_len % block_size
+                    skip_reason = None
+                    if (
+                        seq_offset < mtp_skip_block_boundary_tokens
+                        or projected_offset < mtp_skip_block_boundary_tokens
+                    ):
+                        skip_reason = "block_boundary"
+                    skip_offset_ranges = os.environ.get(
+                        "VLLM_MTP_SKIP_BLOCK_OFFSET_RANGES", ""
+                    ).strip()
+                    if skip_reason is None and skip_offset_ranges:
+
+                        def offset_in_skip_ranges(offset: int) -> bool:
+                            for item in skip_offset_ranges.split(","):
+                                item = item.strip()
+                                if not item:
+                                    continue
+                                try:
+                                    if "-" in item:
+                                        start_s, end_s = item.split("-", 1)
+                                        start = int(start_s.strip())
+                                        end = int(end_s.strip())
+                                        if start <= offset <= end:
+                                            return True
+                                    elif offset == int(item):
+                                        return True
+                                except ValueError:
+                                    continue
+                            return False
+
+                        if offset_in_skip_ranges(seq_offset):
+                            skip_reason = "seq_offset_range"
+                        elif offset_in_skip_ranges(projected_offset):
+                            skip_reason = "projected_offset_range"
+                    if skip_reason is not None:
+                        input_fits_in_drafter = False
+                        log_mtp_event(
+                            "mtp_drafter_block_boundary_skip "
+                            f"reason={skip_reason} "
+                            f"max_seq_len={seq_len} "
+                            f"projected_seq_len={projected_seq_len} "
+                            f"block_size={block_size} "
+                            f"seq_offset={seq_offset} "
+                            f"projected_offset={projected_offset} "
+                            f"skip_tokens={mtp_skip_block_boundary_tokens} "
+                            f"skip_offset_ranges={skip_offset_ranges}"
+                        )
             use_gpu_toks = (
                 spec_config.use_eagle()
                 or spec_config.uses_draft_model()
@@ -4826,11 +5350,37 @@ class GPUModelRunner(
                 # For Nemotron-H: it is necessary to zero out the draft tokens,
                 # otherwise the stale tokens will corrupt Mamba recurrent
                 # state and logprobs for sequences near max_model_len.
+                phase_start = time.perf_counter()
                 self._draft_token_ids = torch.zeros(
                     1, device=self.device, dtype=torch.int32
                 ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
+                log_mtp_timing("zero_draft_token_ids", phase_start)
 
+        if self._is_mtp_pp_sampled_state_enabled():
+            phase_start = time.perf_counter()
+            pp = get_pp_group()
+            if (
+                not pp_sampled_token_broadcasted
+                and not self.broadcast_pp_output
+                and pp.is_last_rank
+                and not self._is_all_reqs_chunked_prefill()
+            ):
+                log_mtp_event("broadcast_mtp_sampled_state_enter")
+                with _pp_boundary_scope(
+                    "gpu_model_runner.pp_broadcast_mtp_sampled_state"
+                ):
+                    pp_sampled_token_broadcasted = (
+                        self._pp_broadcast_prev_sampled_token_ids(
+                            sampler_output.sampled_token_ids,
+                            allow_mtp_state=True,
+                        )
+                    )
+                log_mtp_event("broadcast_mtp_sampled_state_done")
+            log_mtp_timing("broadcast_mtp_sampled_state", phase_start)
+
+        phase_start = time.perf_counter()
+        log_mtp_event("bookkeeping_sync_enter")
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -4847,6 +5397,8 @@ class GPUModelRunner(
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
             )
+        log_mtp_event("bookkeeping_sync_done")
+        log_mtp_timing("bookkeeping_sync", phase_start)
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
@@ -4857,15 +5409,22 @@ class GPUModelRunner(
         # draft model runs. Deferred from target model forward to allow
         # draft model to also save its KV cache.
         if spec_config is not None:
+            phase_start = time.perf_counter()
+            log_mtp_event("finalize_kv_connector_enter")
             self.finalize_kv_connector()
+            log_mtp_event("finalize_kv_connector_done")
+            log_mtp_timing("finalize_kv_connector", phase_start)
 
+        log_mtp_event("eplb_step_enter")
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
+        log_mtp_event("eplb_step_done")
 
         # self.kv_connector_output may be modified during drafting
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
+        log_mtp_event("model_runner_output_enter")
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:
                 capturer = RoutedExpertsCapturer.get_instance()
@@ -4887,13 +5446,24 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
             )
+        log_mtp_event("model_runner_output_done")
 
         if not self.use_async_scheduling:
             return output
 
+        log_mtp_event("async_output_enter")
         with record_function_or_nullcontext(
             "gpu_model_runner: AsyncGPUModelRunnerOutput"
         ):
+            prestarted_sampled_token_ids_cpu = None
+            prestarted_logprobs_tensors_cpu = None
+            prestarted_async_copy_ready_event = None
+            if prestarted_async_output_copy is not None:
+                (
+                    prestarted_sampled_token_ids_cpu,
+                    prestarted_logprobs_tensors_cpu,
+                    prestarted_async_copy_ready_event,
+                ) = prestarted_async_output_copy
             async_output = AsyncGPUModelRunnerOutput(
                 model_runner_output=output,
                 sampled_token_ids=sampler_output.sampled_token_ids,
@@ -4901,7 +5471,12 @@ class GPUModelRunner(
                 invalid_req_indices=invalid_req_indices,
                 async_output_copy_stream=self._get_or_create_async_output_copy_stream(),
                 vocab_size=self.input_batch.vocab_size,
+                sampled_token_ids_cpu=prestarted_sampled_token_ids_cpu,
+                logprobs_tensors_cpu=prestarted_logprobs_tensors_cpu,
+                async_copy_ready_event=prestarted_async_copy_ready_event,
             )
+        log_mtp_event("async_output_done")
+        log_mtp_event("set_async_sampled_token_ids_enter")
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"
         ):
@@ -4911,19 +5486,259 @@ class GPUModelRunner(
                 async_output.sampled_token_ids_cpu,
                 async_output.async_copy_ready_event,
             )
+        log_mtp_event("set_async_sampled_token_ids_done")
 
+        if (
+            spec_config is not None
+            and getattr(spec_config, "method", None) == "mtp"
+            and get_pp_group().is_last_rank
+            and get_tp_group().rank_in_group == 0
+            and os.environ.get("VLLM_MTP_SYNC_ASYNC_OUTPUT", "0") == "1"
+        ):
+            phase_start = time.perf_counter()
+            log_mtp_event("sync_async_output_get_output_enter")
+            output = async_output.get_output()
+            log_mtp_event("sync_async_output_get_output_done")
+            log_mtp_timing("sync_async_output_get_output", phase_start)
+            log_mtp_timing("total", mtp_total_start)
+            return output
+
+        log_mtp_event("return_async_output")
+        log_mtp_timing("total", mtp_total_start)
         return async_output
 
-    def _pp_broadcast_prev_sampled_token_ids(
+    def _is_mtp_disabled_for_current_batch(self) -> bool:
+        spec_config = self.speculative_config
+        if (
+            spec_config is None
+            or getattr(spec_config, "method", None) != "mtp"
+            or os.environ.get("VLLM_MTP_GREEDY_ONLY", "0") != "1"
+        ):
+            return False
+        sampling_metadata = getattr(self.input_batch, "sampling_metadata", None)
+        return sampling_metadata is not None and not sampling_metadata.all_greedy
+
+    @staticmethod
+    def _sampling_params_allow_mtp(sampling_params: object | None) -> bool:
+        return (
+            sampling_params is not None
+            and getattr(sampling_params, "sampling_type", None) == SamplingType.GREEDY
+        )
+
+    def _scheduler_output_is_all_greedy(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> bool:
+        for new_req_data in scheduler_output.scheduled_new_reqs:
+            sampling_params = new_req_data.sampling_params
+            if not self._sampling_params_allow_mtp(sampling_params):
+                return False
+        for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
+            req_state = self.requests.get(req_id)
+            sampling_params = None if req_state is None else req_state.sampling_params
+            if not self._sampling_params_allow_mtp(sampling_params):
+                return False
+        return True
+
+    def _sanitize_scheduled_spec_decode_tokens(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> "SchedulerOutput":
+        spec_config = self.speculative_config
+        scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        if (
+            spec_config is None
+            or getattr(spec_config, "method", None) != "mtp"
+            or not scheduled_spec_tokens
+        ):
+            return scheduler_output
+
+        drop_all = (
+            os.environ.get("VLLM_MTP_GREEDY_ONLY", "0") == "1"
+            and not self._scheduler_output_is_all_greedy(scheduler_output)
+        )
+        drop_req_ids = list(scheduled_spec_tokens) if drop_all else []
+        if not drop_req_ids:
+            return scheduler_output
+
+        num_scheduled_tokens = scheduler_output.num_scheduled_tokens.copy()
+        scheduled_spec_tokens = scheduled_spec_tokens.copy()
+        for req_id in drop_req_ids:
+            spec_token_ids = scheduled_spec_tokens.pop(req_id, None)
+            if not spec_token_ids or req_id not in num_scheduled_tokens:
+                continue
+            num_scheduled_tokens[req_id] = max(
+                1, num_scheduled_tokens[req_id] - len(spec_token_ids)
+            )
+
+        return replace(
+            scheduler_output,
+            num_scheduled_tokens=num_scheduled_tokens,
+            total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
+            scheduled_spec_decode_tokens=scheduled_spec_tokens,
+        )
+
+    def _is_mtp_pp_sampled_state_enabled(self) -> bool:
+        spec_config = self.speculative_config
+        return (
+            spec_config is not None
+            and getattr(spec_config, "method", None) == "mtp"
+            and not self._is_mtp_disabled_for_current_batch()
+            and self.use_async_scheduling
+            and self.num_spec_tokens > 0
+            and get_pp_group().world_size > 1
+        )
+
+    def _mtp_pp_sampled_state_ready(self) -> bool:
+        return (
+            self.input_batch.prev_sampled_token_ids is not None
+            and self.valid_sampled_token_count_gpu is not None
+            and torch.is_tensor(self._draft_token_ids)
+        )
+
+    def _pack_mtp_pp_sampled_state(
         self, sampled_token_ids: torch.Tensor
-    ) -> None:
+    ) -> torch.Tensor | None:
+        if (
+            not self._is_mtp_pp_sampled_state_enabled()
+            or sampled_token_ids.dim() != 2
+            or not self._mtp_pp_sampled_state_ready()
+        ):
+            return None
+
+        num_reqs = self.input_batch.num_reqs
+        draft_token_ids = self._draft_token_ids
+        assert torch.is_tensor(draft_token_ids)
+
+        sampled_width = self.num_spec_tokens + 1
+        sampled_grid = sampled_token_ids[:num_reqs].to(dtype=torch.int32)
+        if sampled_grid.shape[-1] < sampled_width:
+            pad = sampled_grid.new_full(
+                (sampled_grid.shape[0], sampled_width - sampled_grid.shape[-1]),
+                -1,
+            )
+            sampled_grid = torch.cat((sampled_grid, pad), dim=1)
+        else:
+            sampled_grid = sampled_grid[:, :sampled_width]
+        valid_counts = count_valid_sampled_tokens_per_req(sampled_grid).to(
+            dtype=torch.int32
+        ).unsqueeze(1)
+        if (
+            self._mtp_acceptance_log_every > 0
+            and get_tp_group().rank_in_group == 0
+        ):
+            accepted = (
+                (valid_counts.squeeze(1) - 1)
+                .clamp(min=0)
+                .sum()
+                .item()
+            )
+            drafts = num_reqs * self.num_spec_tokens
+            self._mtp_acceptance_log_steps += 1
+            self._mtp_acceptance_log_drafts += drafts
+            self._mtp_acceptance_log_accepted += accepted
+            if (
+                self._mtp_acceptance_log_steps
+                % self._mtp_acceptance_log_every
+                == 0
+            ):
+                acceptance_rate = (
+                    self._mtp_acceptance_log_accepted
+                    / self._mtp_acceptance_log_drafts
+                    if self._mtp_acceptance_log_drafts
+                    else 0.0
+                )
+                mean_acceptance_len = (
+                    1.0
+                    + (
+                        self._mtp_acceptance_log_accepted
+                        / self._mtp_acceptance_log_steps
+                    )
+                    if self._mtp_acceptance_log_steps
+                    else 1.0
+                )
+                logger.info(
+                    "MTP acceptance summary: steps=%d drafts=%d "
+                    "accepted=%d acceptance_rate=%.3f "
+                    "mean_acceptance_len=%.3f",
+                    self._mtp_acceptance_log_steps,
+                    self._mtp_acceptance_log_drafts,
+                    self._mtp_acceptance_log_accepted,
+                    acceptance_rate,
+                    mean_acceptance_len,
+                )
+        draft_token_ids = draft_token_ids[
+            :num_reqs, : self.num_spec_tokens
+        ].to(dtype=torch.int32)
+        return torch.cat(
+            (sampled_grid, valid_counts, draft_token_ids), dim=1
+        ).contiguous()
+
+    def _should_defer_mtp_pp_sampled_token_broadcast(
+        self, sampled_token_ids: torch.Tensor
+    ) -> bool:
+        return (
+            self._is_mtp_pp_sampled_state_enabled()
+            and sampled_token_ids.dim() == 2
+            and not self._mtp_pp_sampled_state_ready()
+        )
+
+    def _pp_broadcast_prev_sampled_token_ids(
+        self,
+        sampled_token_ids: torch.Tensor,
+        *,
+        allow_mtp_state: bool = True,
+    ) -> bool:
         """Broadcast sampled token ids (GPU) from last PP stage"""
         pp = get_pp_group()
         assert pp.is_last_rank
+        is_mtp_enabled = self._is_mtp_pp_sampled_state_enabled()
+        mtp_state = None
+        if is_mtp_enabled:
+            if not allow_mtp_state:
+                return False
+            mtp_state = self._pack_mtp_pp_sampled_state(sampled_token_ids)
+            if mtp_state is None:
+                return False
+            sampled_token_ids = mtp_state
+        elif self._should_defer_mtp_pp_sampled_token_broadcast(sampled_token_ids):
+            return False
+        is_mtp_state = mtp_state is not None
+        if not is_mtp_state and (
+            sampled_token_ids.dim() == 2 and sampled_token_ids.shape[-1] > 1
+        ):
+            valid_mask = (sampled_token_ids >= 0) & (
+                sampled_token_ids < self.input_batch.vocab_size
+            )
+            if valid_mask.any():
+                offsets = torch.arange(
+                    sampled_token_ids.shape[-1],
+                    device=sampled_token_ids.device,
+                ).expand_as(sampled_token_ids)
+                last_valid_indices = torch.where(valid_mask, offsets, -1).max(
+                    dim=1
+                ).values
+                selected_token_ids = torch.gather(
+                    sampled_token_ids,
+                    1,
+                    last_valid_indices.clamp(min=0).unsqueeze(1),
+                )
+                sampled_token_ids = torch.where(
+                    (last_valid_indices >= 0).unsqueeze(1),
+                    selected_token_ids,
+                    sampled_token_ids[:, :1],
+                ).contiguous()
+            else:
+                sampled_token_ids = sampled_token_ids[:, :1].contiguous()
         # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
-        assert sampled_token_ids.dim() == 2 and sampled_token_ids.shape[-1] == 1, (
-            "PP+async expects sampled_token_ids to have shape [num_reqs, 1]"
-        )
+        assert sampled_token_ids.dim() == 2
+        if not is_mtp_state:
+            assert sampled_token_ids.shape[-1] == 1, (
+                "PP+async expects sampled_token_ids to have shape [num_reqs, 1]"
+            )
+        else:
+            assert sampled_token_ids.shape[-1] == 2 * self.num_spec_tokens + 2, (
+                "MTP PP state expects shape "
+                "[num_reqs, num_spec + 1 sampled + 1 count + num_spec draft]"
+            )
         # Skip for chunked prefill: sampled tokens are dummy
         # and will be discarded, no need to broadcast.
         if not self._is_all_reqs_chunked_prefill() and not (
@@ -4942,7 +5757,7 @@ class GPUModelRunner(
                     torch.distributed.send(
                         cpu_tokens, dst=pp.first_rank, group=pp.cpu_group
                     )
-                return
+                return True
             if self._should_use_sampled_token_pair_p2p(sampled_token_ids):
                 with _pp_boundary_scope("sampled_token.pair_p2p_send"):
                     pair_group = pp.sampled_token_pair_device_group()
@@ -4950,7 +5765,7 @@ class GPUModelRunner(
                     torch.distributed.send(
                         sampled_token_ids, dst=pp.first_rank, group=pair_group
                     )
-                return
+                return True
             if self._should_use_first_rank_only_sampled_token_p2p(
                 sampled_token_ids
             ):
@@ -4958,8 +5773,11 @@ class GPUModelRunner(
                     torch.distributed.send(
                         sampled_token_ids, dst=pp.first_rank, group=pp.device_group
                     )
-                return
-            if self._should_use_cpu_sampled_token_broadcast(sampled_token_ids):
+                return True
+            if (
+                not is_mtp_state
+                and self._should_use_cpu_sampled_token_broadcast(sampled_token_ids)
+            ):
                 with _pp_boundary_scope("sampled_token.cpu_broadcast_send"):
                     cpu_tokens = self.pp_sampled_token_ids_cpu[
                         : sampled_token_ids.shape[0]
@@ -4968,7 +5786,7 @@ class GPUModelRunner(
                     torch.distributed.broadcast(
                         cpu_tokens, src=pp.last_rank, group=pp.cpu_group
                     )
-                return
+                return True
             if self._should_use_async_sampled_token_broadcast(sampled_token_ids):
                 with _pp_boundary_scope("sampled_token.async_broadcast_issue"):
                     self.pp_sampled_token_ids_send_ref = sampled_token_ids
@@ -4980,11 +5798,13 @@ class GPUModelRunner(
                             async_op=True,
                         )
                     )
-                return
+                return True
             with _pp_boundary_scope("sampled_token.device_broadcast_blocking_send"):
                 torch.distributed.broadcast(
                     sampled_token_ids, src=pp.rank, group=pp.device_group
                 )
+            return True
+        return False
 
     def _wait_pp_sampled_token_broadcast(
         self, *, recv: bool = True, send: bool = True
@@ -5142,14 +5962,25 @@ class GPUModelRunner(
         pp = get_pp_group()
         assert not pp.is_last_rank
         num_reqs = self.input_batch.num_reqs
+        mtp_state = self._is_mtp_pp_sampled_state_enabled()
         # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
-        if (
-            self.pp_sampled_token_ids_recv is not None
+        if mtp_state and (
+            self.pp_mtp_sampled_token_state_recv is not None
+            and num_reqs <= self.pp_mtp_sampled_token_state_recv.shape[0]
+        ):
+            recv = self.pp_mtp_sampled_token_state_recv[:num_reqs]
+        elif (
+            not mtp_state
+            and self.pp_sampled_token_ids_recv is not None
             and num_reqs <= self.pp_sampled_token_ids_recv.shape[0]
         ):
             recv = self.pp_sampled_token_ids_recv[:num_reqs]
         else:
-            recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
+            recv_width = 2 * self.num_spec_tokens + 2 if mtp_state else 1
+            recv = torch.empty(
+                (num_reqs, recv_width), dtype=torch.int32, device=self.device
+            )
+        gathered_sampled_token_ids: list[list[int]] | None = None
         skip_final_sampled_token = (
             self._should_skip_pp_final_sampled_token_broadcast()
         )
@@ -5157,7 +5988,14 @@ class GPUModelRunner(
         if not self._is_all_reqs_chunked_prefill() and not skip_final_sampled_token:
             with _pp_boundary_scope("sampled_token.recv_wait_before_issue"):
                 self._wait_pp_sampled_token_broadcast(recv=True, send=False)
-            if self._should_use_cpu_first_rank_sampled_token_p2p():
+            if mtp_state:
+                with _pp_boundary_scope(
+                    "sampled_token.device_broadcast_blocking_recv"
+                ):
+                    torch.distributed.broadcast(
+                        recv, src=pp.last_rank, group=pp.device_group
+                    )
+            elif self._should_use_cpu_first_rank_sampled_token_p2p():
                 if pp.is_first_rank:
                     assert recv is not None
                     with _pp_boundary_scope(
@@ -5208,24 +6046,63 @@ class GPUModelRunner(
         if skip_final_sampled_token:
             self.input_batch.prev_sampled_token_ids = None
             self.input_batch.prev_req_id_to_index = {}
+            if mtp_state:
+                self.valid_sampled_token_count_gpu = None
+                self.valid_sampled_token_count_cpu_ready = False
+                self._draft_token_ids = None
+                self._pp_prev_valid_sampled_count = {}
             return
         if self._should_skip_middle_rank_sampled_token_tensor():
             self.input_batch.prev_sampled_token_ids = None
+        elif mtp_state:
+            sampled_width = self.num_spec_tokens + 1
+            sampled_token_ids = recv[:, :sampled_width].contiguous()
+            self.input_batch.prev_sampled_token_ids = sampled_token_ids
+            self.valid_sampled_token_count_gpu = None
+            self.valid_sampled_token_count_cpu_ready = False
+            self._draft_token_ids = recv[
+                :, sampled_width + 1 : sampled_width + 1 + self.num_spec_tokens
+            ].contiguous()
+            gathered_sampled_token_ids = gather_valid_sampled_tokens_per_req(
+                sampled_token_ids
+            )
         else:
             self.input_batch.prev_sampled_token_ids = recv
+            self.valid_sampled_token_count_gpu = None
+            self.valid_sampled_token_count_cpu_ready = False
+            self._draft_token_ids = None
+            self._pp_prev_valid_sampled_count = {}
 
         # construct `prev_req_id_to_index` here so `_prepare_input_ids`
         # can map req_id -> previous batch row
         discard_req_indices = np.nonzero(self.discard_request_mask.np[:num_reqs])[0]
         discard_req_indices_set = set(discard_req_indices)
         prev_req_id_to_index: dict[str, int] = {}
+        if mtp_state:
+            self._pp_prev_valid_sampled_count = {}
         for i, req_id in enumerate(self.input_batch.req_ids):
             if i in discard_req_indices_set:
                 continue
             prev_req_id_to_index[req_id] = i
-            # PP+async scheduling: advance per-request local cached output length by
-            # appending a placeholder (-1) token id.
-            if (req_state := self.requests.get(req_id)) is not None:
+            req_state = self.requests.get(req_id)
+            if mtp_state and gathered_sampled_token_ids is not None:
+                values = gathered_sampled_token_ids[i]
+                valid_count = len(values)
+                pos = self.input_batch.num_tokens_no_spec[i]
+                end = pos + valid_count
+                if valid_count:
+                    self.input_batch.token_ids_cpu[i, pos:end] = values
+                    self.input_batch.is_token_ids[i, pos:end] = True
+                self.input_batch.num_tokens_no_spec[i] = end
+                if req_state is not None:
+                    optimistic = req_state.prev_num_draft_len
+                    if optimistic:
+                        del req_state.output_token_ids[-optimistic:]
+                    req_state.output_token_ids.extend(values)
+                self._pp_prev_valid_sampled_count[req_id] = valid_count
+            elif req_state is not None:
+                # PP+async scheduling: advance per-request local cached output
+                # length by appending a placeholder token id.
                 req_state.output_token_ids.append(-1)
         self.input_batch.prev_req_id_to_index = prev_req_id_to_index
 
@@ -5285,20 +6162,80 @@ class GPUModelRunner(
         if self.valid_sampled_token_count_event is None:
             return
 
+        counts = valid_sampled_tokens_count
+        counts_cpu = self.valid_sampled_token_count_cpu
+        assert counts_cpu is not None
+        mtp_debug_logs = (
+            self.speculative_config is not None
+            and getattr(self.speculative_config, "method", None) == "mtp"
+            and os.environ.get("VLLM_MTP_SAMPLE_TIMING_LOGS", "0") == "1"
+        )
+        if mtp_debug_logs:
+            pp = get_pp_group()
+            logger.warning(
+                "MTP valid_count copy event: phase=enter pp_rank=%s "
+                "pp_world=%s is_last=%s counts_shape=%s next_shape=%s "
+                "sync_copy=%s",
+                pp.rank,
+                pp.world_size,
+                pp.is_last_rank,
+                tuple(counts.shape),
+                tuple(next_token_ids.shape),
+                os.environ.get("VLLM_MTP_SYNC_VALID_COUNT_COPY", "0"),
+            )
+
+        if (
+            os.environ.get("VLLM_MTP_SYNC_VALID_COUNT_COPY", "0") == "1"
+            and self._is_mtp_pp_sampled_state_enabled()
+            and get_pp_group().is_last_rank
+        ):
+            if mtp_debug_logs:
+                pp = get_pp_group()
+                logger.warning(
+                    "MTP valid_count copy event: phase=sync_copy_enter "
+                    "pp_rank=%s pp_world=%s is_last=%s",
+                    pp.rank,
+                    pp.world_size,
+                    pp.is_last_rank,
+                )
+            counts_cpu[: counts.shape[0]].copy_(counts, non_blocking=False)
+            if mtp_debug_logs:
+                pp = get_pp_group()
+                logger.warning(
+                    "MTP valid_count copy event: phase=sync_copy_done "
+                    "pp_rank=%s pp_world=%s is_last=%s count0=%s",
+                    pp.rank,
+                    pp.world_size,
+                    pp.is_last_rank,
+                    int(counts_cpu[0].item()) if counts.shape[0] else None,
+                )
+            self.valid_sampled_token_count_cpu_ready = True
+            if self.use_async_spec_decode:
+                self.valid_sampled_token_count_gpu = counts
+            self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
+            return
+
+        self.valid_sampled_token_count_cpu_ready = False
         default_stream = torch.cuda.current_stream()
         # Initialize a new stream to overlap the copy operation with
         # prepare_input of draft model.
         with torch.cuda.stream(self.valid_sampled_token_count_copy_stream):
             self.valid_sampled_token_count_copy_stream.wait_stream(default_stream)  # type: ignore
-            counts = valid_sampled_tokens_count
-            counts_cpu = self.valid_sampled_token_count_cpu
-            assert counts_cpu is not None
             counts_cpu[: counts.shape[0]].copy_(counts, non_blocking=True)
             self.valid_sampled_token_count_event.record()
+        if mtp_debug_logs:
+            pp = get_pp_group()
+            logger.warning(
+                "MTP valid_count copy event: phase=async_copy_enqueued "
+                "pp_rank=%s pp_world=%s is_last=%s",
+                pp.rank,
+                pp.world_size,
+                pp.is_last_rank,
+            )
 
         if self.use_async_spec_decode:
             # Stash for GPU-side correction in _prepare_inputs.
-            self.valid_sampled_token_count_gpu = valid_sampled_tokens_count
+            self.valid_sampled_token_count_gpu = counts
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
 
     def _get_valid_sampled_token_count(self) -> list[int]:
@@ -5310,7 +6247,46 @@ class GPUModelRunner(
 
         counts_cpu = self.valid_sampled_token_count_cpu
         assert counts_cpu is not None
+        mtp_debug_logs = (
+            self.speculative_config is not None
+            and os.environ.get("VLLM_MTP_SAMPLE_TIMING_LOGS", "0") == "1"
+        )
+        if self.valid_sampled_token_count_cpu_ready:
+            if mtp_debug_logs:
+                pp = get_pp_group()
+                logger.warning(
+                    "MTP valid_count event: phase=cpu_ready pp_rank=%s "
+                    "pp_world=%s is_last=%s prev_shape=%s num_reqs=%s",
+                    pp.rank,
+                    pp.world_size,
+                    pp.is_last_rank,
+                    tuple(prev_sampled_token_ids.shape),
+                    self.input_batch.num_reqs,
+                )
+            return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
+        if mtp_debug_logs:
+            pp = get_pp_group()
+            logger.warning(
+                "MTP valid_count event: phase=wait_enter pp_rank=%s "
+                "pp_world=%s is_last=%s prev_shape=%s num_reqs=%s",
+                pp.rank,
+                pp.world_size,
+                pp.is_last_rank,
+                tuple(prev_sampled_token_ids.shape),
+                self.input_batch.num_reqs,
+            )
         sampled_count_event.synchronize()
+        if mtp_debug_logs:
+            pp = get_pp_group()
+            logger.warning(
+                "MTP valid_count event: phase=wait_done pp_rank=%s "
+                "pp_world=%s is_last=%s prev_shape=%s num_reqs=%s",
+                pp.rank,
+                pp.world_size,
+                pp.is_last_rank,
+                tuple(prev_sampled_token_ids.shape),
+                self.input_batch.num_reqs,
+            )
         return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
 
     def propose_draft_token_ids(
@@ -5328,6 +6304,35 @@ class GPUModelRunner(
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
         assert spec_config is not None
+        mtp_propose_debug = (
+            spec_config.method == "mtp"
+            and os.environ.get("VLLM_MTP_SAMPLE_TIMING_LOGS", "0") == "1"
+        )
+
+        def log_mtp_propose_event(phase: str) -> None:
+            if not mtp_propose_debug:
+                return
+            pp = get_pp_group()
+            sampled_shape = (
+                tuple(sampled_token_ids.shape)
+                if isinstance(sampled_token_ids, torch.Tensor)
+                else (len(sampled_token_ids),)
+            )
+            logger.warning(
+                "MTP propose event: phase=%s pp_rank=%s pp_world=%s "
+                "is_last=%s sampled_shape=%s num_scheduled_tokens=%s "
+                "has_spec_metadata=%s max_seq_len=%s req_ids=%s",
+                phase,
+                pp.rank,
+                pp.world_size,
+                pp.is_last_rank,
+                sampled_shape,
+                num_scheduled_tokens,
+                spec_decode_metadata is not None,
+                common_attn_metadata.max_seq_len,
+                self.input_batch.req_ids[:4],
+            )
+
         if spec_config.method == "ngram":
             from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
@@ -5470,6 +6475,7 @@ class GPUModelRunner(
                     "sampled_token_ids should be a torch.Tensor when"
                     "padded-batch is enabled."
                 )
+                log_mtp_propose_event("prepare_next_token_ids_padded_enter")
                 next_token_ids, valid_sampled_tokens_count = (
                     self.drafter.prepare_next_token_ids_padded(
                         sampled_token_ids,
@@ -5478,9 +6484,13 @@ class GPUModelRunner(
                         self.discard_request_mask.gpu,
                     )
                 )
+                log_mtp_propose_event("prepare_next_token_ids_padded_return")
+                log_mtp_propose_event("copy_valid_sampled_token_count_enter")
                 self._copy_valid_sampled_token_count(
                     next_token_ids, valid_sampled_tokens_count
                 )
+                log_mtp_propose_event("copy_valid_sampled_token_count_done")
+                log_mtp_propose_event("prepare_next_token_ids_padded_done")
 
             num_rejected_tokens_gpu = None
             if spec_decode_metadata is None:
@@ -5513,6 +6523,7 @@ class GPUModelRunner(
                     else:
                         target_hidden_states = hidden_states[token_indices]
                 else:
+                    log_mtp_propose_event("prepare_inputs_padded_enter")
                     (
                         common_attn_metadata,
                         token_indices_to_sample,
@@ -5522,6 +6533,7 @@ class GPUModelRunner(
                         spec_decode_metadata,
                         valid_sampled_tokens_count,
                     )
+                    log_mtp_propose_event("prepare_inputs_padded_done")
                     total_num_tokens = common_attn_metadata.num_actual_tokens
                     # When padding the batch, token_indices is just a range
                     target_token_ids = self.input_ids.gpu[:total_num_tokens]
@@ -5542,6 +6554,7 @@ class GPUModelRunner(
             else:
                 mm_embed_inputs = None
 
+            log_mtp_propose_event("drafter_propose_enter")
             draft_token_ids = self.drafter.propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
@@ -5554,6 +6567,7 @@ class GPUModelRunner(
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
             )
+            log_mtp_propose_event("drafter_propose_done")
 
         return draft_token_ids
 
@@ -6368,7 +7382,7 @@ class GPUModelRunner(
             else:
                 hidden_states = outputs
 
-            if self.speculative_config and (
+            if self.speculative_config and hasattr(self, "drafter") and (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
                 or self.speculative_config.uses_extract_hidden_states()
@@ -7218,7 +8232,7 @@ class GPUModelRunner(
         self.calculate_reorder_batch_threshold()
 
         # Initialize drafter attention backend
-        if self.speculative_config and (
+        if self.speculative_config and hasattr(self, "drafter") and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_draft_model()
         ):
@@ -7270,7 +8284,7 @@ class GPUModelRunner(
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.
-        if self.speculative_config and (
+        if self.speculative_config and hasattr(self, "drafter") and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_extract_hidden_states()
         ):
@@ -7705,6 +8719,7 @@ class GPUModelRunner(
 
         if (
             self.speculative_config
+            and hasattr(self, "drafter")
             and self.speculative_config.uses_extract_hidden_states()
         ):
             assert isinstance(self.drafter, ExtractHiddenStatesProposer)

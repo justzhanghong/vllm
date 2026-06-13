@@ -927,21 +927,99 @@ class WorkerProc:
         worker_response_mq. If the output is an Exception, it is
         converted to a FAILURE response.
         """
+        mtp_debug_logs = os.environ.get("VLLM_MTP_SAMPLE_TIMING_LOGS", "0") == "1"
+        pp_rank = pp_world = pp_is_last = None
+        if mtp_debug_logs:
+            try:
+                pp = get_pp_group()
+                pp_rank = pp.rank
+                pp_world = pp.world_size
+                pp_is_last = pp.is_last_rank
+            except Exception:
+                pass
+            logger.warning(
+                "MTP worker output event: phase=enqueue_output_enter "
+                "rank=%s pp_rank=%s pp_world=%s is_last=%s output_type=%s",
+                self.rank,
+                pp_rank,
+                pp_world,
+                pp_is_last,
+                type(output).__name__,
+            )
         if isinstance(output, AsyncModelRunnerOutput):
+            if mtp_debug_logs:
+                logger.warning(
+                    "MTP worker output event: phase=async_get_output_enter "
+                    "rank=%s pp_rank=%s pp_world=%s is_last=%s",
+                    self.rank,
+                    pp_rank,
+                    pp_world,
+                    pp_is_last,
+                )
+            get_output_start = time.perf_counter()
             output = output.get_output()
+            if mtp_debug_logs:
+                logger.warning(
+                    "MTP worker output event: phase=async_get_output_done "
+                    "elapsed=%.3fs rank=%s pp_rank=%s pp_world=%s is_last=%s",
+                    time.perf_counter() - get_output_start,
+                    self.rank,
+                    pp_rank,
+                    pp_world,
+                    pp_is_last,
+                )
 
         if isinstance(output, Exception):
             result = (WorkerProc.ResponseStatus.FAILURE, str(output))
         else:
             result = (WorkerProc.ResponseStatus.SUCCESS, output)
         if (response_mq := self.worker_response_mq) is not None:
+            if mtp_debug_logs:
+                logger.warning(
+                    "MTP worker output event: phase=response_mq_enqueue_enter "
+                    "rank=%s pp_rank=%s pp_world=%s is_last=%s status=%s",
+                    self.rank,
+                    pp_rank,
+                    pp_world,
+                    pp_is_last,
+                    result[0].name,
+                )
             response_mq.enqueue(result)
+            if mtp_debug_logs:
+                logger.warning(
+                    "MTP worker output event: phase=response_mq_enqueue_done "
+                    "rank=%s pp_rank=%s pp_world=%s is_last=%s",
+                    self.rank,
+                    pp_rank,
+                    pp_world,
+                    pp_is_last,
+                )
 
     def handle_output(self, output: Any):
         """Handles output from the worker. If async scheduling is enabled,
         it is passed to the async_output_busy_loop thread. Otherwise, it is
         enqueued directly to the worker_response_mq.
         """
+        if os.environ.get("VLLM_MTP_SAMPLE_TIMING_LOGS", "0") == "1":
+            pp_rank = pp_world = pp_is_last = None
+            try:
+                pp = get_pp_group()
+                pp_rank = pp.rank
+                pp_world = pp.world_size
+                pp_is_last = pp.is_last_rank
+            except Exception:
+                pass
+            logger.warning(
+                "MTP worker output event: phase=handle_output_enter "
+                "rank=%s pp_rank=%s pp_world=%s is_last=%s "
+                "use_async_scheduling=%s output_type=%s",
+                self.rank,
+                pp_rank,
+                pp_world,
+                pp_is_last,
+                self.use_async_scheduling,
+                type(output).__name__,
+            )
         if self.use_async_scheduling:
             self.async_output_queue.put(output)
         else:
@@ -963,6 +1041,25 @@ class WorkerProc:
 
         while True:
             output = self.async_output_queue.get()
+            if os.environ.get("VLLM_MTP_SAMPLE_TIMING_LOGS", "0") == "1":
+                pp_rank = pp_world = pp_is_last = None
+                try:
+                    pp = get_pp_group()
+                    pp_rank = pp.rank
+                    pp_world = pp.world_size
+                    pp_is_last = pp.is_last_rank
+                except Exception:
+                    pass
+                logger.warning(
+                    "MTP worker output event: phase=async_output_queue_get_done "
+                    "rank=%s pp_rank=%s pp_world=%s is_last=%s "
+                    "output_type=%s",
+                    self.rank,
+                    pp_rank,
+                    pp_world,
+                    pp_is_last,
+                    type(output).__name__,
+                )
             self.enqueue_output(output)
 
     def worker_busy_loop(self):

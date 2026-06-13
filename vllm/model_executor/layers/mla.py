@@ -1,13 +1,76 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+import time
 from dataclasses import dataclass
 
 import torch
 
 from vllm.config import CacheConfig
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
+
+logger = init_logger(__name__)
+
+
+def _mtp_mla_debug_enabled(
+    prefix: str,
+    positions: torch.Tensor,
+) -> tuple[bool, int | None]:
+    if os.environ.get("VLLM_MTP_LAYER_DEBUG", "0") != "1":
+        return False, None
+    if ".layers." not in prefix:
+        return False, None
+    try:
+        layer_idx = int(prefix.split(".layers.", 1)[1].split(".", 1)[0])
+        min_layer = int(os.environ.get("VLLM_MTP_LAYER_DEBUG_MIN_LAYER", "80") or "80")
+    except (IndexError, ValueError):
+        return False, None
+    if layer_idx < min_layer:
+        return False, None
+    try:
+        min_pos = int(os.environ.get("VLLM_MTP_LAYER_DEBUG_MIN_POS", "49900") or "0")
+    except ValueError:
+        min_pos = 49900
+    max_pos = None
+    try:
+        flat = positions.reshape(-1)
+        if flat.numel() > 0:
+            max_pos = int(flat.max().detach().cpu().item())
+    except Exception:
+        max_pos = None
+    if max_pos is not None and max_pos < min_pos:
+        return False, max_pos
+    return True, max_pos
+
+
+def _mtp_mla_debug_start() -> float | None:
+    if os.environ.get("VLLM_MTP_LAYER_DEBUG", "0") != "1":
+        return None
+    return time.perf_counter()
+
+
+def _mtp_mla_debug_log(
+    phase: str,
+    prefix: str,
+    positions: torch.Tensor,
+    start: float | None = None,
+    **extra,
+) -> None:
+    enabled, max_pos = _mtp_mla_debug_enabled(prefix, positions)
+    if not enabled:
+        return
+    elapsed_ms = None if start is None else (time.perf_counter() - start) * 1000.0
+    logger.warning(
+        "MTP MLA debug: phase=%s prefix=%s max_pos=%s elapsed_ms=%s extra=%s",
+        phase,
+        prefix,
+        max_pos,
+        None if elapsed_ms is None else round(elapsed_ms, 3),
+        extra,
+    )
 
 
 @dataclass
@@ -116,6 +179,14 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        _mtp_mla_debug_log(
+            "enter",
+            self.prefix,
+            positions,
+            hidden_shape=tuple(hidden_states.shape),
+            sparse=self.is_sparse,
+            has_indexer=self.indexer is not None,
+        )
         q_c = None
         kv_lora = None
 
@@ -130,13 +201,37 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 "q_b_proj is required when q_lora_rank is not None"
             )
 
+            phase_start = _mtp_mla_debug_start()
             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+            _mtp_mla_debug_log(
+                "fused_qkv_a_proj_done",
+                self.prefix,
+                positions,
+                phase_start,
+                qkv_shape=tuple(qkv_lora.shape),
+            )
             q_c, kv_lora = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
             )
+            phase_start = _mtp_mla_debug_start()
             q_c = self.q_a_layernorm(q_c)
+            _mtp_mla_debug_log(
+                "q_a_layernorm_done",
+                self.prefix,
+                positions,
+                phase_start,
+                q_c_shape=tuple(q_c.shape),
+            )
+            phase_start = _mtp_mla_debug_start()
             q = self.q_b_proj(q_c)[0]
+            _mtp_mla_debug_log(
+                "q_b_proj_done",
+                self.prefix,
+                positions,
+                phase_start,
+                q_shape=tuple(q.shape),
+            )
         else:
             assert self.kv_a_proj_with_mqa is not None, (
                 "kv_a_proj_with_mqa is required when q_lora_rank is None"
@@ -155,23 +250,46 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         k_pe = k_pe.unsqueeze(1)
 
         if self.rotary_emb is not None:
+            phase_start = _mtp_mla_debug_start()
             q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
                 positions, q[..., self.qk_nope_head_dim :], k_pe
             )
+            _mtp_mla_debug_log("rotary_done", self.prefix, positions, phase_start)
 
         if self.indexer and self.is_sparse:
+            phase_start = _mtp_mla_debug_start()
+            _mtp_mla_debug_log("indexer_enter", self.prefix, positions)
             _topk_indices = self.indexer(
                 hidden_states, q_c, positions, self.indexer_rope_emb
             )
+            _mtp_mla_debug_log("indexer_done", self.prefix, positions, phase_start)
 
         if llama_4_scaling is not None:
             q *= llama_4_scaling
 
+        phase_start = _mtp_mla_debug_start()
+        _mtp_mla_debug_log("mla_attn_enter", self.prefix, positions)
         attn_out = self.mla_attn(
             q,
             kv_c_normed,
             k_pe,
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
         )
+        _mtp_mla_debug_log(
+            "mla_attn_done",
+            self.prefix,
+            positions,
+            phase_start,
+            attn_out_shape=tuple(attn_out.shape),
+        )
 
-        return self.o_proj(attn_out)[0]
+        phase_start = _mtp_mla_debug_start()
+        output = self.o_proj(attn_out)[0]
+        _mtp_mla_debug_log(
+            "o_proj_done",
+            self.prefix,
+            positions,
+            phase_start,
+            output_shape=tuple(output.shape),
+        )
+        return output

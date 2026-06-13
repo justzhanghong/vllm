@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -32,6 +33,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
+from vllm.sampling_params import SamplingType
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -181,6 +183,9 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+        self.prioritize_remote_kv_first_decode = (
+            os.environ.get("VLLM_PRIORITIZE_REMOTE_KV_FIRST_DECODE", "0") == "1"
+        )
 
         # Encoder-related.
         # Calculate encoder cache size if applicable
@@ -211,15 +216,29 @@ class Scheduler(SchedulerInterface):
         )
 
         speculative_config = vllm_config.speculative_config
+        self.spec_decode_method = None
         self.use_eagle = False
         self.num_spec_tokens = self.num_lookahead_tokens = 0
         if speculative_config:
+            self.spec_decode_method = speculative_config.method
             self.num_spec_tokens = speculative_config.num_speculative_tokens
             if speculative_config.use_eagle():
                 self.use_eagle = True
                 self.num_lookahead_tokens = self.num_spec_tokens
             if speculative_config.uses_draft_model():
                 self.num_lookahead_tokens = self.num_spec_tokens
+        self.mtp_max_drafter_seq_len = 0
+        if self.spec_decode_method == "mtp":
+            try:
+                self.mtp_max_drafter_seq_len = int(
+                    os.environ.get("VLLM_MTP_MAX_DRAFTER_SEQ_LEN", "0") or "0"
+                )
+            except ValueError:
+                self.mtp_max_drafter_seq_len = 0
+        self.mtp_greedy_only = (
+            self.spec_decode_method == "mtp"
+            and os.environ.get("VLLM_MTP_GREEDY_ONLY", "0") == "1"
+        )
 
         # Create the KV cache manager.
         self.kv_cache_manager = KVCacheManager(
@@ -294,6 +313,45 @@ class Scheduler(SchedulerInterface):
             )
 
         self._pause_state: PauseState = PauseState.UNPAUSED
+
+    def _allow_spec_decode_for_request(self, request: Request) -> bool:
+        if not self.mtp_greedy_only:
+            return True
+        sampling_params = request.sampling_params
+        return (
+            sampling_params is not None
+            and sampling_params.sampling_type == SamplingType.GREEDY
+        )
+
+    def _num_lookahead_tokens_for_request(self, request: Request) -> int:
+        if not self._allow_spec_decode_for_request(request):
+            return 0
+        return self.num_lookahead_tokens
+
+    def _sanitize_spec_token_ids_for_request(self, request: Request) -> None:
+        if not request.spec_token_ids:
+            return
+        if not self._allow_spec_decode_for_request(request):
+            request.spec_token_ids = []
+
+    def _disable_scheduled_mtp_for_mixed_sampling_batch(
+        self,
+        scheduled_reqs: list[Request],
+        num_scheduled_tokens: dict[str, int],
+        scheduled_spec_decode_tokens: dict[str, list[int]],
+    ) -> None:
+        if not self.mtp_greedy_only or not scheduled_spec_decode_tokens:
+            return
+        if all(self._allow_spec_decode_for_request(req) for req in scheduled_reqs):
+            return
+        for req_id, spec_token_ids in list(scheduled_spec_decode_tokens.items()):
+            num_scheduled_tokens[req_id] = max(
+                1, num_scheduled_tokens[req_id] - len(spec_token_ids)
+            )
+        scheduled_spec_decode_tokens.clear()
+        for req in scheduled_reqs:
+            if req.spec_token_ids:
+                req.spec_token_ids = []
 
     def _mamba_block_aligned_split(
         self,
@@ -379,11 +437,27 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
+        defer_running_for_remote_kv_first_decode = (
+            self._has_ready_remote_kv_first_decode()
+        )
+        if (
+            defer_running_for_remote_kv_first_decode
+            and os.environ.get("VLLM_MTP_SAMPLE_TIMING_LOGS", "0") == "1"
+        ):
+            logger.warning(
+                "Prioritizing remote-KV first decode over %d running requests",
+                len(self.running),
+            )
 
         # First, schedule the RUNNING requests.
         req_index = 0
-        while req_index < len(self.running) and token_budget > 0:
+        while (
+            req_index < len(self.running)
+            and token_budget > 0
+            and not defer_running_for_remote_kv_first_decode
+        ):
             request = self.running[req_index]
+            self._sanitize_spec_token_ids_for_request(request)
 
             if (
                 request.num_output_placeholders > 0
@@ -406,6 +480,26 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            if (
+                request.spec_token_ids
+                and self.mtp_max_drafter_seq_len > 0
+                and request.num_computed_tokens + num_new_tokens
+                >= self.mtp_max_drafter_seq_len
+            ):
+                num_spec_tokens = len(request.spec_token_ids)
+                num_new_tokens = max(0, num_new_tokens - num_spec_tokens)
+                request.spec_token_ids = []
+                if os.environ.get("VLLM_MTP_SAMPLE_TIMING_LOGS", "0") == "1":
+                    logger.warning(
+                        "MTP scheduler drafter guard: req_id=%s "
+                        "num_computed_tokens=%s num_new_tokens=%s "
+                        "dropped_spec_tokens=%s limit=%s",
+                        request.request_id,
+                        request.num_computed_tokens,
+                        num_new_tokens,
+                        num_spec_tokens,
+                        self.mtp_max_drafter_seq_len,
+                    )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
@@ -463,7 +557,9 @@ class Scheduler(SchedulerInterface):
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
+                        num_lookahead_tokens=(
+                            self._num_lookahead_tokens_for_request(request)
+                        ),
                     )
 
                     if new_blocks is not None:
@@ -573,6 +669,7 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                self._sanitize_spec_token_ids_for_request(request)
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -722,7 +819,9 @@ class Scheduler(SchedulerInterface):
                 # creates a mismatch between the number
                 # of local and remote blocks.
                 effective_lookahead_tokens = (
-                    0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
+                    0
+                    if request.num_computed_tokens == 0
+                    else self._num_lookahead_tokens_for_request(request)
                 )
 
                 # Determine if we need to allocate cross-attention blocks.
@@ -855,6 +954,11 @@ class Scheduler(SchedulerInterface):
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
 
         # Check if the scheduling constraints are satisfied.
+        self._disable_scheduled_mtp_for_mixed_sampling_batch(
+            scheduled_running_reqs + scheduled_resumed_reqs + scheduled_new_reqs,
+            num_scheduled_tokens,
+            scheduled_spec_decode_tokens,
+        )
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
 
@@ -1567,6 +1671,23 @@ class Scheduler(SchedulerInterface):
             RequestStatus.WAITING_FOR_STREAMING_REQ,
         )
 
+    def _has_ready_remote_kv_first_decode(self) -> bool:
+        if (
+            not self.prioritize_remote_kv_first_decode
+            or not self.finished_recving_kv_req_ids
+        ):
+            return False
+
+        for queue in (self.skipped_waiting, self.waiting):
+            for request in queue:
+                if (
+                    request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+                    and request.request_id in self.finished_recving_kv_req_ids
+                    and request.num_output_tokens == 0
+                ):
+                    return True
+        return False
+
     def _enqueue_waiting_request(self, request: Request) -> None:
         if self._is_blocked_waiting_status(request.status):
             self.skipped_waiting.add_request(request)
@@ -1680,6 +1801,11 @@ class Scheduler(SchedulerInterface):
                 # The request may have been finished. Skip.
                 continue
 
+            if not self._allow_spec_decode_for_request(request):
+                if request.spec_token_ids:
+                    request.spec_token_ids = []
+                continue
+
             if request.is_prefill_chunk:
                 # Ignore draft tokens for prefill chunks.
                 if request.spec_token_ids:
@@ -1707,6 +1833,12 @@ class Scheduler(SchedulerInterface):
                 # The request may have been finished. Skip.
                 continue
 
+            if not self._allow_spec_decode_for_request(request):
+                sched_spec_tokens.pop(req_id, None)
+                if request.spec_token_ids:
+                    request.spec_token_ids = []
+                continue
+
             placeholder_spec_tokens = sched_spec_tokens.get(req_id)
             if not placeholder_spec_tokens:
                 continue
@@ -1715,6 +1847,7 @@ class Scheduler(SchedulerInterface):
             # Trim drafts to scheduled number of spec tokens
             # (needed for chunked prefill case for example).
             del spec_token_ids[orig_num_spec_tokens:]
+            spec_token_ids = [token_id for token_id in spec_token_ids if token_id >= 0]
             # Filter out spec tokens which do not adhere to the grammar.
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request

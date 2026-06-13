@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+import time
 import typing
 from collections.abc import Callable, Iterable
 
@@ -35,9 +37,56 @@ from .deepseek_v2 import (
     _try_load_fp8_indexer_wk,
     get_spec_layer_idx_from_weight_name,
 )
+from .interfaces import SupportsPP
 from .utils import maybe_prefix
 
 logger = init_logger(__name__)
+
+
+def _mtp_layer_debug_enabled(positions: torch.Tensor) -> tuple[bool, int | None]:
+    if os.environ.get("VLLM_MTP_LAYER_DEBUG", "0") != "1":
+        return False, None
+    try:
+        min_pos = int(os.environ.get("VLLM_MTP_LAYER_DEBUG_MIN_POS", "49900") or "0")
+    except ValueError:
+        min_pos = 49900
+    max_pos = None
+    try:
+        flat = positions.reshape(-1)
+        if flat.numel() > 0:
+            max_pos = int(flat.max().detach().cpu().item())
+    except Exception:
+        max_pos = None
+    if max_pos is not None and max_pos < min_pos:
+        return False, max_pos
+    return True, max_pos
+
+
+def _mtp_layer_debug_start() -> float | None:
+    if os.environ.get("VLLM_MTP_LAYER_DEBUG", "0") != "1":
+        return None
+    return time.perf_counter()
+
+
+def _mtp_layer_debug_log(
+    phase: str,
+    prefix: str,
+    positions: torch.Tensor,
+    start: float | None = None,
+    **extra: typing.Any,
+) -> None:
+    enabled, max_pos = _mtp_layer_debug_enabled(positions)
+    if not enabled:
+        return
+    elapsed_ms = None if start is None else (time.perf_counter() - start) * 1000.0
+    logger.warning(
+        "MTP layer debug: phase=%s prefix=%s max_pos=%s elapsed_ms=%s extra=%s",
+        phase,
+        prefix,
+        max_pos,
+        None if elapsed_ms is None else round(elapsed_ms, 3),
+        extra,
+    )
 
 
 class SharedHead(nn.Module):
@@ -73,6 +122,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
 
         self.device = current_platform.device_type
+        self.prefix = prefix
 
         self.is_v32 = hasattr(config, "index_topk")
         if self.is_v32:
@@ -105,19 +155,53 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         spec_step_index: int = 0,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
+        _mtp_layer_debug_log(
+            "predictor_layer_enter",
+            self.prefix,
+            positions,
+            input_shape=tuple(input_ids.shape),
+            position_shape=tuple(positions.shape),
+            hidden_shape=tuple(previous_hidden_states.shape),
+        )
+        phase_start = _mtp_layer_debug_start()
         # masking inputs at position 0, as not needed by MTP
         inputs_embeds = torch.where(positions.unsqueeze(-1) == 0, 0, inputs_embeds)
         inputs_embeds = self.enorm(inputs_embeds)
         previous_hidden_states = self.hnorm(previous_hidden_states)
+        _mtp_layer_debug_log("norms_done", self.prefix, positions, phase_start)
 
+        phase_start = _mtp_layer_debug_start()
         hidden_states = self.eh_proj(
             torch.cat([inputs_embeds, previous_hidden_states], dim=-1)
         )
+        _mtp_layer_debug_log(
+            "eh_proj_done",
+            self.prefix,
+            positions,
+            phase_start,
+            hidden_shape=tuple(hidden_states.shape),
+        )
 
+        phase_start = _mtp_layer_debug_start()
+        _mtp_layer_debug_log("mtp_block_enter", self.prefix, positions)
         hidden_states, residual = self.mtp_block(
             positions=positions, hidden_states=hidden_states, residual=None
         )
+        _mtp_layer_debug_log(
+            "mtp_block_done",
+            self.prefix,
+            positions,
+            phase_start,
+            hidden_shape=tuple(hidden_states.shape),
+            residual_shape=tuple(residual.shape),
+        )
         hidden_states = residual + hidden_states
+        _mtp_layer_debug_log(
+            "predictor_layer_return",
+            self.prefix,
+            positions,
+            output_shape=tuple(hidden_states.shape),
+        )
         return hidden_states
 
 
@@ -181,9 +265,20 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         )
         return logits
 
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
+        return self.logits_processor.get_top_tokens(
+            mtp_layer.shared_head.head, mtp_layer.shared_head(hidden_states)
+        )
+
 
 @support_torch_compile
-class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
+class DeepSeekMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
@@ -236,6 +331,13 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
 
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        return self.model.get_top_tokens(hidden_states, spec_step_idx)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         rocm_aiter_moe_shared_expert_enabled = (
             rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
@@ -273,13 +375,16 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-            spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
-            if spec_layer is None:
-                continue
+            if name == "model.embed_tokens.weight":
+                spec_layer = self.model.mtp_start_layer_idx
+            else:
+                spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
+                if spec_layer is None:
+                    continue
+                name = self._rewrite_spec_layer_name(spec_layer, name)
             is_fusion_moe_shared_experts_layer = (
                 rocm_aiter_moe_shared_expert_enabled and ("mlp.shared_experts" in name)
             )
-            name = self._rewrite_spec_layer_name(spec_layer, name)
 
             if _try_load_fp8_indexer_wk(
                 name, loaded_weight, _pending_wk_fp8, params_dict, loaded_params
