@@ -5211,6 +5211,13 @@ class GPUModelRunner(
             ):
                 input_fits_in_drafter = False
                 log_mtp_event("mtp_greedy_only_skip_draft")
+            if (
+                input_fits_in_drafter
+                and self.use_aux_hidden_state_outputs
+                and (aux_hidden_states is None or len(aux_hidden_states) == 0)
+            ):
+                input_fits_in_drafter = False
+                log_mtp_event("mtp_skip_draft_no_aux_hidden_states")
             mtp_skip_block_boundary_tokens = 0
             if getattr(spec_config, "method", None) == "mtp":
                 try:
@@ -5789,6 +5796,20 @@ class GPUModelRunner(
                 return True
             if self._should_use_async_sampled_token_broadcast(sampled_token_ids):
                 with _pp_boundary_scope("sampled_token.async_broadcast_issue"):
+                    self.pp_sampled_token_ids_send_ref = sampled_token_ids
+                    self.pp_sampled_token_broadcast_handle = (
+                        torch.distributed.broadcast(
+                            sampled_token_ids,
+                            src=pp.rank,
+                            group=pp.device_group,
+                            async_op=True,
+                        )
+                    )
+                return True
+            if is_mtp_state and envs.VLLM_PP_ASYNC_SAMPLED_TOKEN_BROADCAST:
+                with _pp_boundary_scope(
+                    "sampled_token.mtp_state_async_broadcast_issue"
+                ):
                     self.pp_sampled_token_ids_send_ref = sampled_token_ids
                     self.pp_sampled_token_broadcast_handle = (
                         torch.distributed.broadcast(
