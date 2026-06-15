@@ -60,6 +60,22 @@ if TYPE_CHECKING:
     VLLM_PP_BROADCAST_SAMPLED_TOKEN_ONLY: bool = False
     VLLM_PP_DIRECT_RECV_INTERMEDIATE: bool = False
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
+    VLLM_MTP_SAMPLE_TIMING_LOGS: bool = False
+    VLLM_MTP_SAMPLE_TIMING_THRESHOLD_S: float = 0.050
+    VLLM_MTP_EARLY_DEFERRED_CORRECTIONS: bool = False
+    VLLM_MTP_SYNC_VALID_COUNT_COPY: bool = False
+    VLLM_MTP_MAX_DRAFTER_SEQ_LEN: int = 0
+    VLLM_MTP_GREEDY_ONLY: bool = False
+    VLLM_MTP_SYNC_ASYNC_OUTPUT: bool = False
+    VLLM_MTP_PRESTART_ASYNC_OUTPUT_COPY: bool = False
+    VLLM_MTP_SKIP_FIRST_DRAFT: bool = False
+    VLLM_MTP_SKIP_BLOCK_BOUNDARY_TOKENS: int = 0
+    VLLM_MTP_SKIP_BLOCK_OFFSET_RANGES: str = ""
+    VLLM_MTP_ACCEPTANCE_LOG_EVERY: int = 0
+    VLLM_MTP_LAYER_DEBUG: bool = False
+    VLLM_MTP_LAYER_DEBUG_MIN_POS: int = 49900
+    VLLM_MTP_LAYER_DEBUG_MIN_LAYER: int = 80
+    VLLM_PRIORITIZE_REMOTE_KV_FIRST_DECODE: bool = False
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
     VLLM_CPU_SGL_KERNEL: bool = False
@@ -605,6 +621,55 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # a Stage50 stability probe for outputs crossing PP/sampling boundaries.
     "VLLM_FULL_CUDAGRAPH_STRONG_OUTPUT": lambda: bool(
         int(os.getenv("VLLM_FULL_CUDAGRAPH_STRONG_OUTPUT") or "0")
+    ),
+    # MTP speculative decoding probes and guards used by local Stage runs.
+    "VLLM_MTP_SAMPLE_TIMING_LOGS": lambda: bool(
+        int(os.getenv("VLLM_MTP_SAMPLE_TIMING_LOGS", "0"))
+    ),
+    "VLLM_MTP_SAMPLE_TIMING_THRESHOLD_S": lambda: float(
+        os.getenv("VLLM_MTP_SAMPLE_TIMING_THRESHOLD_S", "0.050")
+    ),
+    "VLLM_MTP_EARLY_DEFERRED_CORRECTIONS": lambda: bool(
+        int(os.getenv("VLLM_MTP_EARLY_DEFERRED_CORRECTIONS", "0"))
+    ),
+    "VLLM_MTP_SYNC_VALID_COUNT_COPY": lambda: bool(
+        int(os.getenv("VLLM_MTP_SYNC_VALID_COUNT_COPY", "0"))
+    ),
+    "VLLM_MTP_MAX_DRAFTER_SEQ_LEN": lambda: int(
+        os.getenv("VLLM_MTP_MAX_DRAFTER_SEQ_LEN") or "0"
+    ),
+    "VLLM_MTP_GREEDY_ONLY": lambda: bool(
+        int(os.getenv("VLLM_MTP_GREEDY_ONLY", "0"))
+    ),
+    "VLLM_MTP_SYNC_ASYNC_OUTPUT": lambda: bool(
+        int(os.getenv("VLLM_MTP_SYNC_ASYNC_OUTPUT", "0"))
+    ),
+    "VLLM_MTP_PRESTART_ASYNC_OUTPUT_COPY": lambda: bool(
+        int(os.getenv("VLLM_MTP_PRESTART_ASYNC_OUTPUT_COPY", "0"))
+    ),
+    "VLLM_MTP_SKIP_FIRST_DRAFT": lambda: bool(
+        int(os.getenv("VLLM_MTP_SKIP_FIRST_DRAFT", "0"))
+    ),
+    "VLLM_MTP_SKIP_BLOCK_BOUNDARY_TOKENS": lambda: int(
+        os.getenv("VLLM_MTP_SKIP_BLOCK_BOUNDARY_TOKENS") or "0"
+    ),
+    "VLLM_MTP_SKIP_BLOCK_OFFSET_RANGES": lambda: os.getenv(
+        "VLLM_MTP_SKIP_BLOCK_OFFSET_RANGES", ""
+    ),
+    "VLLM_MTP_ACCEPTANCE_LOG_EVERY": lambda: int(
+        os.getenv("VLLM_MTP_ACCEPTANCE_LOG_EVERY") or "0"
+    ),
+    "VLLM_MTP_LAYER_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_MTP_LAYER_DEBUG", "0"))
+    ),
+    "VLLM_MTP_LAYER_DEBUG_MIN_POS": lambda: int(
+        os.getenv("VLLM_MTP_LAYER_DEBUG_MIN_POS") or "49900"
+    ),
+    "VLLM_MTP_LAYER_DEBUG_MIN_LAYER": lambda: int(
+        os.getenv("VLLM_MTP_LAYER_DEBUG_MIN_LAYER") or "80"
+    ),
+    "VLLM_PRIORITIZE_REMOTE_KV_FIRST_DECODE": lambda: bool(
+        int(os.getenv("VLLM_PRIORITIZE_REMOTE_KV_FIRST_DECODE", "0"))
     ),
     # Override PP async batch queue depth. 0 preserves the executor default,
     # which uses pp_size concurrent batches for pipeline parallelism.

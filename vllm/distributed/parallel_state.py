@@ -71,6 +71,21 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 _TENSOR_DICT_METADATA_CACHE_SENTINEL = "__vllm_tensor_dict_metadata_cache_v1__"
 
 
+def _get_distributed_group_timeout() -> timedelta | None:
+    try:
+        from vllm.config import get_current_vllm_config_or_none
+
+        config = get_current_vllm_config_or_none()
+        if config is None:
+            return None
+        timeout_s = config.parallel_config.distributed_timeout_seconds
+        if timeout_s is None:
+            return None
+        return timedelta(seconds=timeout_s)
+    except Exception:
+        return None
+
+
 def _pp_boundary_scope(name: str) -> contextlib.AbstractContextManager[Any]:
     if not envs.VLLM_PP_BOUNDARY_PROFILING:
         return nullcontext()
@@ -349,15 +364,18 @@ class GroupCoordinator:
         enable_pp_sampled_token_pair_p2p = (
             group_name == "pp" and envs.VLLM_PP_SAMPLED_TOKEN_PAIR_P2P
         )
+        group_timeout = _get_distributed_group_timeout()
 
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
+                ranks, backend=torch_distributed_backend, timeout=group_timeout
             )
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
             with suppress_stdout():
-                cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+                cpu_group = torch.distributed.new_group(
+                    ranks, backend="gloo", timeout=group_timeout
+                )
             if self.rank in ranks:
                 self.ranks = ranks
                 self.world_size = len(ranks)
@@ -377,13 +395,16 @@ class GroupCoordinator:
                     pair_group = torch.distributed.new_group(
                         [rank, ranks[peer_index]],
                         backend=torch_distributed_backend,
+                        timeout=group_timeout,
                     )
                     if self.rank in (rank, ranks[peer_index]):
                         self_tensor_dict_pair_device_groups[pair_key] = pair_group
             if enable_pp_sampled_token_pair_p2p and len(ranks) > 1:
                 pair_ranks = [ranks[0], ranks[-1]]
                 pair_group = torch.distributed.new_group(
-                    pair_ranks, backend=torch_distributed_backend
+                    pair_ranks,
+                    backend=torch_distributed_backend,
+                    timeout=group_timeout,
                 )
                 if self.rank in pair_ranks:
                     self_sampled_token_pair_device_group = pair_group

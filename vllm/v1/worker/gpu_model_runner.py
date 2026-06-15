@@ -5167,14 +5167,18 @@ class GPUModelRunner(
                         if discard_mask[req_idx]:
                             continue
                         req_state = self.requests.get(req_id)
-                        if req_state is None or req_state.output_token_ids:
+                        if req_state is None:
                             continue
-                        if (
-                            self.input_batch.num_computed_tokens_cpu[req_idx]
-                            >= self.input_batch.num_prompt_tokens[req_idx]
-                        ):
-                            skip_first_mtp_draft = True
-                            break
+                        output_len = len(req_state.output_token_ids)
+                        if output_len > 1:
+                            continue
+                        # In 1P1D decode, remote KV first decode can still
+                        # report num_computed_tokens < num_prompt_tokens while
+                        # the current step has sampled token_1. This check runs
+                        # after request state update, so token_1 may already be
+                        # present in output_token_ids.
+                        skip_first_mtp_draft = True
+                        break
                 if skip_first_mtp_draft:
                     input_fits_in_drafter = False
                     log_mtp_event("mtp_skip_first_draft")
