@@ -79,6 +79,9 @@ class SpecDecodeBaseProposer:
         self.max_model_len = vllm_config.model_config.max_model_len
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
+        draft_hf_config = getattr(self.draft_model_config, "hf_config", None)
+        self._share_mtp_indices = getattr(
+            draft_hf_config, "index_share_for_mtp_iteration", False)
 
         # We need to get the hidden size from the draft model config because
         # the draft model's hidden size can be different from the target model's
@@ -553,6 +556,9 @@ class SpecDecodeBaseProposer:
             num_input_tokens=num_input_tokens,
             slot_mapping_size=slot_mapping_size,
         )
+        if self._share_mtp_indices and hasattr(self.model.model,
+                                               "set_skip_topk"):
+            self.model.model.set_skip_topk(False)
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -569,6 +575,9 @@ class SpecDecodeBaseProposer:
                 hidden_states = last_hidden_states
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
+        if self._share_mtp_indices and hasattr(self.model.model,
+                                               "set_skip_topk"):
+            self.model.model.set_skip_topk(True)
         log_mtp_proposer_event(
             "model_forward_first_pass_done",
             phase_start,

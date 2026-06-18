@@ -734,6 +734,43 @@ class Indexer(nn.Module):
         return self.indexer_op(hidden_states, q_fp8, k, weights)
 
 
+class SharedTopKIndexer(nn.Module):
+    """Sparse-attention handle for layers reusing a previous full indexer."""
+
+    def __init__(self, topk_tokens: int, topk_indices_buffer: torch.Tensor):
+        super().__init__()
+        self.topk_tokens = topk_tokens
+        self.topk_indices_buffer = topk_indices_buffer
+
+
+def _parse_layer_idx_from_prefix(prefix: str) -> int | None:
+    parts = prefix.split(".")
+    for idx, part in enumerate(parts[:-1]):
+        if part == "layers":
+            try:
+                return int(parts[idx + 1])
+            except ValueError:
+                return None
+    return None
+
+
+def _get_indexer_type(
+    config: DeepseekV2Config | DeepseekV3Config,
+    layer_idx: int | None,
+) -> str:
+    if os.environ.get("VLLM_GLM52_INDEX_SHARE", "1") == "0":
+        return "full"
+    if layer_idx is None:
+        return "full"
+    indexer_types = getattr(config, "indexer_types", None)
+    if indexer_types is not None and 0 <= layer_idx < len(indexer_types):
+        return str(indexer_types[layer_idx])
+    # GLM-5.2 MTP layer has its own indexer weights after the base layers.
+    if layer_idx >= getattr(config, "num_hidden_layers", 0):
+        return "full"
+    return "full"
+
+
 def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
     """
     We fuse the WK and weights_proj projections, but in some checkpoints WK is stored
@@ -984,24 +1021,41 @@ class DeepseekV2MLAAttention(nn.Module):
             self.scaling = self.scaling * mscale * mscale
 
         self.is_v32 = hasattr(config, "index_topk")
+        self.indexer_type = "full"
+        self.indexer_should_update = True
 
         if self.is_v32:
-            self.indexer_rope_emb = get_rope(
-                qk_rope_head_dim,
-                max_position=max_position_embeddings,
-                rope_parameters=config.rope_parameters,
-                is_neox_style=not getattr(config, "indexer_rope_interleave", False),
+            self.indexer_type = _get_indexer_type(
+                config, _parse_layer_idx_from_prefix(prefix)
             )
-            self.indexer = Indexer(
-                vllm_config,
-                config,
-                hidden_size,
-                q_lora_rank,
-                quant_config,
-                cache_config,
-                topk_indices_buffer,
-                f"{prefix}.indexer",
-            )
+            self.indexer_should_update = self.indexer_type != "shared"
+            if self.indexer_should_update:
+                self.indexer_rope_emb = get_rope(
+                    qk_rope_head_dim,
+                    max_position=max_position_embeddings,
+                    rope_parameters=config.rope_parameters,
+                    is_neox_style=not getattr(
+                        config, "indexer_rope_interleave", False
+                    ),
+                )
+                self.indexer = Indexer(
+                    vllm_config,
+                    config,
+                    hidden_size,
+                    q_lora_rank,
+                    quant_config,
+                    cache_config,
+                    topk_indices_buffer,
+                    f"{prefix}.indexer",
+                )
+            else:
+                assert topk_indices_buffer is not None, (
+                    "Shared sparse indexer requires a topk index buffer"
+                )
+                self.indexer_rope_emb = None
+                self.indexer = SharedTopKIndexer(
+                    config.index_topk, topk_indices_buffer
+                )
         else:
             self.indexer_rope_emb = None
             self.indexer = None
@@ -1024,6 +1078,7 @@ class DeepseekV2MLAAttention(nn.Module):
             indexer_rotary_emb=self.indexer_rope_emb,
             is_sparse=self.is_v32,
             topk_indices_buffer=topk_indices_buffer,
+            indexer_should_update=self.indexer_should_update,
         )
 
         self.mla_attn = MultiHeadLatentAttentionWrapper(

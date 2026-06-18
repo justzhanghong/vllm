@@ -89,6 +89,7 @@ class MLAModules:
     indexer: torch.nn.Module | None
     is_sparse: bool
     topk_indices_buffer: torch.Tensor | None
+    indexer_should_update: bool = True
     indexer_rotary_emb: torch.nn.Module | None = None
 
 
@@ -149,6 +150,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.indexer = mla_modules.indexer
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
         self.is_sparse = mla_modules.is_sparse
+        self.indexer_should_update = mla_modules.indexer_should_update
+        self.skip_topk = False
 
         if self.indexer is not None:
             assert hasattr(self.indexer, "topk_tokens")
@@ -256,7 +259,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
             _mtp_mla_debug_log("rotary_done", self.prefix, positions, phase_start)
 
-        if self.indexer and self.is_sparse:
+        if (self.indexer_should_update and not self.skip_topk and self.indexer
+                and self.is_sparse):
             phase_start = _mtp_mla_debug_start()
             _mtp_mla_debug_log("indexer_enter", self.prefix, positions)
             _topk_indices = self.indexer(

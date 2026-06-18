@@ -231,6 +231,23 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
+    def set_skip_topk(self, skip: bool):
+        """Toggle sparse indexer computation for MTP IndexShare.
+
+        GLM-5.2 sets index_share_for_mtp_iteration so MTP step 0 computes
+        topk indices and later draft steps reuse the same buffer.
+        """
+        for layer in self.layers.values():
+            mtp_block = getattr(layer, "mtp_block", None)
+            if mtp_block is None:
+                continue
+            self_attn = getattr(mtp_block, "self_attn", None)
+            if self_attn is None:
+                continue
+            mla_attn = getattr(self_attn, "mla_attn", None)
+            if mla_attn is not None and hasattr(mla_attn, "skip_topk"):
+                mla_attn.skip_topk = skip
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
