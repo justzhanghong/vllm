@@ -466,7 +466,7 @@ def _sparse_mla_compute_tile(
     ASSUME_VALID_AFTER_TOPK: tl.constexpr,
     ASSUME_VALID_AFTER_TOPK_NOMASK: tl.constexpr,
     ASSUME_PREFIX_LEN_MASK: tl.constexpr,
-    VALID_INDEX_BASE_SEQ_LEN: tl.constexpr,
+    VALID_INDEX_BASE_SEQ_LEN,
     INDEX_TOPK: tl.constexpr,
 ):
     """Shared stage-1 body: load Q, run the sparse online-softmax loop over
@@ -778,7 +778,7 @@ def _sparse_mla_kernel_final(
     ASSUME_VALID_AFTER_TOPK: tl.constexpr,
     ASSUME_VALID_AFTER_TOPK_NOMASK: tl.constexpr,
     ASSUME_PREFIX_LEN_MASK: tl.constexpr,
-    VALID_INDEX_BASE_SEQ_LEN: tl.constexpr,
+    VALID_INDEX_BASE_SEQ_LEN,
 ):
     """Single-pass fast path: full topk, write final bf16 output directly."""
     cur_q = tl.program_id(0)
@@ -877,7 +877,6 @@ def _sparse_mla_kernel_final_static(
     lse_ptr,
     seq_kv,
     h_q,
-    num_tokens: tl.constexpr,
     stride_q_nope_token,
     stride_q_nope_head,
     stride_q_pe_token,
@@ -911,7 +910,7 @@ def _sparse_mla_kernel_final_static(
     ASSUME_VALID_AFTER_TOPK: tl.constexpr,
     ASSUME_VALID_AFTER_TOPK_NOMASK: tl.constexpr,
     ASSUME_PREFIX_LEN_MASK: tl.constexpr,
-    VALID_INDEX_BASE_SEQ_LEN: tl.constexpr,
+    VALID_INDEX_BASE_SEQ_LEN,
 ):
     """Single-pass final kernel with caller-selected static launch config."""
     cur_q = tl.program_id(0)
@@ -1009,7 +1008,6 @@ def _sparse_mla_kernel_final_dv_tile_static(
     lse_ptr,
     seq_kv,
     h_q,
-    num_tokens: tl.constexpr,
     stride_q_nope_token,
     stride_q_nope_head,
     stride_q_pe_token,
@@ -1043,7 +1041,7 @@ def _sparse_mla_kernel_final_dv_tile_static(
     ASSUME_VALID_AFTER_TOPK: tl.constexpr,
     ASSUME_VALID_AFTER_TOPK_NOMASK: tl.constexpr,
     ASSUME_PREFIX_LEN_MASK: tl.constexpr,
-    VALID_INDEX_BASE_SEQ_LEN: tl.constexpr,
+    VALID_INDEX_BASE_SEQ_LEN,
 ):
     """Decode-M=1 final kernel split across output-DV tiles."""
     cur_q = tl.program_id(0)
@@ -1389,7 +1387,7 @@ def _sparse_mla_kernel_split(
     ASSUME_VALID_AFTER_TOPK: tl.constexpr,
     ASSUME_VALID_AFTER_TOPK_NOMASK: tl.constexpr,
     ASSUME_PREFIX_LEN_MASK: tl.constexpr,
-    VALID_INDEX_BASE_SEQ_LEN: tl.constexpr,
+    VALID_INDEX_BASE_SEQ_LEN,
 ):
     """Stage 1 of split-KV: process one slice of the topk axis and write
     its `(out_partial, lse_partial)` into the mid buffer."""
@@ -1861,7 +1859,6 @@ def triton_sparse_mla_attention(
                 lse_ptr=lse_ptr,
                 seq_kv=kv.shape[0],
                 h_q=num_heads_q,
-                num_tokens=num_tokens,
                 stride_q_nope_token=q_nope.stride(0),
                 stride_q_nope_head=q_nope.stride(1),
                 stride_q_pe_token=q_pe.stride(0),
@@ -1919,7 +1916,6 @@ def triton_sparse_mla_attention(
                 lse_ptr=lse_ptr,
                 seq_kv=kv.shape[0],
                 h_q=num_heads_q,
-                num_tokens=num_tokens,
                 stride_q_nope_token=q_nope.stride(0),
                 stride_q_nope_head=q_nope.stride(1),
                 stride_q_pe_token=q_pe.stride(0),
@@ -1978,7 +1974,6 @@ def triton_sparse_mla_attention(
                 lse_ptr=lse_ptr,
                 seq_kv=kv.shape[0],
                 h_q=num_heads_q,
-                num_tokens=num_tokens,
                 stride_q_nope_token=q_nope.stride(0),
                 stride_q_nope_head=q_nope.stride(1),
                 stride_q_pe_token=q_pe.stride(0),

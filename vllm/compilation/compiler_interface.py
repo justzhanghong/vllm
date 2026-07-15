@@ -24,6 +24,80 @@ from vllm.utils.torch_utils import is_torch_equal_or_newer
 logger = init_logger(__name__)
 
 
+def _glm52_disable_inductor_autotune() -> bool:
+    value = os.environ.get("GLM52_DISABLE_INDUCTOR_AUTOTUNE", "1").lower()
+    return value not in ("0", "false", "no", "off")
+
+
+def _patch_glm52_triton_autotuner() -> None:
+    """Avoid runtime Triton benchmark sweeps in loaded Inductor artifacts."""
+    if not _glm52_disable_inductor_autotune():
+        return
+    try:
+        from torch._inductor.runtime import triton_heuristics
+
+        autotuner_cls = getattr(triton_heuristics, "CachingAutotuner", None)
+        if autotuner_cls is None or getattr(
+            autotuner_cls, "_glm52_no_runtime_autotune", False
+        ):
+            return
+
+        original_benchmark_all_configs = autotuner_cls.benchmark_all_configs
+        original_autotune_to_one_config = autotuner_cls.autotune_to_one_config
+
+        def benchmark_all_configs(self, *args: Any, **kwargs: Any) -> dict[Any, float]:
+            if not _glm52_disable_inductor_autotune():
+                return original_benchmark_all_configs(self, *args, **kwargs)
+            if not getattr(self, "launchers", None):
+                return original_benchmark_all_configs(self, *args, **kwargs)
+            return {self.launchers[0]: 0.0}
+
+        def autotune_to_one_config(self, *args: Any, **kwargs: Any) -> None:
+            if not _glm52_disable_inductor_autotune():
+                return original_autotune_to_one_config(self, *args, **kwargs)
+            if not getattr(self, "launchers", None):
+                return original_autotune_to_one_config(self, *args, **kwargs)
+            self.launchers = [self.launchers[0]]
+            self.autotune_time_taken_ns = getattr(
+                self, "precompile_time_taken_ns", 0
+            )
+            save_cache_hook = getattr(self, "save_cache_hook", None)
+            if save_cache_hook is not None:
+                save_cache_hook(self.launchers[0].config, self.autotune_time_taken_ns)
+            return None
+
+        autotuner_cls._glm52_original_benchmark_all_configs = (
+            original_benchmark_all_configs
+        )
+        autotuner_cls._glm52_original_autotune_to_one_config = (
+            original_autotune_to_one_config
+        )
+        autotuner_cls.benchmark_all_configs = benchmark_all_configs
+        autotuner_cls.autotune_to_one_config = autotune_to_one_config
+        autotuner_cls._glm52_no_runtime_autotune = True
+    except Exception:
+        logger.exception("Failed to patch GLM52 Triton runtime autotuner")
+
+
+def _apply_glm52_inductor_safety_config(config: dict[str, Any] | None = None) -> None:
+    """Disable Inductor autotune sweeps that can fault during GLM-5.2 profile."""
+    if not _glm52_disable_inductor_autotune():
+        return
+    _patch_glm52_triton_autotuner()
+    if config is not None:
+        config["max_autotune"] = False
+        config["coordinate_descent_tuning"] = False
+        config["triton.autotune_pointwise"] = False
+    try:
+        from torch._inductor import config as inductor_config
+
+        inductor_config.max_autotune = False
+        inductor_config.coordinate_descent_tuning = False
+        inductor_config.triton.autotune_pointwise = False
+    except Exception:
+        logger.exception("Failed to apply GLM52 Inductor safety config")
+
+
 class CompilerInterface:
     """
     The interface for a compiler that can be used by vLLM.
@@ -164,6 +238,7 @@ def _get_vllm_functorch_config() -> dict[str, Any]:
 
 
 def get_inductor_factors() -> list[Any]:
+    _apply_glm52_inductor_safety_config()
     factors: list[Any] = []
     # summarize system state
     from torch._inductor.codecache import CacheBase
@@ -421,6 +496,7 @@ class InductorStandaloneAdaptor(CompilerInterface):
         assert isinstance(handle[0], str)
         assert isinstance(handle[1], str)
         path = handle[1]
+        _apply_glm52_inductor_safety_config()
         inductor_compiled_graph = torch._inductor.CompiledArtifact.load(
             path=path, format=self.save_format
         )
@@ -665,6 +741,7 @@ class InductorAdaptor(CompilerInterface):
         assert isinstance(handle[0], str)
         assert isinstance(handle[1], str)
         hash_str = handle[0]
+        _apply_glm52_inductor_safety_config()
 
         from torch._functorch._aot_autograd.autograd_cache import AOTAutogradCache
         from torch._inductor.codecache import FxGraphCache
@@ -747,13 +824,15 @@ class InductorAdaptor(CompilerInterface):
 
 
 def set_inductor_config(config: dict[str, Any], compile_range: Range) -> None:
+    _apply_glm52_inductor_safety_config(config)
     if compile_range.is_single_size():
         # for a specific batch size, tuning triton kernel parameters
         # can be beneficial
-        config["max_autotune"] = envs.VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE
-        config["coordinate_descent_tuning"] = (
-            envs.VLLM_ENABLE_INDUCTOR_COORDINATE_DESCENT_TUNING
-        )
+        if not _glm52_disable_inductor_autotune():
+            config["max_autotune"] = envs.VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE
+            config["coordinate_descent_tuning"] = (
+                envs.VLLM_ENABLE_INDUCTOR_COORDINATE_DESCENT_TUNING
+            )
 
 
 def set_functorch_config() -> None:

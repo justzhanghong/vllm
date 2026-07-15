@@ -3,6 +3,7 @@
 """Custom Sparse Attention Indexer layers."""
 
 import os
+import time
 
 import torch
 
@@ -113,6 +114,21 @@ _SKIP_PREFILL_TOPK_CLEAR = _env_flag(
     "VLLM_SPARSE_INDEXER_SKIP_PREFILL_TOPK_CLEAR"
 )
 _SKIP_DECODE_TOPK_CLEAR = _env_flag("VLLM_SPARSE_INDEXER_SKIP_DECODE_TOPK_CLEAR")
+_PREFILL_SHAPE_BUCKET_TRACE = _env_flag("VLLM_PREFILL_SHAPE_BUCKET_TRACE")
+_PREFILL_MQA_CANONICAL_M = _env_int(
+    "VLLM_MQA_CUDA_V7_FUSED_TRITON_PREFILL_CANONICAL_M",
+    "0",
+)
+
+
+def _shape_bucket_trace_sync(device: torch.device) -> None:
+    if _PREFILL_SHAPE_BUCKET_TRACE and device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _shape_bucket_trace_ms(start: float, device: torch.device) -> float:
+    _shape_bucket_trace_sync(device)
+    return (time.perf_counter() - start) * 1000.0
 
 
 def sparse_attn_indexer(
@@ -235,6 +251,9 @@ def sparse_attn_indexer(
 
     # scale_fmt can be None, but the function expects str
     assert scale_fmt is not None
+    if _PREFILL_SHAPE_BUCKET_TRACE:
+        _shape_bucket_trace_sync(hidden_states.device)
+        trace_start = time.perf_counter()
     ops.indexer_k_quant_and_cache(
         k,
         kv_cache,
@@ -242,6 +261,14 @@ def sparse_attn_indexer(
         quant_block_size,
         scale_fmt,
     )
+    if _PREFILL_SHAPE_BUCKET_TRACE:
+        logger.info(
+            "PREFILL_SHAPE_BUCKET_INDEXER_TIMING op=indexer_k_quant_cache "
+            "hidden=%s slot_mapping=%s ms=%.3f",
+            tuple(hidden_states.shape),
+            tuple(slot_mapping.shape),
+            _shape_bucket_trace_ms(trace_start, hidden_states.device),
+        )
 
     skip_prefill_topk_clear = (
         has_prefill
@@ -258,6 +285,21 @@ def sparse_attn_indexer(
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
+        if _PREFILL_SHAPE_BUCKET_TRACE:
+            logger.info(
+                "PREFILL_SHAPE_BUCKET_INDEXER_META hidden=%s q_fp8=%s k=%s "
+                "weights=%s slot_mapping=%s num_tokens=%s max_query=%s "
+                "max_seq=%s chunks=%s",
+                tuple(hidden_states.shape),
+                tuple(q_fp8.shape),
+                tuple(k.shape),
+                tuple(weights.shape),
+                tuple(slot_mapping.shape),
+                attn_metadata_narrowed.num_actual_tokens,
+                attn_metadata_narrowed.max_query_len,
+                attn_metadata_narrowed.max_seq_len,
+                len(prefill_metadata.chunks),
+            )
 
         # Get the full shared workspace buffers once (will allocate on first use)
         workspace_manager = current_workspace_manager()
@@ -323,14 +365,26 @@ def sparse_attn_indexer(
                 device=hidden_states.device,
             )
             fp8_mqa_dequant_q_cuda(q_fp8, q_bf16_full)
+        max_actual_chunk_m = max(
+            chunk.token_end - chunk.token_start
+            for chunk in prefill_metadata.chunks
+        )
+        canonical_chunk_m = max_actual_chunk_m
+        if fused_triton and _PREFILL_MQA_CANONICAL_M > 0:
+            if max_actual_chunk_m > _PREFILL_MQA_CANONICAL_M:
+                logger.warning_once(
+                    "Prefill fused Triton MQA actual chunk M %s exceeds "
+                    "configured canonical M %s; check split_indexer_prefill_chunks.",
+                    max_actual_chunk_m,
+                    _PREFILL_MQA_CANONICAL_M,
+                )
+            canonical_chunk_m = max(
+                canonical_chunk_m, _PREFILL_MQA_CANONICAL_M
+            )
         q_bf16_workspace: torch.Tensor | None = None
         if q_workspace:
-            max_chunk_m = max(
-                chunk.token_end - chunk.token_start
-                for chunk in prefill_metadata.chunks
-            )
             q_bf16_workspace = torch.empty(
-                (q_fp8.shape[1], max_chunk_m, q_fp8.shape[2]),
+                (q_fp8.shape[1], canonical_chunk_m, q_fp8.shape[2]),
                 dtype=torch.bfloat16,
                 device=hidden_states.device,
             )
@@ -350,23 +404,50 @@ def sparse_attn_indexer(
                     return ((n + 127) // 128) * 128
                 return n
 
-            max_chunk_m = max(
-                chunk.token_end - chunk.token_start
-                for chunk in prefill_metadata.chunks
-            )
             max_chunk_n = max(
                 padded_n(chunk.active_seq_lens)
                 for chunk in prefill_metadata.chunks
             )
             logits_workspace = torch.empty(
-                (max_chunk_m, max_chunk_n),
+                (canonical_chunk_m, max_chunk_n),
                 dtype=torch.float32,
                 device=hidden_states.device,
             )
         for chunk in prefill_metadata.chunks:
+            actual_total_seq_lens = (
+                chunk.actual_total_seq_lens
+                if chunk.actual_total_seq_lens is not None
+                else chunk.total_seq_lens
+            )
+            actual_active_seq_lens = (
+                chunk.actual_active_seq_lens
+                if chunk.actual_active_seq_lens is not None
+                else chunk.active_seq_lens
+            )
+            if _PREFILL_SHAPE_BUCKET_TRACE:
+                logger.info(
+                    "PREFILL_SHAPE_BUCKET_INDEXER_CHUNK token_start=%s "
+                    "token_end=%s q_m=%s canonical_m=%s total_seq_lens=%s "
+                    "active_seq_lens=%s "
+                    "actual_total_seq_lens=%s actual_active_seq_lens=%s "
+                    "num_reqs=%s skip_kv_gather=%s",
+                    chunk.token_start,
+                    chunk.token_end,
+                    chunk.token_end - chunk.token_start,
+                    canonical_chunk_m,
+                    chunk.total_seq_lens,
+                    chunk.active_seq_lens,
+                    chunk.actual_total_seq_lens,
+                    chunk.actual_active_seq_lens,
+                    chunk.num_reqs,
+                    chunk.skip_kv_gather,
+                )
+            if _PREFILL_SHAPE_BUCKET_TRACE:
+                _shape_bucket_trace_sync(hidden_states.device)
+                trace_gather_start = time.perf_counter()
             if not chunk.skip_kv_gather:
-                k_fp8_gather = k_fp8_full[: chunk.total_seq_lens]
-                k_scale_gather = k_scale_full[: chunk.total_seq_lens]
+                k_fp8_gather = k_fp8_full[:actual_total_seq_lens]
+                k_scale_gather = k_scale_full[:actual_total_seq_lens]
                 ops.cp_gather_indexer_k_quant_cache(
                     kv_cache,
                     k_fp8_gather,
@@ -396,12 +477,28 @@ def sparse_attn_indexer(
                     fp8_mqa_dequant_k_cuda(
                         k_fp8_gather,
                         k_scale_gather.view(torch.float32).flatten(),
-                        k_bf16_full[: chunk.total_seq_lens],
+                        k_bf16_full[:actual_total_seq_lens],
                     )
+            if _PREFILL_SHAPE_BUCKET_TRACE:
+                logger.info(
+                    "PREFILL_SHAPE_BUCKET_INDEXER_TIMING op=gather_dequant "
+                    "token_start=%s token_end=%s q_m=%s active_n=%s "
+                    "total_n=%s skip_kv_gather=%s ms=%.3f",
+                    chunk.token_start,
+                    chunk.token_end,
+                    chunk.token_end - chunk.token_start,
+                    chunk.active_seq_lens,
+                    chunk.total_seq_lens,
+                    chunk.skip_kv_gather,
+                    _shape_bucket_trace_ms(trace_gather_start, hidden_states.device),
+                )
 
             k_fp8 = k_fp8_full[: chunk.active_seq_lens]
             k_scale = k_scale_full[: chunk.active_seq_lens]
 
+            if _PREFILL_SHAPE_BUCKET_TRACE:
+                _shape_bucket_trace_sync(hidden_states.device)
+                trace_mqa_start = time.perf_counter()
             if is_deep_gemm_supported():
                 logits = fp8_mqa_logits(
                     q_fp8[chunk.token_start : chunk.token_end],
@@ -451,7 +548,7 @@ def sparse_attn_indexer(
                         )
                     )
                 ):
-                    row_end_base = chunk.active_seq_lens - q_chunk.shape[0] + 1
+                    row_end_base = actual_active_seq_lens - q_chunk.shape[0] + 1
                 if mqa_backend == "triton":
                     logger.info_once(
                         "Sparse indexer prefill MQA logits backend: Triton"
@@ -501,7 +598,10 @@ def sparse_attn_indexer(
                                     w_chunk,
                                     cu_seqlen_ks,
                                     cu_seqlen_ke,
-                                    actual_n=chunk.active_seq_lens,
+                                    actual_m=q_chunk.shape[0],
+                                    canonical_m=canonical_chunk_m,
+                                    actual_n=actual_active_seq_lens,
+                                    canonical_n=chunk.active_seq_lens,
                                     logits_out=logits_workspace,
                                     row_start_zero=row_start_zero,
                                     row_end_base=row_end_base,
@@ -528,7 +628,10 @@ def sparse_attn_indexer(
                                     w_chunk,
                                     cu_seqlen_ks,
                                     cu_seqlen_ke,
-                                    actual_n=chunk.active_seq_lens,
+                                    actual_m=q_chunk.shape[0],
+                                    canonical_m=canonical_chunk_m,
+                                    actual_n=actual_active_seq_lens,
+                                    canonical_n=chunk.active_seq_lens,
                                     q_bf16_out=q_bf16_out,
                                     logits_out=logits_workspace,
                                     row_start_zero=row_start_zero,
@@ -547,7 +650,7 @@ def sparse_attn_indexer(
                                 w_chunk,
                                 cu_seqlen_ks,
                                 cu_seqlen_ke,
-                                actual_n=chunk.active_seq_lens,
+                                actual_n=actual_active_seq_lens,
                                 logits_out=logits_workspace,
                                 fallback=False,
                             )
@@ -572,7 +675,7 @@ def sparse_attn_indexer(
                                 w_chunk,
                                 cu_seqlen_ks,
                                 cu_seqlen_ke,
-                                actual_n=chunk.active_seq_lens,
+                                actual_n=actual_active_seq_lens,
                                 logits_out=logits_workspace,
                                 fallback=False,
                             )
@@ -583,7 +686,7 @@ def sparse_attn_indexer(
                                 w_chunk,
                                 cu_seqlen_ks,
                                 cu_seqlen_ke,
-                                actual_n=chunk.active_seq_lens,
+                                actual_n=actual_active_seq_lens,
                                 logits_out=logits_workspace,
                                 fallback=False,
                             )
@@ -608,8 +711,24 @@ def sparse_attn_indexer(
                         cu_seqlen_ke,
                         fallback=mqa_backend == "auto",
                     )
+            if _PREFILL_SHAPE_BUCKET_TRACE:
+                logger.info(
+                    "PREFILL_SHAPE_BUCKET_INDEXER_TIMING op=mqa_logits "
+                    "token_start=%s token_end=%s q_m=%s canonical_m=%s "
+                    "active_n=%s logits=%s ms=%.3f",
+                    chunk.token_start,
+                    chunk.token_end,
+                    chunk.token_end - chunk.token_start,
+                    canonical_chunk_m,
+                    chunk.active_seq_lens,
+                    tuple(logits.shape),
+                    _shape_bucket_trace_ms(trace_mqa_start, hidden_states.device),
+                )
             num_rows = logits.shape[0]
 
+            if _PREFILL_SHAPE_BUCKET_TRACE:
+                _shape_bucket_trace_sync(hidden_states.device)
+                trace_topk_start = time.perf_counter()
             if (
                 current_platform.is_cuda()
                 and chunk.num_reqs == 1
@@ -665,6 +784,19 @@ def sparse_attn_indexer(
                     logits.stride(1),
                     topk_tokens,
                 )
+            if _PREFILL_SHAPE_BUCKET_TRACE:
+                logger.info(
+                    "PREFILL_SHAPE_BUCKET_INDEXER_TIMING op=topk "
+                    "token_start=%s token_end=%s q_m=%s active_n=%s "
+                    "num_rows=%s topk=%s ms=%.3f",
+                    chunk.token_start,
+                    chunk.token_end,
+                    chunk.token_end - chunk.token_start,
+                    chunk.active_seq_lens,
+                    num_rows,
+                    topk_tokens,
+                    _shape_bucket_trace_ms(trace_topk_start, hidden_states.device),
+                )
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
         assert decode_metadata is not None
@@ -714,6 +846,20 @@ def sparse_attn_indexer(
                 attn_metadata_narrowed.max_seq_len + block_size - 1
             ) // block_size
             decode_block_table = decode_block_table[:, :max_blocks]
+        if _PREFILL_SHAPE_BUCKET_TRACE:
+            logger.info(
+                "PREFILL_SHAPE_BUCKET_DECODE_META q=%s batch=%s next_n=%s "
+                "seq_lens=%s max_seq=%s logits_len=%s block_table=%s "
+                "topk_backend=%s",
+                tuple(q_fp8[:num_decode_tokens].shape),
+                batch_size,
+                next_n,
+                tuple(seq_lens.shape),
+                attn_metadata_narrowed.max_seq_len,
+                decode_logits_len,
+                tuple(decode_block_table.shape),
+                _DECODE_TOPK_BACKEND,
+            )
         topk_workspace: torch.Tensor | None = None
         decode_topk_backend = _DECODE_TOPK_BACKEND
         decode_topk_logits_len = decode_logits_len
@@ -783,6 +929,9 @@ def sparse_attn_indexer(
         topk_tile_candidate_cutoffs: torch.Tensor | None = None
         topk_tile_fallback_flags: torch.Tensor | None = None
         if is_deep_gemm_supported():
+            if _PREFILL_SHAPE_BUCKET_TRACE:
+                _shape_bucket_trace_sync(hidden_states.device)
+                trace_decode_mqa_start = time.perf_counter()
             logits = fp8_paged_mqa_logits(
                 padded_q_fp8_decode_tokens,
                 kv_cache,
@@ -793,6 +942,16 @@ def sparse_attn_indexer(
                 max_model_len=decode_logits_len,
                 clean_logits=False,
             )
+            if _PREFILL_SHAPE_BUCKET_TRACE:
+                logger.info(
+                    "PREFILL_SHAPE_BUCKET_DECODE_TIMING op=paged_mqa_logits "
+                    "logits=%s max_seq=%s logits_len=%s ms=%.3f",
+                    tuple(logits.shape),
+                    attn_metadata_narrowed.max_seq_len,
+                    decode_logits_len,
+                    _shape_bucket_trace_ms(trace_decode_mqa_start,
+                                           hidden_states.device),
+                )
         else:
             logits_out: torch.Tensor | None = None
             q_bf16_decode: torch.Tensor | None = None
@@ -896,6 +1055,9 @@ def sparse_attn_indexer(
                         else:
                             logits_out = workspace_buffers[buffer_idx]
                             topk_workspace = workspace_buffers[buffer_idx + 1]
+            if _PREFILL_SHAPE_BUCKET_TRACE:
+                _shape_bucket_trace_sync(hidden_states.device)
+                trace_decode_mqa_start = time.perf_counter()
             logits = fp8_paged_mqa_logits_triton(
                 padded_q_fp8_decode_tokens,
                 kv_cache,
@@ -917,9 +1079,24 @@ def sparse_attn_indexer(
                 and decode_topk_logits_len > decode_logits_len
             ):
                 logits = logits_out[:num_padded_tokens, :decode_topk_logits_len]
+            if _PREFILL_SHAPE_BUCKET_TRACE:
+                logger.info(
+                    "PREFILL_SHAPE_BUCKET_DECODE_TIMING "
+                    "op=paged_mqa_logits_triton logits=%s max_seq=%s "
+                    "logits_len=%s topk_logits_len=%s ms=%.3f",
+                    tuple(logits.shape),
+                    attn_metadata_narrowed.max_seq_len,
+                    decode_logits_len,
+                    decode_topk_logits_len,
+                    _shape_bucket_trace_ms(trace_decode_mqa_start,
+                                           hidden_states.device),
+                )
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
+        if _PREFILL_SHAPE_BUCKET_TRACE:
+            _shape_bucket_trace_sync(hidden_states.device)
+            trace_decode_topk_start = time.perf_counter()
         if current_platform.is_cuda() and decode_topk_backend != "legacy":
             if topk_workspace is None:
                 workspace_manager = current_workspace_manager()
@@ -932,7 +1109,7 @@ def sparse_attn_indexer(
                 topk_indices,
                 topk_workspace,
                 topk_tokens,
-                attn_metadata_narrowed.max_seq_len,
+                decode_logits_len,
             )
         elif current_platform.is_cuda():
             if (
@@ -1024,6 +1201,21 @@ def sparse_attn_indexer(
                     logits.stride(1),
                     topk_tokens,
                 )
+        if _PREFILL_SHAPE_BUCKET_TRACE:
+            logger.info(
+                "PREFILL_SHAPE_BUCKET_DECODE_TIMING op=topk "
+                "backend=%s logits=%s max_seq=%s topk_shape_len=%s "
+                "topk=%s ms=%.3f",
+                decode_topk_backend,
+                tuple(logits.shape),
+                attn_metadata_narrowed.max_seq_len,
+                decode_logits_len
+                if decode_topk_backend != "legacy"
+                else decode_topk_logits_len,
+                topk_tokens,
+                _shape_bucket_trace_ms(trace_decode_topk_start,
+                                       hidden_states.device),
+            )
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
             # the topk indices removing padded tokens

@@ -30,6 +30,53 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
 logger = init_logger(__name__)
+_PREFILL_SHAPE_BUCKET_TRACE = os.getenv("VLLM_PREFILL_SHAPE_BUCKET_TRACE", "0") == "1"
+_PREFILL_SHAPE_BUCKET_ENABLED = os.getenv("VLLM_PREFILL_SHAPE_BUCKET", "0") == "1"
+_PREFILL_SHAPE_BUCKET_PAD_METADATA = (
+    os.getenv("VLLM_PREFILL_SHAPE_BUCKET_PAD_METADATA", "1") == "1"
+)
+_PREFILL_SHAPE_BUCKET_PAD_ACTIVE_SEQ = (
+    os.getenv("VLLM_PREFILL_SHAPE_BUCKET_PAD_ACTIVE_SEQ", "1") == "1"
+)
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+_PREFILL_SHAPE_BUCKET_MULTIPLE = _env_int("VLLM_PREFILL_SHAPE_BUCKET_MULTIPLE", 128)
+_PREFILL_SHAPE_BUCKET_MAX = _env_int("VLLM_PREFILL_SHAPE_BUCKET_MAX", 2048)
+_PREFILL_MQA_CANONICAL_M = _env_int(
+    "VLLM_MQA_CUDA_V7_FUSED_TRITON_PREFILL_CANONICAL_M", 0
+)
+
+
+def _round_prefill_shape_bucket(value: int, limit: int) -> int:
+    if (
+        not _PREFILL_SHAPE_BUCKET_ENABLED
+        or not _PREFILL_SHAPE_BUCKET_PAD_METADATA
+        or not _PREFILL_SHAPE_BUCKET_PAD_ACTIVE_SEQ
+        or value <= 0
+        or _PREFILL_SHAPE_BUCKET_MULTIPLE <= 0
+        or _PREFILL_SHAPE_BUCKET_MAX <= 0
+    ):
+        return value
+    rounded = (
+        (value + _PREFILL_SHAPE_BUCKET_MULTIPLE - 1)
+        // _PREFILL_SHAPE_BUCKET_MULTIPLE
+    ) * _PREFILL_SHAPE_BUCKET_MULTIPLE
+    if rounded - value > _PREFILL_SHAPE_BUCKET_MAX:
+        return value
+    return min(rounded, limit)
+
+
+def _cap_prefill_chunk_m(value: int) -> int:
+    if _PREFILL_MQA_CANONICAL_M <= 0:
+        return value
+    return min(value, _PREFILL_MQA_CANONICAL_M)
 
 
 @triton.jit
@@ -90,13 +137,23 @@ def split_indexer_prefill_chunks(
     end = 0
 
     while end < n:
-        start, chunk_m, chunk_n = end, 0, 0
+        start, chunk_m, chunk_n_actual, chunk_n_budget = end, 0, 0, 0
 
         while end < n:
-            q, s = query_lens_cpu[end].item(), seq_lens_cpu[end].item()
-            new_m, new_n = chunk_m + q, chunk_n + s
-            if new_n <= workspace_size and new_m * new_n <= max_logits_elems:
-                chunk_m, chunk_n = new_m, new_n
+            q = int(query_lens_cpu[end].item())
+            s = int(seq_lens_cpu[end].item())
+            new_m = chunk_m + q
+            new_n_actual = chunk_n_actual + s
+            new_n_budget = _round_prefill_shape_bucket(
+                new_n_actual, workspace_size
+            )
+            if (
+                new_n_budget <= workspace_size
+                and new_m * new_n_budget <= max_logits_elems
+            ):
+                chunk_m = new_m
+                chunk_n_actual = new_n_actual
+                chunk_n_budget = new_n_budget
                 end += 1
             else:
                 break
@@ -104,22 +161,30 @@ def split_indexer_prefill_chunks(
         # A single request can exceed the budget, requiring sub-chunking
         # on the query dimension.
         if end == start:
-            chunk_m, chunk_n = query_lens_cpu[end].item(), seq_lens_cpu[end].item()
+            chunk_m = int(query_lens_cpu[end].item())
+            chunk_n_actual = int(seq_lens_cpu[end].item())
+            chunk_n_budget = _round_prefill_shape_bucket(
+                chunk_n_actual, workspace_size
+            )
             end += 1
 
         req_slice = slice(start + request_offset, end + request_offset)
-        if active_split_cap > 0 and end == start + 1 and chunk_n > 0:
+        if active_split_cap > 0 and end == start + 1 and chunk_n_budget > 0:
             q_off = 0
             # For a single long request, selected query tokens are end-aligned
             # in the sequence. Use the max active KV length of each subchunk
             # for the logits budget, but cap M to avoid very large early tiles.
+            split_cap = active_split_cap
+            if split_cap <= 0:
+                split_cap = chunk_m
+            split_cap = _cap_prefill_chunk_m(split_cap)
             while q_off < chunk_m:
-                hi = min(active_split_cap, chunk_m - q_off)
+                hi = min(split_cap, chunk_m - q_off)
                 lo = 1
                 best = 1
                 while lo <= hi:
                     mid = (lo + hi) // 2
-                    active_n = chunk_n - chunk_m + q_off + mid
+                    active_n = chunk_n_budget - chunk_m + q_off + mid
                     if mid * max(1, active_n) <= max_logits_elems:
                         best = mid
                         lo = mid + 1
@@ -128,7 +193,12 @@ def split_indexer_prefill_chunks(
                 chunks.append((req_slice, slice(q_off, q_off + best)))
                 q_off += best
         else:
-            max_q = max(1, max_logits_elems // chunk_n) if chunk_n > 0 else chunk_m
+            max_q = (
+                max(1, max_logits_elems // chunk_n_budget)
+                if chunk_n_budget > 0
+                else chunk_m
+            )
+            max_q = max(1, _cap_prefill_chunk_m(max_q))
             for q_off in range(0, chunk_m, max_q):
                 sub_m = min(max_q, chunk_m - q_off)
                 chunks.append((req_slice, slice(q_off, q_off + sub_m)))
@@ -188,6 +258,8 @@ class DeepseekV32IndexerPrefillChunkMetadata:
     token_end: int
     num_reqs: int
     skip_kv_gather: bool = False
+    actual_total_seq_lens: int | None = None
+    actual_active_seq_lens: int | None = None
 
 
 @dataclass
@@ -418,10 +490,19 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         cu_seqlen_ks_cpu, cu_seqlen_ke_cpu = kv_spans_from_batches_cpu(
             prefill_query_start_loc, seq_lens_cpu[req_slice]
         )
-        active_seq_lens = int(cu_seqlen_ke_cpu[query_slice].max().item())
+        actual_active_seq_lens = int(cu_seqlen_ke_cpu[query_slice].max().item())
         token_start = query_start_loc_cpu[req_slice.start].item()
-        total_seq_lens = int(seq_lens_cpu[req_slice].sum().item())
+        actual_total_seq_lens = int(seq_lens_cpu[req_slice].sum().item())
         num_reqs = req_slice.stop - req_slice.start
+        active_seq_lens = actual_active_seq_lens
+        total_seq_lens = actual_total_seq_lens
+        active_seq_lens = _round_prefill_shape_bucket(
+            active_seq_lens, self.max_prefill_buffer_size
+        )
+        total_seq_lens = _round_prefill_shape_bucket(
+            total_seq_lens, self.max_prefill_buffer_size
+        )
+        total_seq_lens = max(total_seq_lens, active_seq_lens)
         assert total_seq_lens <= self.max_prefill_buffer_size
         cu_seq_lens = (
             torch.cat(
@@ -445,6 +526,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             token_end=token_start + query_slice.stop,
             num_reqs=num_reqs,
             skip_kv_gather=skip_kv_gather,
+            actual_total_seq_lens=actual_total_seq_lens,
+            actual_active_seq_lens=actual_active_seq_lens,
         )
 
     def _prepare_decode_tensors(
@@ -611,6 +694,36 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             prefill_metadata = DeepseekV32IndexerPrefillMetadata(
                 chunks=chunks,
             )
+            indexer_max_seq_len = max(
+                common_attn_metadata.max_seq_len,
+                max(chunk.active_seq_lens for chunk in chunks),
+            )
+            if _PREFILL_SHAPE_BUCKET_TRACE:
+                logger.info(
+                    "PREFILL_SHAPE_BUCKET_INDEXER_BUILD tokens=%s max_query=%s "
+                    "max_seq=%s indexer_max_seq=%s query_lens=%s "
+                    "seq_lens=%s chunks=%s",
+                    num_tokens,
+                    common_attn_metadata.max_query_len,
+                    common_attn_metadata.max_seq_len,
+                    indexer_max_seq_len,
+                    prefill_query_lens_cpu.tolist(),
+                    seq_lens_cpu[num_decodes:].tolist(),
+                    [
+                        {
+                            "token_start": chunk.token_start,
+                            "token_end": chunk.token_end,
+                            "total_seq_lens": chunk.total_seq_lens,
+                            "active_seq_lens": chunk.active_seq_lens,
+                            "actual_total_seq_lens": chunk.actual_total_seq_lens,
+                            "actual_active_seq_lens": chunk.actual_active_seq_lens,
+                            "skip_kv_gather": chunk.skip_kv_gather,
+                        }
+                        for chunk in chunks
+                    ],
+                )
+        else:
+            indexer_max_seq_len = common_attn_metadata.max_seq_len
 
         decode_metadata = None
         if num_decodes > 0:
@@ -660,12 +773,29 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 requires_padding=requires_padding,
                 schedule_metadata=self.scheduler_metadata_buffer,
             )
+            rounded_decode_max_seq_len = _round_prefill_shape_bucket(
+                indexer_max_seq_len,
+                self.vllm_config.model_config.max_model_len,
+            )
+            if rounded_decode_max_seq_len != indexer_max_seq_len:
+                if _PREFILL_SHAPE_BUCKET_TRACE:
+                    logger.info(
+                        "PREFILL_SHAPE_BUCKET_DECODE_MAX_SEQ actual=%s "
+                        "rounded=%s num_decodes=%s num_decode_tokens=%s "
+                        "batch_size=%s",
+                        indexer_max_seq_len,
+                        rounded_decode_max_seq_len,
+                        num_decodes,
+                        num_decode_tokens,
+                        batch_size,
+                    )
+                indexer_max_seq_len = rounded_decode_max_seq_len
 
         attn_metadata = DeepseekV32IndexerMetadata(
             seq_lens=common_attn_metadata.seq_lens,
             num_reqs=common_attn_metadata.num_reqs,
             max_query_len=common_attn_metadata.max_query_len,
-            max_seq_len=common_attn_metadata.max_seq_len,
+            max_seq_len=indexer_max_seq_len,
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             query_start_loc=common_attn_metadata.query_start_loc,
             slot_mapping=common_attn_metadata.slot_mapping,

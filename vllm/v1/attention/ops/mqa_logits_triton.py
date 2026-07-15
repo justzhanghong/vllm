@@ -1186,6 +1186,9 @@ def _mqa_bf16_fused_logits_kernel(
     stride_k_n,
     stride_w_m,
     stride_out_m,
+    row_end_base,
+    actual_m,
+    actual_n,
     M: tl.constexpr,
     N: tl.constexpr,
     H: tl.constexpr,
@@ -1195,7 +1198,6 @@ def _mqa_bf16_fused_logits_kernel(
     BLOCK_D: tl.constexpr,
     ROW_START_ZERO: tl.constexpr,
     ROW_END_CONTIGUOUS: tl.constexpr,
-    ROW_END_BASE: tl.constexpr,
     FAST_FULL_TILE: tl.constexpr,
     FAST_INVALID_TILE: tl.constexpr,
     SKIP_INVALID_STORE: tl.constexpr,
@@ -1207,20 +1209,29 @@ def _mqa_bf16_fused_logits_kernel(
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_D)
     mask_m = offs_m < M
+    mask_m_actual = offs_m < actual_m
     mask_n = offs_n < N
+    mask_n_actual = offs_n < actual_n
     mask_d = offs_d < D
+
+    if pid_m * BLOCK_M >= actual_m:
+        return
+    if pid_n * BLOCK_N >= actual_n:
+        return
 
     if FAST_INVALID_TILE and ROW_START_ZERO and ROW_END_CONTIGUOUS:
         block_n_start = pid_n * BLOCK_N
         max_row_end = (
-            ROW_END_BASE + tl.minimum((pid_m + 1) * BLOCK_M, M) - 1
+            row_end_base
+            + tl.minimum((pid_m + 1) * BLOCK_M, actual_m)
+            - 1
         )
         if block_n_start >= max_row_end:
             if not SKIP_INVALID_STORE:
                 tl.store(
                     out_ptr + offs_m[:, None] * stride_out_m + offs_n[None, :],
                     float("-inf"),
-                    mask=mask_m[:, None] & mask_n[None, :],
+                    mask=mask_m_actual[:, None] & mask_n[None, :],
                 )
             return
 
@@ -1228,7 +1239,7 @@ def _mqa_bf16_fused_logits_kernel(
     if REUSE_K_TILE:
         k_reuse = tl.load(
             k_ptr + offs_n[:, None] * stride_k_n + offs_d[None, :],
-            mask=mask_n[:, None] & mask_d[None, :],
+            mask=mask_n_actual[:, None] & mask_d[None, :],
             other=0.0,
         )
     for h in tl.static_range(0, H):
@@ -1237,7 +1248,7 @@ def _mqa_bf16_fused_logits_kernel(
             + h * stride_q_h
             + offs_m[:, None] * stride_q_m
             + offs_d[None, :],
-            mask=mask_m[:, None] & mask_d[None, :],
+            mask=mask_m_actual[:, None] & mask_d[None, :],
             other=0.0,
         )
         if REUSE_K_TILE:
@@ -1245,41 +1256,41 @@ def _mqa_bf16_fused_logits_kernel(
         else:
             k = tl.load(
                 k_ptr + offs_n[:, None] * stride_k_n + offs_d[None, :],
-                mask=mask_n[:, None] & mask_d[None, :],
+                mask=mask_n_actual[:, None] & mask_d[None, :],
                 other=0.0,
             )
         s = tl.dot(q, tl.trans(k), out_dtype=tl.float32)
         weight = tl.load(
             w_ptr + offs_m * stride_w_m + h,
-            mask=mask_m,
+            mask=mask_m_actual,
             other=0.0,
         )
         acc += tl.maximum(s, 0.0) * weight[:, None]
 
     if FAST_FULL_TILE and ROW_START_ZERO and ROW_END_CONTIGUOUS:
         block_n_end = (pid_n + 1) * BLOCK_N
-        block_min_row_end = ROW_END_BASE + pid_m * BLOCK_M
+        block_min_row_end = row_end_base + pid_m * BLOCK_M
         if block_n_end <= block_min_row_end:
             tl.store(
                 out_ptr + offs_m[:, None] * stride_out_m + offs_n[None, :],
                 acc,
-                mask=mask_m[:, None] & mask_n[None, :],
+                mask=mask_m_actual[:, None] & mask_n_actual[None, :],
             )
             return
 
     if ROW_END_CONTIGUOUS:
-        row_end = ROW_END_BASE + offs_m
+        row_end = row_end_base + offs_m
     else:
-        row_end = tl.load(ke_ptr + offs_m, mask=mask_m, other=0)
+        row_end = tl.load(ke_ptr + offs_m, mask=mask_m_actual, other=0)
     if ROW_START_ZERO:
-        valid = mask_m[:, None] & mask_n[None, :] & (
+        valid = mask_m_actual[:, None] & mask_n_actual[None, :] & (
             offs_n[None, :] < row_end[:, None]
         )
     else:
-        row_start = tl.load(ks_ptr + offs_m, mask=mask_m, other=0)
+        row_start = tl.load(ks_ptr + offs_m, mask=mask_m_actual, other=0)
         valid = (
-            mask_m[:, None]
-            & mask_n[None, :]
+            mask_m_actual[:, None]
+            & mask_n_actual[None, :]
             & (offs_n[None, :] >= row_start[:, None])
             & (offs_n[None, :] < row_end[:, None])
         )
@@ -1287,7 +1298,7 @@ def _mqa_bf16_fused_logits_kernel(
     tl.store(
         out_ptr + offs_m[:, None] * stride_out_m + offs_n[None, :],
         acc,
-        mask=mask_m[:, None] & mask_n[None, :],
+        mask=mask_m_actual[:, None] & mask_n_actual[None, :],
     )
 
 
@@ -1298,7 +1309,10 @@ def fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton(
     cu_seqlen_ks: torch.Tensor,
     cu_seqlen_ke: torch.Tensor,
     *,
+    actual_m: int | None = None,
+    canonical_m: int | None = None,
     actual_n: int | None = None,
+    canonical_n: int | None = None,
     logits_out: torch.Tensor | None = None,
     block_m: int | None = None,
     block_n: int | None = None,
@@ -1306,8 +1320,22 @@ def fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton(
     row_end_base: int | None = None,
 ) -> torch.Tensor:
     """Exact fused Triton logits path for pre-dequantized BF16 Q and K."""
-    M = q_bf16.shape[1]
-    N = k_bf16.shape[0] if actual_n is None else actual_n
+    actual_M = q_bf16.shape[1] if actual_m is None else actual_m
+    M = actual_M if canonical_m is None else canonical_m
+    if M < actual_M:
+        raise RuntimeError(f"canonical_m={M} is smaller than actual_m={actual_M}")
+    if actual_M > q_bf16.shape[1]:
+        raise RuntimeError(
+            f"actual_m={actual_M} exceeds available Q rows={q_bf16.shape[1]}"
+        )
+    actual_N = k_bf16.shape[0] if actual_n is None else actual_n
+    N = actual_N if canonical_n is None else canonical_n
+    if N < actual_N:
+        raise RuntimeError(f"canonical_n={N} is smaller than actual_n={actual_N}")
+    if N > k_bf16.shape[0]:
+        raise RuntimeError(
+            f"canonical_n={N} exceeds available K rows={k_bf16.shape[0]}"
+        )
     if logits_out is None:
         logits = torch.empty((M, N), dtype=torch.float32, device=q_bf16.device)
     else:
@@ -1316,8 +1344,8 @@ def fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton(
             raise RuntimeError(
                 f"logits_out is too small for M={M}, N={N}: {logits_out.shape}"
             )
-    if M == 0 or N == 0:
-        return logits
+    if actual_M == 0 or actual_N == 0:
+        return logits[:actual_M, :actual_N]
 
     if not q_bf16.is_cuda:
         raise RuntimeError("q_bf16 is not a CUDA tensor")
@@ -1421,6 +1449,9 @@ def fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton(
         k_bf16.stride(0),
         weights.stride(0),
         logits.stride(0),
+        0 if row_end_base is None else row_end_base,
+        actual_M,
+        actual_N,
         M=M,
         N=N,
         H=H,
@@ -1430,7 +1461,6 @@ def fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton(
         BLOCK_D=triton.next_power_of_2(D),
         ROW_START_ZERO=row_start_zero,
         ROW_END_CONTIGUOUS=row_end_base is not None,
-        ROW_END_BASE=0 if row_end_base is None else row_end_base,
         FAST_FULL_TILE=fast_full_tile,
         FAST_INVALID_TILE=fast_invalid_tile,
         SKIP_INVALID_STORE=skip_invalid_store,
@@ -1438,7 +1468,7 @@ def fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton(
         num_warps=num_warps,
         num_stages=num_stages,
     )
-    return logits
+    return logits[:actual_M, :actual_N]
 
 
 def fp8_mqa_logits_cuda_v7_fused_triton(
@@ -1448,7 +1478,10 @@ def fp8_mqa_logits_cuda_v7_fused_triton(
     cu_seqlen_ks: torch.Tensor,
     cu_seqlen_ke: torch.Tensor,
     *,
+    actual_m: int | None = None,
+    canonical_m: int | None = None,
     actual_n: int | None = None,
+    canonical_n: int | None = None,
     q_bf16_out: torch.Tensor | None = None,
     logits_out: torch.Tensor | None = None,
     row_start_zero: bool = False,
@@ -1481,7 +1514,10 @@ def fp8_mqa_logits_cuda_v7_fused_triton(
             weights,
             cu_seqlen_ks,
             cu_seqlen_ke,
+            actual_m=actual_m,
+            canonical_m=canonical_m,
             actual_n=actual_n,
+            canonical_n=canonical_n,
             logits_out=logits_out,
             row_start_zero=row_start_zero,
             row_end_base=row_end_base,

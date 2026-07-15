@@ -471,6 +471,9 @@ class CommonAttentionMetadata:
             _num_computed_tokens_cpu=self._num_computed_tokens_cpu[:num_actual_reqs]
             if self._num_computed_tokens_cpu is not None
             else None,
+            seq_lens_cpu_upper_bound=self.seq_lens_cpu_upper_bound[:num_actual_reqs]
+            if self.seq_lens_cpu_upper_bound is not None
+            else None,
             num_reqs=num_actual_reqs,
             num_actual_tokens=num_actual_tokens,
             max_query_len=self.max_query_len,

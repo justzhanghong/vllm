@@ -1432,9 +1432,8 @@ class OpenAIServingChat(OpenAIServing):
                 request.tool_choice
                 and type(request.tool_choice) is ChatCompletionNamedToolChoiceParam
             ):
-                assert tool_calls is not None and len(tool_calls) > 0
                 tool_call_class_items = []
-                for idx, tc in enumerate(tool_calls):
+                for idx, tc in enumerate(tool_calls or []):
                     # Use native ID if available (e.g., Kimi K2),
                     # otherwise generate ID with correct id_type
                     if tc.id:
@@ -1457,12 +1456,22 @@ class OpenAIServingChat(OpenAIServing):
                                 tool_call_class(id=generated_id, function=tc)
                             )
                     history_tool_call_cnt += 1
-                message = ChatMessage(
-                    role=role,
-                    reasoning=reasoning,
-                    content="",
-                    tool_calls=tool_call_class_items,
-                )
+                if tool_call_class_items:
+                    message = ChatMessage(
+                        role=role,
+                        reasoning=reasoning,
+                        content="",
+                        tool_calls=tool_call_class_items,
+                    )
+                else:
+                    logger.warning(
+                        "Named tool_choice requested, but no tool calls were "
+                        "extracted from model output. Returning a standard "
+                        "chat message instead of failing the request."
+                    )
+                    message = ChatMessage(
+                        role=role, reasoning=reasoning, content=content
+                    )
 
             elif request.tool_choice and request.tool_choice == "required":
                 tool_call_class_items = []
