@@ -247,6 +247,11 @@ class SchedulerOutput:
         default_factory=dict
     )
 
+    # Full-attention OSCAR scheduler-owned cache metadata.
+    oscar_hp_row_ids: dict[str, int] = field(default_factory=dict)
+    oscar_prefix_page_ids: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    oscar_shared_hit_tokens: dict[str, int] = field(default_factory=dict)
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

@@ -15,8 +15,35 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.v1.kv_cache_interface import OscarKVCacheSpec
 from vllm.v1.request import Request
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+
+def _set_oscar_warmup_hp_rows(
+    model_runner: GPUModelRunner,
+    scheduler_output: SchedulerOutput,
+    req_ids: list[str],
+) -> None:
+    max_num_rows = model_runner.kv_cache_config.oscar_max_num_seqs
+    if max_num_rows is None:
+        return
+    if len(req_ids) > max_num_rows:
+        raise RuntimeError(
+            "OSCAR warmup requests exceed reserved HP rows: "
+            f"requests={len(req_ids)}, rows={max_num_rows}"
+        )
+    scheduler_output.oscar_hp_row_ids = {
+        req_id: row for row, req_id in enumerate(req_ids)
+    }
+    spec = model_runner.kv_cache_config.kv_cache_groups[0].kv_cache_spec
+    assert isinstance(spec, OscarKVCacheSpec)
+    pages_per_request = spec.prefix_tokens // spec.block_size
+    scheduler_output.oscar_prefix_page_ids = {
+        req_id: tuple(range(row * pages_per_request, (row + 1) * pages_per_request))
+        for row, req_id in enumerate(req_ids)
+    }
+    scheduler_output.oscar_shared_hit_tokens = dict.fromkeys(req_ids, 0)
 
 
 @torch.inference_mode()
@@ -94,6 +121,7 @@ def warmup_kernels(
     prefill_output.num_scheduled_tokens = {rid: prompt_len for rid in req_ids}
     prefill_output.total_num_scheduled_tokens = prompt_len * num_reqs
     prefill_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+    _set_oscar_warmup_hp_rows(model_runner, prefill_output, req_ids)
 
     # Disable KV connector for warmup run.
     model_runner.kv_connector.set_disabled(True)
@@ -141,6 +169,7 @@ def warmup_kernels(
             decode_output.num_scheduled_tokens.values()
         )
         decode_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+        _set_oscar_warmup_hp_rows(model_runner, decode_output, req_ids)
 
         worker_execute_model(decode_output)
         worker_sample_tokens(None)

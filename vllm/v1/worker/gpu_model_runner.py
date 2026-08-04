@@ -148,6 +148,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
+    OscarKVCacheSpec,
     OscarMLAAttentionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
@@ -194,6 +195,7 @@ from vllm.v1.worker.cp_utils import (
 )
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
+from vllm.v1.worker.gpu.attn_utils import _reshape_oscar_kv_cache
 from vllm.v1.worker.gpu.pool.late_interaction_runner import LateInteractionRunner
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
@@ -845,6 +847,15 @@ class GPUModelRunner(
         self.prev_positions = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
         self.num_scheduled_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int32
+        )
+        self.oscar_hp_row_ids = self._make_buffer(
+            self.max_num_reqs, dtype=torch.int32
+        )
+        self.oscar_shared_hit_tokens = self._make_buffer(
+            self.max_num_reqs, dtype=torch.int32
+        )
+        self.oscar_prefix_page_ids = self._make_buffer(
+            self.max_num_reqs, 4, dtype=torch.int32
         )
 
         self.encoder_seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
@@ -2246,6 +2257,38 @@ class GPUModelRunner(
         self.query_start_loc.copy_to_gpu()
         query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
 
+        if self.kv_cache_config.oscar_max_num_seqs is not None:
+            expected_req_ids = set(scheduler_output.num_scheduled_tokens)
+            hp_req_ids = set(scheduler_output.oscar_hp_row_ids)
+            prefix_req_ids = set(scheduler_output.oscar_prefix_page_ids)
+            shared_req_ids = set(scheduler_output.oscar_shared_hit_tokens)
+            if (
+                hp_req_ids != expected_req_ids
+                or prefix_req_ids != expected_req_ids
+                or shared_req_ids != expected_req_ids
+            ):
+                raise RuntimeError(
+                    "OSCAR scheduler output has incomplete BF16 ownership: "
+                    f"expected={sorted(expected_req_ids)}, "
+                    f"hp={sorted(hp_req_ids)}, prefix={sorted(prefix_req_ids)}, "
+                    f"shared={sorted(shared_req_ids)}"
+                )
+            self.oscar_hp_row_ids.np.fill(-1)
+            self.oscar_prefix_page_ids.np.fill(-1)
+            self.oscar_shared_hit_tokens.np.fill(0)
+            for req_id, hp_row in scheduler_output.oscar_hp_row_ids.items():
+                req_index = self.input_batch.req_id_to_index[req_id]
+                self.oscar_hp_row_ids.np[req_index] = hp_row
+                self.oscar_prefix_page_ids.np[req_index] = (
+                    scheduler_output.oscar_prefix_page_ids[req_id]
+                )
+                self.oscar_shared_hit_tokens.np[req_index] = (
+                    scheduler_output.oscar_shared_hit_tokens[req_id]
+                )
+            self.oscar_hp_row_ids.copy_to_gpu()
+            self.oscar_prefix_page_ids.copy_to_gpu()
+            self.oscar_shared_hit_tokens.copy_to_gpu()
+
         # Compute optimistic seq_lens (assumes all draft tokens from previous
         # iteration accepted). Store in optimistic_seq_lens_cpu for use by
         # _build_attention_metadata (max_seq_len) and discard_request_mask.
@@ -2543,7 +2586,7 @@ class GPUModelRunner(
         num_reqs: int,
         total_num_scheduled_tokens: int,
     ) -> tuple[torch.Tensor, SpecDecodeMetadata | None] | None:
-        if self.cache_config.cache_dtype == "oscar_mla_int2":
+        if self.cache_config.cache_dtype in {"oscar_int2", "oscar_mla_int2"}:
             return None
         if not envs.VLLM_STAGE50_DECODE_PREP_FASTPATH:
             return None
@@ -2745,6 +2788,21 @@ class GPUModelRunner(
             slot_mapping=slot_mapping_gid_0,
             causal=True,
             is_prefilling=is_prefilling,
+            oscar_hp_row_ids=(
+                self.oscar_hp_row_ids.gpu[:num_reqs_padded]
+                if self.kv_cache_config.oscar_max_num_seqs is not None
+                else None
+            ),
+            oscar_prefix_page_ids=(
+                self.oscar_prefix_page_ids.gpu[:num_reqs_padded]
+                if self.kv_cache_config.oscar_max_num_seqs is not None
+                else None
+            ),
+            oscar_shared_hit_tokens=(
+                self.oscar_shared_hit_tokens.gpu[:num_reqs_padded]
+                if self.kv_cache_config.oscar_max_num_seqs is not None
+                else None
+            ),
         )
         if self.cache_config.cache_dtype == "oscar_mla_int2":
             oscar_spec = next(
@@ -9303,8 +9361,11 @@ class GPUModelRunner(
                         max_num_seqs=max_num_seqs,
                     )
                     continue
-                assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-                num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                if isinstance(kv_cache_spec, OscarKVCacheSpec):
+                    num_blocks = self.kv_cache_config.num_blocks
+                else:
+                    assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
+                    num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                 if isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
                     num_blocks_per_kv_block = (
@@ -9325,6 +9386,20 @@ class GPUModelRunner(
                         assert len(kv_cache_stride_order) == len(kv_cache_shape)
                     except (AttributeError, NotImplementedError):
                         kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
+                    if isinstance(kv_cache_spec, OscarKVCacheSpec):
+                        if kernel_block_size != kv_cache_spec.block_size:
+                            raise ValueError("OSCAR requires kernel block size 16")
+                        max_num_seqs = self.kv_cache_config.oscar_max_num_seqs
+                        assert max_num_seqs is not None
+                        kv_caches[layer_name] = _reshape_oscar_kv_cache(
+                            raw_tensor,
+                            kv_cache_spec,
+                            kv_cache_shape,
+                            kv_cache_stride_order,
+                            kernel_num_blocks,
+                            max_num_seqs,
+                        )
+                        continue
                     # The allocation respects the backend-defined stride order
                     # to ensure the semantic remains consistent for each
                     # backend. We first obtain the generic kv cache shape and
@@ -9506,6 +9581,14 @@ class GPUModelRunner(
         """
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        for group in kv_cache_config.kv_cache_groups:
+            if isinstance(group.kv_cache_spec, OscarKVCacheSpec):
+                spec = group.kv_cache_spec
+                self.oscar_prefix_page_ids = self._make_buffer(
+                    self.max_num_reqs,
+                    spec.prefix_tokens // spec.block_size,
+                    dtype=torch.int32,
+                )
         self._mamba_copy_bufs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)

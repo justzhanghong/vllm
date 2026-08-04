@@ -1693,6 +1693,47 @@ class EngineArgs:
                 merged,
                 num_layers,
             )
+        elif resolved_cache_dtype == "oscar_int2":
+            from vllm.model_executor.layers.quantization.oscar.config import (
+                OscarConfig,
+            )
+
+            oscar_config = OscarConfig.from_cache_dtype(
+                resolved_cache_dtype, model_config.get_head_size()
+            )
+            oscar_config.validate_prototype_settings()
+            if not self.enforce_eager:
+                raise ValueError("OSCAR prototype requires --enforce-eager")
+            if cache_config.enable_prefix_caching:
+                if self.async_scheduling is True:
+                    raise ValueError(
+                        "OSCAR prefix caching does not support async scheduling"
+                    )
+                self.async_scheduling = False
+            if self.speculative_config is not None:
+                raise ValueError(
+                    "OSCAR prototype does not support speculative decoding"
+                )
+            if (
+                self.kv_transfer_config is not None
+                and self.kv_transfer_config.is_kv_transfer_instance
+            ):
+                raise ValueError("OSCAR prototype does not support KV connectors")
+            if cache_config.kv_offloading_size is not None:
+                raise ValueError("OSCAR prototype does not support KV cache offloading")
+            if cache_config.kv_cache_dtype_skip_layers:
+                raise ValueError(
+                    "OSCAR mixed-token cache must be enabled on every attention "
+                    "layer; --kv-cache-dtype-skip-layers is unsupported"
+                )
+            logger.info(
+                "OSCAR KV cache enabled: prefix=%d BF16, recent=%d BF16, "
+                "history=rotation+clip+INT2, k_clip=%.2f, v_clip=%.2f",
+                oscar_config.prefix_tokens,
+                oscar_config.recent_tokens,
+                oscar_config.k_clip_ratio,
+                oscar_config.v_clip_ratio,
+            )
 
         ray_runtime_env = None
         if is_ray_initialized():

@@ -193,5 +193,8 @@ class DefaultModelState(ModelState):
             kv_cache_config=kv_cache_config,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
+            oscar_hp_row_ids=input_batch.oscar_hp_row_ids,
+            oscar_prefix_page_ids=input_batch.oscar_prefix_page_ids,
+            oscar_shared_hit_tokens=input_batch.oscar_shared_hit_tokens,
         )
         return attn_metadata

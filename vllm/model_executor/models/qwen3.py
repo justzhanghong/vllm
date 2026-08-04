@@ -42,6 +42,11 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.oscar.config import OscarConfig
+from vllm.model_executor.layers.quantization.oscar.rotation import (
+    absorb_v_rotation_into_qkv,
+    get_layer_rotation,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.sequence import IntermediateTensors
@@ -337,4 +342,49 @@ class Qwen3ForCausalLM(
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(weights)
+        loaded_weights = loader.load_weights(weights)
+        self._maybe_absorb_oscar_v_rotation()
+        return loaded_weights
+
+    def _maybe_absorb_oscar_v_rotation(self) -> None:
+        cache_dtype = self.vllm_config.cache_config.cache_dtype
+        if cache_dtype != "oscar_int2":
+            return
+        oscar_config = OscarConfig.from_cache_dtype(cache_dtype, self.config.head_dim)
+        if not oscar_config.absorb_v_rotation:
+            return
+        if get_tensor_model_parallel_world_size() != 1:
+            raise RuntimeError(
+                "VLLM_OSCAR_ABSORB_V_ROTATION currently supports TP=1 only"
+            )
+        if self.vllm_config.lora_config is not None:
+            raise RuntimeError("VLLM_OSCAR_ABSORB_V_ROTATION does not support LoRA")
+        if self.quant_config is not None:
+            raise RuntimeError(
+                "VLLM_OSCAR_ABSORB_V_ROTATION currently supports dense "
+                "unquantized Qwen3 weights only"
+            )
+
+        folded_layers = 0
+        for layer_idx in range(self.model.start_layer, self.model.end_layer):
+            attn = self.model.layers[layer_idx].self_attn
+            if getattr(attn.attn, "oscar_v_rotation_absorbed", False):
+                raise RuntimeError(
+                    f"OSCAR V rotation was already absorbed for layer {layer_idx}"
+                )
+            rotation = get_layer_rotation(
+                oscar_config.v_rotation_path,
+                attn.attn.layer_name,
+                attn.head_dim,
+                attn.qkv_proj.weight.device,
+                torch.float32,
+            )
+            absorb_v_rotation_into_qkv(attn, rotation)
+            attn.attn.oscar_v_rotation_absorbed = True
+            folded_layers += 1
+        if folded_layers == 0:
+            raise RuntimeError(
+                "VLLM_OSCAR_ABSORB_V_ROTATION was enabled but no local Qwen3 "
+                "layers were folded"
+            )
+        logger.info("Absorbed OSCAR V rotation into %d Qwen3 QKV layers", folded_layers)

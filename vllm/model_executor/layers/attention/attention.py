@@ -619,6 +619,27 @@ class Attention(nn.Module, AttentionLayerBase):
                 dtype=self.kv_cache_torch_dtype,
                 tq_slot_size=tq_config.slot_size_aligned,
             )
+        elif self.kv_cache_dtype == "oscar_int2":
+            from vllm.model_executor.layers.quantization.oscar.config import (
+                OscarConfig,
+            )
+            from vllm.v1.kv_cache_interface import OscarKVCacheSpec
+
+            oscar_config = OscarConfig.from_cache_dtype(
+                self.kv_cache_dtype, self.head_size
+            )
+            return OscarKVCacheSpec(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size_v,
+                dtype=self.kv_cache_torch_dtype,
+                quant_slot_size=oscar_config.slot_size_aligned,
+                group_size=oscar_config.group_size,
+                prefix_tokens=oscar_config.prefix_tokens,
+                recent_tokens=oscar_config.recent_tokens,
+                prefix_cache_extra_tokens=oscar_config.prefix_cache_extra_tokens,
+            )
         else:
             return FullAttentionSpec(
                 block_size=block_size,

@@ -46,7 +46,7 @@ from vllm.tasks import SupportedTask
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, OscarKVCacheSpec
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
@@ -338,6 +338,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        for group in kv_cache_config.kv_cache_groups:
+            if isinstance(group.kv_cache_spec, OscarKVCacheSpec):
+                spec = group.kv_cache_spec
+                self.input_buffers.set_oscar_prefix_pages_per_request(
+                    spec.prefix_tokens // spec.block_size
+                )
         block_sizes = [
             kv_cache_group.kv_cache_spec.block_size
             for kv_cache_group in kv_cache_config.kv_cache_groups
@@ -812,6 +818,57 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         seq_lens_cpu_upper_bound = torch.from_numpy(seq_lens_cpu_upper_bound_np)
 
+        oscar_hp_row_ids = None
+        oscar_prefix_page_ids = None
+        oscar_shared_hit_tokens = None
+        if self.kv_cache_config.oscar_max_num_seqs is not None:
+            expected_req_ids = set(req_ids)
+            hp_req_ids = set(scheduler_output.oscar_hp_row_ids)
+            prefix_req_ids = set(scheduler_output.oscar_prefix_page_ids)
+            shared_req_ids = set(scheduler_output.oscar_shared_hit_tokens)
+            if (
+                hp_req_ids != expected_req_ids
+                or prefix_req_ids != expected_req_ids
+                or shared_req_ids != expected_req_ids
+            ):
+                raise RuntimeError(
+                    "OSCAR scheduler output has incomplete BF16 ownership: "
+                    f"expected={sorted(expected_req_ids)}, "
+                    f"hp={sorted(hp_req_ids)}, prefix={sorted(prefix_req_ids)}, "
+                    f"shared={sorted(shared_req_ids)}"
+                )
+            hp_rows_np = np.full(self.max_num_reqs, -1, dtype=np.int32)
+            hp_rows_np[:num_reqs] = [
+                scheduler_output.oscar_hp_row_ids[req_id] for req_id in req_ids
+            ]
+            async_copy_to_gpu(hp_rows_np, out=self.input_buffers.oscar_hp_row_ids)
+            oscar_hp_row_ids = self.input_buffers.oscar_hp_row_ids[:num_reqs_padded]
+
+            prefix_pages_np = np.full(
+                self.input_buffers.oscar_prefix_page_ids.shape, -1, dtype=np.int32
+            )
+            prefix_pages_np[:num_reqs] = [
+                scheduler_output.oscar_prefix_page_ids[req_id] for req_id in req_ids
+            ]
+            async_copy_to_gpu(
+                prefix_pages_np, out=self.input_buffers.oscar_prefix_page_ids
+            )
+            oscar_prefix_page_ids = self.input_buffers.oscar_prefix_page_ids[
+                :num_reqs_padded
+            ]
+
+            shared_hit_np = np.zeros(self.max_num_reqs, dtype=np.int32)
+            shared_hit_np[:num_reqs] = [
+                scheduler_output.oscar_shared_hit_tokens[req_id]
+                for req_id in req_ids
+            ]
+            async_copy_to_gpu(
+                shared_hit_np, out=self.input_buffers.oscar_shared_hit_tokens
+            )
+            oscar_shared_hit_tokens = self.input_buffers.oscar_shared_hit_tokens[
+                :num_reqs_padded
+            ]
+
         return InputBatch(
             req_ids=req_ids,
             num_reqs=num_reqs,
@@ -835,6 +892,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
             has_structured_output_reqs=scheduler_output.has_structured_output_requests,
+            oscar_hp_row_ids=oscar_hp_row_ids,
+            oscar_prefix_page_ids=oscar_prefix_page_ids,
+            oscar_shared_hit_tokens=oscar_shared_hit_tokens,
         )
 
     def prepare_attn(

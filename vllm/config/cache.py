@@ -31,6 +31,7 @@ CacheDType = Literal[
     "int8_per_token_head",
     "fp8_per_token_head",
     "nvfp4",
+    "oscar_int2",
     "oscar_mla_int2",
 ]
 MambaDType = Literal["auto", "float32", "float16"]

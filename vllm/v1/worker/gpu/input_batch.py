@@ -26,10 +26,26 @@ class InputBuffers:
             max_num_reqs + 1, dtype=torch.int32, device=device
         )
         self.seq_lens = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
+        self.oscar_hp_row_ids = torch.arange(
+            max_num_reqs, dtype=torch.int32, device=device
+        )
+        self.oscar_shared_hit_tokens = torch.zeros(
+            max_num_reqs, dtype=torch.int32, device=device
+        )
+        self.set_oscar_prefix_pages_per_request(4)
         # DCP: per-request local seq_lens buffer
         self.dcp_local_seq_lens = torch.zeros(
             max_num_reqs, dtype=torch.int32, device=device
         )
+
+    def set_oscar_prefix_pages_per_request(self, num_pages: int) -> None:
+        if num_pages <= 0:
+            raise ValueError("OSCAR requires at least one BF16 prefix page")
+        self.oscar_prefix_page_ids = torch.arange(
+            self.max_num_reqs * num_pages,
+            dtype=torch.int32,
+            device=self.device,
+        ).view(self.max_num_reqs, num_pages)
 
 
 @dataclass
@@ -78,6 +94,11 @@ class InputBatch:
 
     # Whether any requests in batch use structured output.
     has_structured_output_reqs: bool
+
+    # Full-attention OSCAR scheduler-owned cache metadata.
+    oscar_hp_row_ids: torch.Tensor | None = None
+    oscar_prefix_page_ids: torch.Tensor | None = None
+    oscar_shared_hit_tokens: torch.Tensor | None = None
 
     @classmethod
     def make_dummy(
@@ -148,6 +169,9 @@ class InputBatch:
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
             has_structured_output_reqs=False,
+            oscar_hp_row_ids=input_buffers.oscar_hp_row_ids[:num_reqs],
+            oscar_prefix_page_ids=input_buffers.oscar_prefix_page_ids[:num_reqs],
+            oscar_shared_hit_tokens=input_buffers.oscar_shared_hit_tokens[:num_reqs],
         )
 
 

@@ -1098,6 +1098,15 @@ class Scheduler(SchedulerInterface):
             oscar_mla_cache_metadata=self.kv_cache_manager.get_oscar_mla_metadata(
                 list(num_scheduled_tokens)
             ),
+            oscar_hp_row_ids=self.kv_cache_manager.get_oscar_hp_row_ids(
+                list(num_scheduled_tokens)
+            ),
+            oscar_prefix_page_ids=self.kv_cache_manager.get_oscar_prefix_page_ids(
+                list(num_scheduled_tokens)
+            ),
+            oscar_shared_hit_tokens=self.kv_cache_manager.get_oscar_shared_hit_tokens(
+                list(num_scheduled_tokens)
+            ),
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:

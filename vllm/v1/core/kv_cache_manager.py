@@ -14,7 +14,10 @@ from vllm.model_executor.layers.quantization.oscar_mla.cache import (
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
-from vllm.v1.core.single_type_kv_cache_manager import OscarMLAKVCacheManager
+from vllm.v1.core.single_type_kv_cache_manager import (
+    OscarKVCacheManager,
+    OscarMLAKVCacheManager,
+)
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
@@ -541,6 +544,43 @@ class KVCacheManager:
         manager = self.coordinator.single_type_managers[0]
         assert isinstance(manager, OscarMLAKVCacheManager)
         return {request_id: manager.metadata(request_id) for request_id in request_ids}
+
+    def get_oscar_hp_row_ids(self, request_ids: Sequence[str]) -> dict[str, int]:
+        """Return stable BF16 pool rows for scheduled OSCAR requests."""
+        if self.kv_cache_config.oscar_max_num_seqs is None:
+            return {}
+        assert len(self.coordinator.single_type_managers) == 1
+        manager = self.coordinator.single_type_managers[0]
+        assert isinstance(manager, OscarKVCacheManager)
+        return {
+            request_id: manager.get_hp_row(request_id) for request_id in request_ids
+        }
+
+    def get_oscar_prefix_page_ids(
+        self, request_ids: Sequence[str]
+    ) -> dict[str, tuple[int, ...]]:
+        """Return scheduler-owned BF16 prefix pages for OSCAR requests."""
+        if self.kv_cache_config.oscar_max_num_seqs is None:
+            return {}
+        assert len(self.coordinator.single_type_managers) == 1
+        manager = self.coordinator.single_type_managers[0]
+        assert isinstance(manager, OscarKVCacheManager)
+        return {
+            request_id: manager.get_prefix_page_ids(request_id)
+            for request_id in request_ids
+        }
+
+    def get_oscar_shared_hit_tokens(self, request_ids: Sequence[str]) -> dict[str, int]:
+        """Return initial shared cache-hit lengths for OSCAR requests."""
+        if self.kv_cache_config.oscar_max_num_seqs is None:
+            return {}
+        assert len(self.coordinator.single_type_managers) == 1
+        manager = self.coordinator.single_type_managers[0]
+        assert isinstance(manager, OscarKVCacheManager)
+        return {
+            request_id: manager.get_shared_hit_tokens(request_id)
+            for request_id in request_ids
+        }
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """Cache the blocks for the request, if enabled.

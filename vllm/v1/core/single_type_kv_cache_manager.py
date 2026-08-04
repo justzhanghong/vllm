@@ -18,6 +18,10 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashWithGroupId,
     KVCacheBlock,
 )
+from vllm.v1.core.oscar_kv_cache import (
+    OscarHPRowAllocator,
+    OscarKVCacheCapacityError,
+)
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     CrossAttentionSpec,
@@ -25,6 +29,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
+    OscarKVCacheSpec,
     OscarMLAAttentionSpec,
     SinkFullAttentionSpec,
     SlidingWindowSpec,
@@ -497,6 +502,217 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             else:
                 break
         return num_common_blocks
+
+
+class OscarKVCacheManager(FullAttentionManager):
+    """Full-attention manager for shared prefix and request-owned recent BF16."""
+
+    def __init__(
+        self,
+        kv_cache_spec: OscarKVCacheSpec,
+        block_pool: BlockPool,
+        enable_caching: bool,
+        kv_cache_group_id: int,
+        max_num_seqs: int,
+        dcp_world_size: int = 1,
+        pcp_world_size: int = 1,
+    ) -> None:
+        super().__init__(
+            kv_cache_spec,
+            block_pool,
+            enable_caching,
+            kv_cache_group_id,
+            dcp_world_size,
+            pcp_world_size,
+        )
+        self.oscar_kv_cache_spec = kv_cache_spec
+        self.hp_rows = OscarHPRowAllocator(max_num_seqs)
+        self.prefix_pages_per_request = kv_cache_spec.prefix_tokens // self.block_size
+        extra_prefix_pages = cdiv(
+            kv_cache_spec.prefix_cache_extra_tokens, self.block_size
+        )
+        self.num_prefix_pages = (
+            max_num_seqs * self.prefix_pages_per_request + extra_prefix_pages
+        )
+        self.free_prefix_pages = list(range(self.num_prefix_pages - 1, -1, -1))
+        self.shared_hit_tokens: dict[str, int] = {}
+        self.pending_ready_block_ids: set[int] = set()
+        self.block_pool.register_block_reuse_callback(self._release_block_state)
+
+    @property
+    def num_free_prefix_pages(self) -> int:
+        return len(self.free_prefix_pages)
+
+    def _release_block_state(self, block: KVCacheBlock) -> None:
+        self.pending_ready_block_ids.discard(block.block_id)
+        if block.oscar_prefix_page_id is not None:
+            self.free_prefix_pages.append(block.oscar_prefix_page_id)
+            block.oscar_prefix_page_id = None
+        block.oscar_prefix_ready = False
+        block.oscar_int2_ready = False
+
+    def _reclaim_prefix_pages(self, count: int) -> None:
+        if len(self.free_prefix_pages) >= count:
+            return
+        for block in self.block_pool.free_block_queue.get_all_free_blocks():
+            if block.oscar_prefix_page_id is None:
+                continue
+            self.block_pool.evict_blocks({block.block_id})
+            self._release_block_state(block)
+            if len(self.free_prefix_pages) >= count:
+                return
+        raise OscarKVCacheCapacityError(
+            "OSCAR BF16 prefix pages are exhausted by active requests"
+        )
+
+    def _allocate_prefix_pages(
+        self, request_id: str, first_new_block: int, new_blocks: list[KVCacheBlock]
+    ) -> None:
+        for offset, block in enumerate(new_blocks):
+            block_index = first_new_block + offset
+            if block_index >= self.prefix_pages_per_request:
+                break
+            if block.oscar_prefix_page_id is not None:
+                continue
+            self._reclaim_prefix_pages(1)
+            block.oscar_prefix_page_id = self.free_prefix_pages.pop()
+            block.oscar_prefix_ready = False
+
+    @classmethod
+    def find_longest_cache_hit(
+        cls,
+        block_hashes: BlockHashList,
+        max_length: int,
+        kv_cache_group_ids: list[int],
+        block_pool: BlockPool,
+        kv_cache_spec: KVCacheSpec,
+        use_eagle: bool,
+        alignment_tokens: int,
+        dcp_world_size: int = 1,
+        pcp_world_size: int = 1,
+    ) -> tuple[list[KVCacheBlock], ...]:
+        assert isinstance(kv_cache_spec, OscarKVCacheSpec)
+        computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
+            [] for _ in kv_cache_group_ids
+        )
+        block_size = kv_cache_spec.block_size
+        max_num_blocks = max_length // block_size
+        for block_hash in itertools.islice(block_hashes, max_num_blocks):
+            cached = block_pool.get_cached_block(block_hash, kv_cache_group_ids)
+            if not cached or not all(
+                (block.oscar_prefix_page_id is not None and block.oscar_prefix_ready)
+                or block.oscar_int2_ready
+                for block in cached
+            ):
+                break
+            for computed, block in zip(computed_blocks, cached):
+                computed.append(block)
+        if use_eagle and computed_blocks[0]:
+            for computed in computed_blocks:
+                computed.pop()
+        while (
+            block_size != alignment_tokens
+            and len(computed_blocks[0]) * block_size % alignment_tokens != 0
+        ):
+            for computed in computed_blocks:
+                computed.pop()
+        return computed_blocks
+
+    def allocate_new_blocks(
+        self, request_id: str, num_tokens: int, num_tokens_main_model: int
+    ) -> list[KVCacheBlock]:
+        first_new_block = len(self.req_to_blocks.get(request_id, ()))
+        num_required_blocks = cdiv(num_tokens, self.block_size)
+        needed_prefix_pages = max(
+            0,
+            min(num_required_blocks, self.prefix_pages_per_request)
+            - min(first_new_block, self.prefix_pages_per_request),
+        )
+        self._reclaim_prefix_pages(needed_prefix_pages)
+        allocated_row = request_id not in self.hp_rows.request_rows
+        if allocated_row:
+            self.hp_rows.allocate(request_id)
+            self.shared_hit_tokens[request_id] = first_new_block * self.block_size
+        try:
+            new_blocks = super().allocate_new_blocks(
+                request_id, num_tokens, num_tokens_main_model
+            )
+            self._allocate_prefix_pages(request_id, first_new_block, new_blocks)
+            return new_blocks
+        except Exception:
+            if allocated_row:
+                self.hp_rows.free(request_id)
+                self.shared_hit_tokens.pop(request_id, None)
+            raise
+
+    def free(self, request_id: str) -> None:
+        blocks = self.req_to_blocks.get(request_id, ())
+        self.hp_rows.free(request_id)
+        self.shared_hit_tokens.pop(request_id, None)
+        for block in blocks:
+            if block.ref_cnt == 1 and (
+                not self.enable_caching or block.block_hash is None
+            ):
+                self._release_block_state(block)
+        super().free(request_id)
+
+    def get_hp_row(self, request_id: str) -> int:
+        return self.hp_rows.get(request_id)
+
+    def get_shared_hit_tokens(self, request_id: str) -> int:
+        return self.shared_hit_tokens[request_id]
+
+    def get_prefix_page_ids(self, request_id: str) -> tuple[int, ...]:
+        blocks = self.req_to_blocks[request_id]
+        pages = [
+            block.oscar_prefix_page_id
+            for block in blocks[: self.prefix_pages_per_request]
+        ]
+        pages.extend([-1] * (self.prefix_pages_per_request - len(pages)))
+        if any(page is None for page in pages):
+            raise RuntimeError(f"OSCAR request {request_id} has an unowned prefix page")
+        return tuple(int(page) for page in pages if page is not None)
+
+    def cache_blocks(self, request: Request, num_tokens: int) -> None:
+        super().cache_blocks(request, num_tokens)
+        blocks = self.req_to_blocks[request.request_id]
+        num_full_blocks = min(len(blocks), num_tokens // self.block_size)
+        for block in blocks[: min(num_full_blocks, self.prefix_pages_per_request)]:
+            if not block.oscar_prefix_ready:
+                self.pending_ready_block_ids.add(block.block_id)
+        int2_ready_blocks = max(
+            self.prefix_pages_per_request,
+            (num_tokens - self.oscar_kv_cache_spec.recent_tokens) // self.block_size,
+        )
+        for block in blocks[self.prefix_pages_per_request : int2_ready_blocks]:
+            if not block.oscar_int2_ready:
+                self.pending_ready_block_ids.add(block.block_id)
+
+    def new_step_starts(self) -> None:
+        for block_id in self.pending_ready_block_ids:
+            block = self.block_pool.blocks[block_id]
+            if block.oscar_prefix_page_id is not None:
+                block.oscar_prefix_ready = True
+            else:
+                block.oscar_int2_ready = True
+        self.pending_ready_block_ids.clear()
+
+    def reset_prefix_cache(self) -> None:
+        for block in self.block_pool.blocks:
+            if block.ref_cnt == 0:
+                self._release_block_state(block)
+
+    def assert_prefix_pages_consistent(self) -> None:
+        free = set(self.free_prefix_pages)
+        allocated = {
+            block.oscar_prefix_page_id
+            for block in self.block_pool.blocks
+            if block.oscar_prefix_page_id is not None
+        }
+        if len(free) != len(self.free_prefix_pages) or free & allocated:
+            raise RuntimeError("OSCAR BF16 prefix page ownership is inconsistent")
+        if free | allocated != set(range(self.num_prefix_pages)):
+            raise RuntimeError("OSCAR BF16 prefix page accounting is not conserved")
 
 
 class OscarMLAKVCacheManager(FullAttentionManager):
@@ -1270,6 +1486,7 @@ class SinkFullAttentionManager(FullAttentionManager):
 spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     FullAttentionSpec: FullAttentionManager,
     TQFullAttentionSpec: FullAttentionManager,
+    OscarKVCacheSpec: OscarKVCacheManager,
     MLAAttentionSpec: FullAttentionManager,
     OscarMLAAttentionSpec: OscarMLAKVCacheManager,
     SlidingWindowSpec: SlidingWindowManager,

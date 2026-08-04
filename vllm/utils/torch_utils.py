@@ -47,6 +47,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "turboquant_k3v4_nc": torch.uint8,
     "turboquant_3bit_nc": torch.uint8,
     "nvfp4": torch.uint8,
+    "oscar_int2": torch.uint8,
     # OSCAR MLA uses heterogeneous INT2/FP32/BF16 physical pools. uint8 is
     # only the generic runtime marker; OscarMLAAttentionSpec owns the layout.
     "oscar_mla_int2": torch.uint8,

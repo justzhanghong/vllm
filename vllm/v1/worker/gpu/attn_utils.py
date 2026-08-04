@@ -18,6 +18,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    OscarKVCacheSpec,
     OscarMLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -143,6 +144,60 @@ def _allocate_kv_cache(kv_cache_config: KVCacheConfig, device: torch.device):
     return kv_cache_raw_tensors
 
 
+def _reshape_oscar_kv_cache(
+    kv_raw_tensor: torch.Tensor,
+    kv_cache_spec: OscarKVCacheSpec,
+    kv_cache_shape: tuple[int, ...],
+    kv_cache_stride_order: tuple[int, ...],
+    num_blocks: int,
+    max_num_seqs: int,
+) -> list[torch.Tensor]:
+    """Split one accounted allocation into quant, prefix, and recent tensors."""
+    if kv_cache_spec.head_size_v != kv_cache_spec.head_size:
+        raise ValueError("OSCAR requires equal key and value head sizes")
+
+    quant_bytes = num_blocks * kv_cache_spec.page_size_bytes
+    prefix_slots = max_num_seqs * kv_cache_spec.prefix_tokens
+    prefix_slots += (
+        (kv_cache_spec.prefix_cache_extra_tokens + kv_cache_spec.block_size - 1)
+        // kv_cache_spec.block_size
+        * kv_cache_spec.block_size
+    )
+    recent_slots = max_num_seqs * kv_cache_spec.recent_tokens
+    hp_slot_bytes = kv_cache_spec.hp_page_size_bytes // kv_cache_spec.block_size
+    prefix_bytes = prefix_slots * hp_slot_bytes
+    recent_bytes = recent_slots * hp_slot_bytes
+    expected_bytes = quant_bytes + prefix_bytes + recent_bytes
+    if kv_raw_tensor.numel() != expected_bytes:
+        raise RuntimeError(
+            "OSCAR KV allocation size mismatch: "
+            f"actual={kv_raw_tensor.numel()}, expected={expected_bytes}"
+        )
+
+    permuted_shape = tuple(kv_cache_shape[i] for i in kv_cache_stride_order)
+    inv_order = [
+        kv_cache_stride_order.index(i) for i in range(len(kv_cache_stride_order))
+    ]
+    quant_cache = (
+        kv_raw_tensor[:quant_bytes]
+        .view(kv_cache_spec.dtype)
+        .view(permuted_shape)
+        .permute(*inv_order)
+    )
+    hp_shape_tail = (kv_cache_spec.num_kv_heads, 2, kv_cache_spec.head_size)
+    prefix_cache = (
+        kv_raw_tensor[quant_bytes : quant_bytes + prefix_bytes]
+        .view(kv_cache_spec.hp_dtype)
+        .view(prefix_slots, *hp_shape_tail)
+    )
+    recent_cache = (
+        kv_raw_tensor[quant_bytes + prefix_bytes :]
+        .view(kv_cache_spec.hp_dtype)
+        .view(recent_slots, *hp_shape_tail)
+    )
+    return [quant_cache, prefix_cache, recent_cache]
+
+
 def _reshape_kv_cache(
     kv_cache_config: KVCacheConfig,
     kv_cache_raw_tensors: dict[str, torch.Tensor],
@@ -168,8 +223,11 @@ def _reshape_kv_cache(
                     max_num_seqs=max_num_seqs,
                 )
                 continue
-            assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-            num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+            if isinstance(kv_cache_spec, OscarKVCacheSpec):
+                num_blocks = kv_cache_config.num_blocks
+            else:
+                assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
+                num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
 
             attn_backend = attn_backends[layer_name]
             kv_cache_shape = attn_backend.get_kv_cache_shape(
@@ -193,10 +251,22 @@ def _reshape_kv_cache(
                 for i in range(len(kv_cache_stride_order))
             ]
 
-            dtype = kv_cache_spec.dtype
-            raw_tensor = raw_tensor.view(dtype)
-            raw_tensor = raw_tensor.view(kv_cache_shape)
-            kv_caches[layer_name] = raw_tensor.permute(*inv_order)
+            if isinstance(kv_cache_spec, OscarKVCacheSpec):
+                max_num_seqs = kv_cache_config.oscar_max_num_seqs
+                assert max_num_seqs is not None
+                kv_caches[layer_name] = _reshape_oscar_kv_cache(
+                    raw_tensor,
+                    kv_cache_spec,
+                    kv_cache_shape,
+                    kv_cache_stride_order,
+                    num_blocks,
+                    max_num_seqs,
+                )
+            else:
+                dtype = kv_cache_spec.dtype
+                raw_tensor = raw_tensor.view(dtype)
+                raw_tensor = raw_tensor.view(kv_cache_shape)
+                kv_caches[layer_name] = raw_tensor.permute(*inv_order)
     return kv_caches
 
 
@@ -242,6 +312,9 @@ def build_attn_metadata(
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
     dcp_local_seq_lens: torch.Tensor | None = None,
     encoder_seq_lens: dict[int, tuple[torch.Tensor, np.ndarray]] | None = None,
+    oscar_hp_row_ids: torch.Tensor | None = None,
+    oscar_prefix_page_ids: torch.Tensor | None = None,
+    oscar_shared_hit_tokens: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
@@ -268,6 +341,9 @@ def build_attn_metadata(
             slot_mapping=slot_mapping,
             causal=True,
             dcp_local_seq_lens=dcp_local_seq_lens,
+            oscar_hp_row_ids=oscar_hp_row_ids,
+            oscar_prefix_page_ids=oscar_prefix_page_ids,
+            oscar_shared_hit_tokens=oscar_shared_hit_tokens,
         )
         if encoder_seq_lens and i in encoder_seq_lens:
             encoder_seq_lens_gpu, encoder_seq_lens_cpu = encoder_seq_lens[i]

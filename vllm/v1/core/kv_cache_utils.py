@@ -26,6 +26,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     KVCacheTensor,
     MLAAttentionSpec,
+    OscarKVCacheSpec,
     OscarMLAAttentionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
@@ -128,6 +129,12 @@ class KVCacheBlock:
 
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
+
+    # OSCAR full-attention state. The prefix page follows the lifetime of the
+    # quantized block so a cached block can be reused by another request.
+    oscar_prefix_page_id: int | None = None
+    oscar_prefix_ready: bool = False
+    oscar_int2_ready: bool = False
 
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
@@ -1139,6 +1146,7 @@ def get_kv_cache_config_from_groups(
         )
 
     # Determine how model runners should initialize the KV cache tensors.
+    oscar_max_num_seqs: int | None = None
     oscar_mla_max_num_seqs: int | None = None
     oscar_mla_history_pages: int | None = None
     only_group_spec = kv_cache_groups[0].kv_cache_spec
@@ -1160,7 +1168,59 @@ def get_kv_cache_config_from_groups(
         if isinstance(spec, OscarMLAAttentionSpec)
     }
 
-    if oscar_mla_specs:
+    if len(kv_cache_groups) == 1 and isinstance(
+        only_group_spec, OscarKVCacheSpec
+    ):
+        if vllm_config.cache_config.num_gpu_blocks_override is not None:
+            raise ValueError("OSCAR does not support num_gpu_blocks_override")
+        from vllm.v1.core.oscar_kv_cache import (
+            OscarKVCacheGeometry,
+            plan_oscar_kv_cache,
+        )
+
+        group = kv_cache_groups[0]
+        spec = group.kv_cache_spec
+        assert isinstance(spec, OscarKVCacheSpec)
+        geometry = OscarKVCacheGeometry(
+            num_layers=len(group.layer_names),
+            num_kv_heads=spec.num_kv_heads,
+            head_size=spec.head_size,
+            value_head_size=spec.head_size_v,
+            quant_slot_size=spec.quant_slot_size,
+            group_size=spec.group_size,
+            block_size=spec.block_size,
+            prefix_tokens=spec.prefix_tokens,
+            recent_tokens=spec.recent_tokens,
+            hp_element_size=get_dtype_size(spec.hp_dtype),
+        )
+        oscar_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        plan = plan_oscar_kv_cache(
+            geometry,
+            available_memory,
+            oscar_max_num_seqs,
+            spec.prefix_cache_extra_tokens,
+        )
+        per_layer_size = plan.allocated_bytes // geometry.num_layers
+        assert per_layer_size * geometry.num_layers == plan.allocated_bytes
+        num_blocks = plan.quant_pages
+        kv_cache_tensors = [
+            KVCacheTensor(size=per_layer_size, shared_by=[layer_name])
+            for layer_name in group.layer_names
+        ]
+        if not suppress_log:
+            logger.info(
+                "OSCAR KV pools: INT2 history=%d tokens (%s GiB), BF16 "
+                "prefix=%d tokens (%s GiB), BF16 recent=%d tokens (%s GiB), "
+                "unused=%d bytes",
+                plan.quant_slots,
+                format_gib(plan.quant_bytes),
+                plan.prefix_slots,
+                format_gib(plan.prefix_slots * geometry.hp_token_bytes),
+                plan.recent_slots,
+                format_gib(plan.recent_slots * geometry.hp_token_bytes),
+                plan.unused_bytes,
+            )
+    elif oscar_mla_specs:
         if vllm_config.cache_config.num_gpu_blocks_override is not None:
             raise ValueError("OSCAR MLA does not support num_gpu_blocks_override")
         from vllm.model_executor.layers.quantization.oscar_mla.cache import (
@@ -1302,6 +1362,7 @@ def get_kv_cache_config_from_groups(
         num_blocks=num_blocks,
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
+        oscar_max_num_seqs=oscar_max_num_seqs,
         oscar_mla_max_num_seqs=oscar_mla_max_num_seqs,
         oscar_mla_history_pages=oscar_mla_history_pages,
     )

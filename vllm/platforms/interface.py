@@ -542,6 +542,27 @@ class Platform:
                 dtype=kv_cache_dtype,
                 kv_quant_mode=kv_quant_mode,
             ).page_size_bytes
+        elif cache_config.cache_dtype == "oscar_int2":
+            from vllm.model_executor.layers.quantization.oscar.config import (
+                OscarConfig,
+            )
+            from vllm.v1.kv_cache_interface import OscarKVCacheSpec
+
+            oscar_config = OscarConfig.from_cache_dtype(
+                cache_config.cache_dtype, model_config.get_head_size()
+            )
+            attn_page_size_1_token = OscarKVCacheSpec(
+                block_size=1,
+                num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+                head_size=model_config.get_head_size(),
+                head_size_v=model_config.get_head_size(),
+                dtype=kv_cache_dtype,
+                kv_quant_mode=kv_quant_mode,
+                quant_slot_size=oscar_config.slot_size_aligned,
+                group_size=oscar_config.group_size,
+                prefix_tokens=0,
+                recent_tokens=0,
+            ).page_size_bytes
         else:
             attn_page_size_1_token = FullAttentionSpec(
                 block_size=1,

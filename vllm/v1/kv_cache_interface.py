@@ -296,6 +296,63 @@ class TQFullAttentionSpec(FullAttentionSpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class OscarKVCacheSpec(FullAttentionSpec):
+    """Three-pool OSCAR KV cache geometry for one full-attention layer."""
+
+    quant_slot_size: int
+    group_size: int = 128
+    prefix_tokens: int = 64
+    recent_tokens: int = 256
+    prefix_cache_extra_tokens: int = 0
+    hp_dtype: torch.dtype = torch.bfloat16
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        positive = {
+            "quant_slot_size": self.quant_slot_size,
+            "group_size": self.group_size,
+        }
+        invalid = [name for name, value in positive.items() if value <= 0]
+        if invalid:
+            raise ValueError(f"OSCAR spec values must be positive: {invalid}")
+        if self.prefix_tokens < 0 or self.recent_tokens < 0:
+            raise ValueError("OSCAR windows must be non-negative")
+        if self.prefix_cache_extra_tokens < 0:
+            raise ValueError("OSCAR extra prefix tokens must be non-negative")
+        if self.prefix_tokens % self.block_size != 0:
+            raise ValueError("OSCAR prefix window must be block aligned")
+        if self.recent_tokens % self.block_size != 0:
+            raise ValueError("OSCAR recent window must be block aligned")
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        return self.block_size * self.num_kv_heads * self.quant_slot_size
+
+    @property
+    def hp_page_size_bytes(self) -> int:
+        return (
+            self.block_size
+            * self.num_kv_heads
+            * (self.head_size + self.head_size_v)
+            * get_dtype_size(self.hp_dtype)
+        )
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        max_model_len = vllm_config.model_config.max_model_len
+        return cdiv(max_model_len, self.block_size) * self.page_size_bytes
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert all(isinstance(spec, cls) for spec in specs), (
+            "All layers in an OSCAR KV cache group must use OscarKVCacheSpec."
+        )
+        assert all(spec == specs[0] for spec in specs[1:]), (
+            "All layers in an OSCAR KV cache group must have identical geometry."
+        )
+        return copy.deepcopy(specs[0])
+
+
+@dataclass(frozen=True, kw_only=True)
 class MLAAttentionSpec(FullAttentionSpec):
     # TODO(Lucas/Chen): less hacky way to do this
     cache_dtype_str: str | None = None
@@ -698,6 +755,8 @@ class KVCacheConfig:
     """Reserved request rows in the fixed OSCAR MLA BF16 pools."""
     oscar_mla_history_pages: int | None = None
     """Number of pages in OSCAR MLA's independent INT2 history namespace."""
+    oscar_max_num_seqs: int | None = None
+    """Reserved request rows in the full-attention OSCAR BF16 pools."""
 
     @property
     def has_mamba_layers(self) -> bool:

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -180,6 +180,12 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+        self.block_reuse_callbacks: list[Callable[[KVCacheBlock], None]] = []
+
+    def register_block_reuse_callback(
+        self, callback: Callable[[KVCacheBlock], None]
+    ) -> None:
+        self.block_reuse_callbacks.append(callback)
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -339,12 +345,16 @@ class BlockPool:
         if self.enable_caching:
             for block in ret:
                 self._maybe_evict_cached_block(block)
+                for callback in self.block_reuse_callbacks:
+                    callback(block)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         else:
             for block in ret:
+                for callback in self.block_reuse_callbacks:
+                    callback(block)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:

@@ -379,6 +379,9 @@ class CommonAttentionMetadata:
     block_table_tensor: torch.Tensor
     slot_mapping: torch.Tensor
     oscar_mla: "OscarMLABatchMetadata | None" = None
+    oscar_hp_row_ids: torch.Tensor | None = None
+    oscar_prefix_page_ids: torch.Tensor | None = None
+    oscar_shared_hit_tokens: torch.Tensor | None = None
 
     causal: bool = True
 
@@ -490,6 +493,9 @@ class CommonAttentionMetadata:
             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
+            oscar_hp_row_ids=maybe_slice_reqs(self.oscar_hp_row_ids),
+            oscar_prefix_page_ids=maybe_slice_reqs(self.oscar_prefix_page_ids),
+            oscar_shared_hit_tokens=maybe_slice_reqs(self.oscar_shared_hit_tokens),
         )
 
 
