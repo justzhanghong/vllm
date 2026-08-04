@@ -514,7 +514,6 @@ def oscar_decode_attention(
         NUM_KV_SPLITS=NUM_KV_SPLITS,
         BLOCK_DV=BLOCK_D,
         Lv=D,
-        OUTPUT_FP16=0,
         num_warps=4,
         num_stages=2,
     )
