@@ -36,7 +36,9 @@ from vllm.config import (
     AttentionConfig,
     CacheConfig,
     CompilationConfig,
+    CompilationMode,
     ConfigType,
+    CUDAGraphMode,
     DeviceConfig,
     ECTransferConfig,
     EPLBConfig,
@@ -131,6 +133,31 @@ else:
 
 
 logger = init_logger(__name__)
+
+
+def _is_oscar_execution_mode_supported(
+    enforce_eager: bool,
+    compilation_config: CompilationConfig,
+    optimization_level: OptimizationLevel = OptimizationLevel.O2,
+) -> bool:
+    return (
+        enforce_eager
+        or (
+            compilation_config.mode == CompilationMode.VLLM_COMPILE
+            and compilation_config.cudagraph_mode
+            in (
+                CUDAGraphMode.PIECEWISE,
+                CUDAGraphMode.FULL,
+                CUDAGraphMode.FULL_AND_PIECEWISE,
+            )
+        )
+        or (
+            compilation_config.mode is None
+            and compilation_config.cudagraph_mode is None
+            and optimization_level > OptimizationLevel.O0
+        )
+    )
+
 
 # object is used to allow for special typing forms
 T = TypeVar("T")
@@ -1702,8 +1729,16 @@ class EngineArgs:
                 resolved_cache_dtype, model_config.get_head_size()
             )
             oscar_config.validate_prototype_settings()
-            if not self.enforce_eager:
-                raise ValueError("OSCAR prototype requires --enforce-eager")
+            if not _is_oscar_execution_mode_supported(
+                self.enforce_eager,
+                self.compilation_config,
+                self.optimization_level,
+            ):
+                raise ValueError(
+                    "OSCAR prototype requires --enforce-eager or "
+                    "VLLM_COMPILE with PIECEWISE/FULL/FULL_AND_PIECEWISE "
+                    "CUDA Graphs"
+                )
             if cache_config.enable_prefix_caching:
                 if self.async_scheduling is True:
                     raise ValueError(

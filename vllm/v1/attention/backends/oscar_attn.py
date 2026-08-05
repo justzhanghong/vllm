@@ -157,6 +157,21 @@ class OscarMetadata(AttentionMetadata):
 class OscarMetadataBuilder(AttentionMetadataBuilder[OscarMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
 
+    @classmethod
+    def get_cudagraph_support(
+        cls, vllm_config, kv_cache_spec
+    ) -> AttentionCGSupport:
+        scheduler_config = vllm_config.scheduler_config
+        cache_config = vllm_config.cache_config
+        if (
+            scheduler_config.max_num_seqs == 1
+            and not scheduler_config.enable_chunked_prefill
+            and not cache_config.enable_prefix_caching
+            and vllm_config.speculative_config is None
+        ):
+            return AttentionCGSupport.ALWAYS
+        return AttentionCGSupport.NEVER
+
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=False)
@@ -196,7 +211,8 @@ class OscarMetadataBuilder(AttentionMetadataBuilder[OscarMetadata]):
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> OscarMetadata:
         m = self.build(0, common_attn_metadata)
-        m.seq_lens.fill_(1)
+        if common_attn_metadata.max_query_len <= 1:
+            m.seq_lens.fill_(1)
         return m
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):

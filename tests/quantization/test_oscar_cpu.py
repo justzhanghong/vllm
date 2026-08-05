@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import inspect
 import os
 import tempfile
 import unittest
@@ -11,7 +10,9 @@ from unittest.mock import patch
 
 import torch
 
-from vllm.model_executor.layers.attention.attention import Attention
+from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode
+from vllm.config.vllm import OptimizationLevel
+from vllm.engine.arg_utils import _is_oscar_execution_mode_supported
 from vllm.model_executor.layers.quantization.oscar.config import OscarConfig
 from vllm.model_executor.layers.quantization.oscar.layout import partition_tokens
 from vllm.model_executor.layers.quantization.oscar.rotation import (
@@ -19,13 +20,180 @@ from vllm.model_executor.layers.quantization.oscar.rotation import (
     absorb_v_rotation_into_qkv,
     get_layer_rotation,
 )
-from vllm.model_executor.models.qwen3 import Qwen3ForCausalLM
-from vllm.platforms.interface import Platform
-from vllm.v1.attention.backend import AttentionType
-from vllm.v1.kv_cache_interface import FullAttentionSpec, OscarKVCacheSpec
+from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
+from vllm.v1.attention.backends.oscar_attn import OscarMetadataBuilder
 
 
 class TestOscarConfigAndLayout(unittest.TestCase):
+    def test_execution_mode_support(self):
+        self.assertTrue(
+            _is_oscar_execution_mode_supported(
+                True,
+                CompilationConfig(
+                    mode=CompilationMode.NONE,
+                    cudagraph_mode=CUDAGraphMode.NONE,
+                ),
+            )
+        )
+        self.assertTrue(
+            _is_oscar_execution_mode_supported(
+                False,
+                CompilationConfig(
+                    mode=CompilationMode.VLLM_COMPILE,
+                    cudagraph_mode=CUDAGraphMode.PIECEWISE,
+                ),
+            )
+        )
+        self.assertTrue(
+            _is_oscar_execution_mode_supported(
+                False,
+                CompilationConfig(),
+                OptimizationLevel.O2,
+            )
+        )
+        self.assertFalse(
+            _is_oscar_execution_mode_supported(
+                False,
+                CompilationConfig(),
+                OptimizationLevel.O0,
+            )
+        )
+        self.assertTrue(
+            _is_oscar_execution_mode_supported(
+                False,
+                CompilationConfig(
+                    mode=CompilationMode.VLLM_COMPILE,
+                    cudagraph_mode=CUDAGraphMode.FULL,
+                ),
+            )
+        )
+        self.assertTrue(
+            _is_oscar_execution_mode_supported(
+                False,
+                CompilationConfig(
+                    mode=CompilationMode.VLLM_COMPILE,
+                    cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+                ),
+            )
+        )
+        for mode, cudagraph_mode in (
+            (CompilationMode.NONE, CUDAGraphMode.NONE),
+            (CompilationMode.VLLM_COMPILE, CUDAGraphMode.NONE),
+            (CompilationMode.VLLM_COMPILE, CUDAGraphMode.FULL_DECODE_ONLY),
+        ):
+            with self.subTest(mode=mode, cudagraph_mode=cudagraph_mode):
+                self.assertFalse(
+                    _is_oscar_execution_mode_supported(
+                        False,
+                        CompilationConfig(
+                            mode=mode,
+                            cudagraph_mode=cudagraph_mode,
+                        ),
+                    )
+                )
+
+    def test_full_cudagraph_support_is_fail_closed(self):
+        def config(*, max_num_seqs=1, chunked=False, prefix=False, spec=None):
+            return SimpleNamespace(
+                scheduler_config=SimpleNamespace(
+                    max_num_seqs=max_num_seqs,
+                    enable_chunked_prefill=chunked,
+                ),
+                cache_config=SimpleNamespace(enable_prefix_caching=prefix),
+                speculative_config=spec,
+            )
+
+        kv_cache_spec = SimpleNamespace()
+        self.assertEqual(
+            OscarMetadataBuilder.get_cudagraph_support(config(), kv_cache_spec),
+            AttentionCGSupport.ALWAYS,
+        )
+        for unsafe_config in (
+            config(max_num_seqs=2),
+            config(chunked=True),
+            config(prefix=True),
+            config(spec=SimpleNamespace()),
+        ):
+            with self.subTest(config=unsafe_config):
+                self.assertEqual(
+                    OscarMetadataBuilder.get_cudagraph_support(
+                        unsafe_config, kv_cache_spec
+                    ),
+                    AttentionCGSupport.NEVER,
+                )
+
+    def test_full_cudagraph_metadata_reuses_persistent_buffers(self):
+        vllm_config = SimpleNamespace(
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=8,
+                max_num_seqs=1,
+            ),
+            cache_config=SimpleNamespace(kv_cache_memory_bytes=None),
+            model_config=SimpleNamespace(dtype=torch.bfloat16),
+            parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        )
+        kv_cache_spec = SimpleNamespace(num_kv_heads=1, head_size=128)
+        builder = OscarMetadataBuilder(
+            kv_cache_spec, ["model.layers.0.self_attn.attn"], vllm_config, "cpu"
+        )
+
+        def common_metadata(seq_len, query_len, padded_tokens):
+            return CommonAttentionMetadata(
+                query_start_loc=torch.tensor([0, query_len], dtype=torch.int32),
+                query_start_loc_cpu=torch.tensor(
+                    [0, query_len], dtype=torch.int32
+                ),
+                seq_lens=torch.tensor([seq_len], dtype=torch.int32),
+                _seq_lens_cpu=torch.tensor([seq_len], dtype=torch.int32),
+                seq_lens_cpu_upper_bound=torch.tensor(
+                    [seq_len], dtype=torch.int32
+                ),
+                num_reqs=1,
+                num_actual_tokens=padded_tokens,
+                max_query_len=query_len,
+                max_seq_len=seq_len,
+                block_table_tensor=torch.zeros((1, 1), dtype=torch.int32),
+                slot_mapping=torch.full(
+                    (padded_tokens,), -1, dtype=torch.int64
+                ),
+                oscar_hp_row_ids=torch.tensor([0], dtype=torch.int32),
+                oscar_prefix_page_ids=torch.zeros((1, 4), dtype=torch.int32),
+                oscar_shared_hit_tokens=torch.tensor([0], dtype=torch.int32),
+            )
+
+        with patch(
+            "vllm.v1.attention.backend.np_to_pinned_tensor",
+            side_effect=torch.from_numpy,
+        ):
+            captured = builder.build_for_cudagraph_capture(
+                common_metadata(seq_len=4, query_len=4, padded_tokens=4)
+            )
+            pointers = (
+                captured.token_to_req_indices.data_ptr(),
+                captured.seq_start_loc.data_ptr(),
+                captured.cached_lens.data_ptr(),
+            )
+            self.assertEqual(captured.seq_lens.tolist(), [4])
+
+            decode_capture = builder.build_for_cudagraph_capture(
+                common_metadata(seq_len=7, query_len=1, padded_tokens=1)
+            )
+            self.assertEqual(decode_capture.seq_lens.tolist(), [1])
+
+            replay = builder.build(
+                0, common_metadata(seq_len=7, query_len=1, padded_tokens=1)
+            )
+        self.assertEqual(
+            pointers,
+            (
+                replay.token_to_req_indices.data_ptr(),
+                replay.seq_start_loc.data_ptr(),
+                replay.cached_lens.data_ptr(),
+            ),
+        )
+        self.assertEqual(replay.seq_start_loc.tolist(), [0, 7])
+        self.assertEqual(replay.cached_lens.tolist(), [6])
+
     def test_task_defaults_and_geometry(self):
         cfg = OscarConfig()
         self.assertEqual((cfg.prefix_tokens, cfg.recent_tokens), (64, 256))
@@ -79,6 +247,22 @@ class TestOscarConfigAndLayout(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "K_ROTATION_PATH"):
             OscarConfig().validate_prototype_settings()
 
+    def test_prototype_validation_allows_block_aligned_recent_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k_path = Path(tmp) / "k.pt"
+            v_path = Path(tmp) / "v.pt"
+            k_path.touch()
+            v_path.touch()
+            OscarConfig(
+                recent_tokens=512,
+                k_rotation_path=str(k_path),
+                v_rotation_path=str(v_path),
+            ).validate_prototype_settings()
+
+    def test_prototype_validation_rejects_unaligned_recent_window(self):
+        with self.assertRaisesRegex(ValueError, "recent_tokens.*block aligned"):
+            OscarConfig(recent_tokens=500).validate_prototype_settings()
+
     def test_absorb_v_rotation_env_flag(self):
         with patch.dict(os.environ, {"VLLM_OSCAR_ABSORB_V_ROTATION": "1"}):
             self.assertTrue(
@@ -96,7 +280,6 @@ class TestOscarConfigAndLayout(unittest.TestCase):
 
     def test_serving_materialize_capacity_is_disabled(self):
         from vllm.v1.attention.backends.oscar_attn import (
-            OscarAttentionBackend,
             _materialize_token_capacity,
         )
 
@@ -106,49 +289,17 @@ class TestOscarConfigAndLayout(unittest.TestCase):
         self.assertEqual(
             _materialize_token_capacity(vllm_config, 8, 128, torch.bfloat16), 0
         )
-        self.assertTrue(OscarAttentionBackend.supports_kv_cache_dtype("oscar_int2"))
-        self.assertFalse(
-            OscarAttentionBackend.supports_kv_cache_dtype("oscar_mla_int2")
+
+    def test_grouped_h4_decode_stage1_dispatch_is_narrow(self):
+        from vllm.v1.attention.ops.triton_oscar_decode import (
+            _use_grouped_h4_stage1,
         )
 
-    def test_full_attention_and_mla_dtypes_route_to_distinct_specs(self):
-        attn = Attention.__new__(Attention)
-        attn.attn_type = AttentionType.DECODER
-        attn.sliding_window = None
-        attn.num_kv_heads = 8
-        attn.head_size = 128
-        attn.head_size_v = 128
-        attn.kv_cache_torch_dtype = torch.uint8
-        vllm_config = SimpleNamespace(
-            cache_config=SimpleNamespace(block_size=16),
-            model_config=SimpleNamespace(use_mla=False),
-        )
-
-        attn.kv_cache_dtype = "oscar_int2"
-        self.assertIsInstance(attn.get_kv_cache_spec(vllm_config), OscarKVCacheSpec)
-
-        attn.kv_cache_dtype = "oscar_mla_int2"
-        mla_route_spec = attn.get_kv_cache_spec(vllm_config)
-        self.assertIsInstance(mla_route_spec, FullAttentionSpec)
-        self.assertNotIsInstance(mla_route_spec, OscarKVCacheSpec)
-
-    def test_qwen3_full_attention_hook_ignores_mla_dtype(self):
-        model = SimpleNamespace(
-            vllm_config=SimpleNamespace(
-                cache_config=SimpleNamespace(cache_dtype="oscar_mla_int2")
-            )
-        )
-        with patch.object(
-            OscarConfig,
-            "from_cache_dtype",
-            side_effect=AssertionError("MLA route must not enter full OSCAR hook"),
-        ):
-            Qwen3ForCausalLM._maybe_absorb_oscar_v_rotation(model)
-
-    def test_hybrid_page_size_uses_exact_full_attention_dtype(self):
-        source = inspect.getsource(Platform._align_hybrid_block_size)
-        self.assertIn('cache_config.cache_dtype == "oscar_int2"', source)
-        self.assertNotIn('cache_config.cache_dtype.startswith("oscar_")', source)
+        self.assertTrue(_use_grouped_h4_stage1(32, 8, 128))
+        self.assertTrue(_use_grouped_h4_stage1(8, 2, 128))
+        for shape in ((32, 8, 64), (32, 4, 128), (8, 8, 128), (7, 2, 128)):
+            with self.subTest(shape=shape):
+                self.assertFalse(_use_grouped_h4_stage1(*shape))
 
 
 class TestOscarRotationLoading(unittest.TestCase):

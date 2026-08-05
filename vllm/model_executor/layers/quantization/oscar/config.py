@@ -207,7 +207,6 @@ class OscarConfig:
             "key_quant_bits": (self.key_quant_bits, 2),
             "value_quant_bits": (self.value_quant_bits, 2),
             "prefix_tokens": (self.prefix_tokens, 64),
-            "recent_tokens": (self.recent_tokens, 256),
         }
         mismatches = [
             f"{name}={actual} (expected {wanted})"
@@ -218,6 +217,11 @@ class OscarConfig:
             mismatches.append(f"k_clip_ratio={self.k_clip_ratio} (expected 0.96)")
         if not math.isclose(self.v_clip_ratio, 0.92, abs_tol=1e-9):
             mismatches.append(f"v_clip_ratio={self.v_clip_ratio} (expected 0.92)")
+        if self.recent_tokens <= 0 or self.recent_tokens % 16 != 0:
+            mismatches.append(
+                f"recent_tokens={self.recent_tokens} "
+                "(expected positive and block aligned to 16)"
+            )
         if mismatches:
             raise ValueError(
                 "Unsupported OSCAR prototype configuration: " + ", ".join(mismatches)
