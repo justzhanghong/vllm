@@ -934,10 +934,21 @@ def _oscar_decode_stage1_grouped_h4_v(
             )
             values = tl.where(is_hp[:, None], hp_values, values)
 
-        acc0 = acc0 * r0 + tl.sum(p0[:, None] * values, 0)
-        acc1 = acc1 * r1 + tl.sum(p1[:, None] * values, 0)
-        acc2 = acc2 * r2 + tl.sum(p2[:, None] * values, 0)
-        acc3 = acc3 * r3 + tl.sum(p3[:, None] * values, 0)
+        p01 = tl.join(p0, p1)
+        p23 = tl.join(p2, p3)
+        probs = tl.join(p01, p23)
+        probs = tl.permute(probs, (2, 1, 0))
+        probs = tl.reshape(probs, (4, BLOCK_KV))
+        value_dot = tl.dot(probs.to(tl.bfloat16), values.to(tl.bfloat16))
+        value_dot = tl.permute(value_dot, (1, 0))
+        value_dot = tl.reshape(value_dot, (BLOCK_D, 2, 2))
+        value_dot_even, value_dot_odd = tl.split(value_dot)
+        dot0, dot2 = tl.split(value_dot_even)
+        dot1, dot3 = tl.split(value_dot_odd)
+        acc0 = acc0 * r0 + dot0
+        acc1 = acc1 * r1 + dot1
+        acc2 = acc2 * r2 + dot2
+        acc3 = acc3 * r3 + dot3
         l0 = l0 * r0 + tl.sum(p0, 0)
         l1 = l1 * r1 + tl.sum(p1, 0)
         l2 = l2 * r2 + tl.sum(p2, 0)
