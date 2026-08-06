@@ -301,6 +301,57 @@ class TestOscarConfigAndLayout(unittest.TestCase):
             with self.subTest(shape=shape):
                 self.assertFalse(_use_grouped_h4_stage1(*shape))
 
+    def test_d128_quarter_layout_and_d64_legacy_layout_are_explicit(self):
+        from vllm.v1.attention.ops.triton_oscar_store import (
+            _int2_byte_index_and_shift,
+        )
+
+        for dim in range(128):
+            byte_idx, shift = _int2_byte_index_and_shift(dim, 128)
+            self.assertEqual(byte_idx, dim % 32)
+            self.assertEqual(shift, (dim // 32) * 2)
+        for dim in range(64):
+            byte_idx, shift = _int2_byte_index_and_shift(dim, 64)
+            self.assertEqual(byte_idx, dim // 4)
+            self.assertEqual(shift, (dim % 4) * 2)
+
+    def test_grouped_h4_split_contract_is_32_quant_plus_one_hp(self):
+        from vllm.v1.attention.ops.triton_oscar_decode import (
+            _grouped_h4_partial_counts,
+        )
+
+        self.assertEqual(_grouped_h4_partial_counts(32), (32, 33))
+
+    def test_grouped_h4_uses_private_finite_lse_reducer(self):
+        from vllm.v1.attention.ops import triton_oscar_decode
+
+        source = Path(triton_oscar_decode.__file__).read_text()
+        kernel_start = source.index("def _oscar_finite_lse_stage2(")
+        kernel_end = source.index("\n\n@triton.jit", kernel_start)
+        kernel_source = source[kernel_start:kernel_end]
+        self.assertIn("for partial_idx in range(0, NUM_PARTIALS):", kernel_source)
+        self.assertIn("is_finite =", kernel_source)
+        self.assertIn("tlogic > -float(\"inf\")", kernel_source)
+        self.assertIn("tlogic < float(\"inf\")", kernel_source)
+        self.assertIn("safe_e_sum = tl.where(e_sum > 0.0, e_sum, 1.0)", kernel_source)
+        self.assertIn(
+            "out = tl.where(e_sum > 0.0, acc / safe_e_sum, 0.0)",
+            kernel_source,
+        )
+        self.assertIn(
+            "lse_out = tl.where(\n"
+            '        e_sum > 0.0, e_max + tl.log(safe_e_sum), -float("inf")\n'
+            "    )",
+            kernel_source,
+        )
+
+        dispatch_source = source[source.index("def oscar_decode_attention(") :]
+        self.assertIn(
+            "if grouped_h4:\n        _oscar_finite_lse_stage2[grid2](",
+            dispatch_source,
+        )
+        self.assertIn("else:\n        _fwd_kernel_stage2[grid2](", dispatch_source)
+
 
 class TestOscarRotationLoading(unittest.TestCase):
     def tearDown(self):

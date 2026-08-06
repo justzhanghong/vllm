@@ -20,6 +20,14 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
+def _int2_byte_index_and_shift(dim: int, head_dim: int) -> tuple[int, int]:
+    """Return the physical byte and bit shift for one logical INT2 element."""
+    if head_dim == 128:
+        quarter = head_dim // 4
+        return dim % quarter, (dim // quarter) * 2
+    return dim // 4, (dim % 4) * 2
+
+
 @triton.jit
 def _quantize_pack_int2_vec(
     vec,
@@ -51,10 +59,13 @@ def _quantize_pack_int2_vec(
     # Match OSCAR SGLang: q = clamp(round(x / scale + zero_point), 0, levels-1).
     q = tl.minimum(tl.maximum((vec / scale + zero + 0.5).to(tl.int32), 0), LEVELS - 1)
 
-    # Pack 4 two-bit indices per byte: byte b = q[4b] | q[4b+1]<<2 | ...
-    q_grp = tl.reshape(q, [BLOCK_D // 4, 4])
     shifts = tl.arange(0, 4) * 2
-    packed = tl.sum((q_grp & 0x3) << shifts[None, :], axis=1).to(tl.uint8)
+    if D == 128:
+        q_grp = tl.reshape(q, [4, BLOCK_D // 4])
+        packed = tl.sum((q_grp & 0x3) << shifts[:, None], axis=0).to(tl.uint8)
+    else:
+        q_grp = tl.reshape(q, [BLOCK_D // 4, 4])
+        packed = tl.sum((q_grp & 0x3) << shifts[None, :], axis=1).to(tl.uint8)
     pack_offs = tl.arange(0, BLOCK_PACK)
     pack_mask = pack_offs < DATA_BYTES
     tl.store(

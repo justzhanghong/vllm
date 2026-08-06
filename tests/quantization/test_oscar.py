@@ -79,6 +79,45 @@ def test_store_metadata_is_bf16():
     torch.testing.assert_close(cache_bf16[0, 0, 0, value_meta + 1], expected_value_zero)
 
 
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_store_int2_physical_layout(head_dim):
+    from vllm.v1.attention.ops.triton_oscar_store import oscar_store
+
+    device = "cuda"
+    cfg = OscarConfig.from_cache_dtype("oscar_int2", head_dim)
+    codes = torch.arange(head_dim, device=device, dtype=torch.float32) % 4
+    key = codes.view(1, 1, head_dim)
+    cache = _make_cache(1, 16, 1, cfg.slot_size_aligned, device)
+    oscar_store(
+        key,
+        key,
+        cache,
+        torch.zeros(1, dtype=torch.int32, device=device),
+        key_levels=cfg.key_levels,
+        value_levels=cfg.value_levels,
+        key_packed_size=cfg.key_packed_size,
+        data_bytes=cfg.key_data_bytes,
+    )
+
+    scale = ((key.max() - key.min()) / 3).to(torch.bfloat16).float()
+    zero = (-key.min() / scale).to(torch.bfloat16).float()
+    quant = torch.clamp((key / scale + zero + 0.5).int(), 0, 3).view(-1)
+    if head_dim == 128:
+        expected = (
+            quant[:32]
+            | (quant[32:64] << 2)
+            | (quant[64:96] << 4)
+            | (quant[96:128] << 6)
+        ).to(torch.uint8)
+    else:
+        expected = (
+            (quant.view(-1, 4) * torch.tensor([1, 4, 16, 64], device=device))
+            .sum(1)
+            .to(torch.uint8)
+        )
+    torch.testing.assert_close(cache[0, 0, 0, : cfg.key_data_bytes], expected)
+
+
 def test_mixed_kernels_reject_wrong_prefix_page_width():
     from vllm.v1.attention.ops.triton_oscar_decode import oscar_decode_attention
     from vllm.v1.attention.ops.triton_oscar_mixed_store import oscar_store_hp
