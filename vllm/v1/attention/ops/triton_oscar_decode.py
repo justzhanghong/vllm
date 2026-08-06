@@ -687,11 +687,33 @@ def _oscar_decode_stage1_grouped_h4_qk(
             keys = tl.where(is_hp[:, None], hp_keys, keys)
 
         score_keys = keys.to(tl.bfloat16)
-        score_mask = d_mask[None, :]
-        scores0 = tl.sum(tl.where(score_mask, q0[None, :] * score_keys, 0.0), 1)
-        scores1 = tl.sum(tl.where(score_mask, q1[None, :] * score_keys, 0.0), 1)
-        scores2 = tl.sum(tl.where(score_mask, q2[None, :] * score_keys, 0.0), 1)
-        scores3 = tl.sum(tl.where(score_mask, q3[None, :] * score_keys, 0.0), 1)
+        q_head = tl.arange(0, 4)[:, None]
+        q_heads = tl.where(q_head == 0, q0[None, :], q1[None, :])
+        q_heads = tl.where(q_head == 2, q2[None, :], q_heads)
+        q_heads = tl.where(q_head == 3, q3[None, :], q_heads)
+
+        q_quarters = tl.reshape(q_heads, (4, 4, 32))
+        q_quarters = tl.permute(q_quarters, (0, 2, 1))
+        q_quarters = tl.reshape(q_quarters, (4, 32, 2, 2))
+        q_even, q_odd = tl.split(q_quarters)
+        q_d0, q_d2 = tl.split(q_even)
+        q_d1, q_d3 = tl.split(q_odd)
+
+        key_quarters = tl.reshape(score_keys, (BLOCK_KV, 4, 32))
+        key_quarters = tl.permute(key_quarters, (0, 2, 1))
+        key_quarters = tl.reshape(key_quarters, (BLOCK_KV, 32, 2, 2))
+        key_even, key_odd = tl.split(key_quarters)
+        key_d0, key_d2 = tl.split(key_even)
+        key_d1, key_d3 = tl.split(key_odd)
+
+        score_heads = tl.dot(q_d0, tl.trans(key_d0))
+        score_heads = score_heads + tl.dot(q_d1, tl.trans(key_d1))
+        score_heads = score_heads + tl.dot(q_d2, tl.trans(key_d2))
+        score_heads = score_heads + tl.dot(q_d3, tl.trans(key_d3))
+        score_pairs = tl.reshape(tl.trans(score_heads), (BLOCK_KV, 2, 2))
+        score_even, score_odd = tl.split(score_pairs)
+        scores0, scores2 = tl.split(score_even)
+        scores1, scores3 = tl.split(score_odd)
         scores0 = tl.where(kv_mask, scores0 * ATTN_SCALE, -float("inf"))
         scores1 = tl.where(kv_mask, scores1 * ATTN_SCALE, -float("inf"))
         scores2 = tl.where(kv_mask, scores2 * ATTN_SCALE, -float("inf"))
