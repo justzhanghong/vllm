@@ -92,8 +92,12 @@ def _oscar_decode_stage1(
     kv_range = tl.arange(0, BLOCK_KV)
 
     # INT2 unpack index vectors (loop-invariant): 4 indices per byte.
-    byte_idx = d_offs // 4
-    bit_shift = (d_offs % 4) * 2
+    if HEAD_DIM == 128:
+        byte_idx = d_offs % KEY_DATA_BYTES
+        bit_shift = (d_offs // KEY_DATA_BYTES) * 2
+    else:
+        byte_idx = d_offs // 4
+        bit_shift = (d_offs % 4) * 2
 
     q_base = bid * stride_qb + hid * stride_qh
     q_rot = tl.load(Q_rot_ptr + q_base + d_offs, mask=d_mask, other=0.0).to(tl.float32)
@@ -319,8 +323,12 @@ def _oscar_decode_stage1_grouped_h4(
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < HEAD_DIM
     kv_range = tl.arange(0, BLOCK_KV)
-    byte_idx = d_offs // 4
-    bit_shift = (d_offs % 4) * 2
+    if HEAD_DIM == 128:
+        byte_idx = d_offs % KEY_DATA_BYTES
+        bit_shift = (d_offs // KEY_DATA_BYTES) * 2
+    else:
+        byte_idx = d_offs // 4
+        bit_shift = (d_offs % 4) * 2
 
     q_base = bid * stride_qb + head0 * stride_qh
     q0 = tl.load(Q_rot_ptr + q_base + d_offs, mask=d_mask, other=0.0).to(
@@ -589,8 +597,12 @@ def _oscar_decode_stage1_grouped_h4_qk(
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < HEAD_DIM
     kv_range = tl.arange(0, BLOCK_KV)
-    byte_idx = d_offs // 4
-    bit_shift = (d_offs % 4) * 2
+    if HEAD_DIM == 128:
+        byte_idx = d_offs % KEY_DATA_BYTES
+        bit_shift = (d_offs // KEY_DATA_BYTES) * 2
+    else:
+        byte_idx = d_offs // 4
+        bit_shift = (d_offs % 4) * 2
 
     q_base = bid * stride_qb + head0 * stride_qh
     q0 = tl.load(Q_rot_ptr + q_base + d_offs, mask=d_mask, other=0.0).to(
@@ -809,8 +821,12 @@ def _oscar_decode_stage1_grouped_h4_v(
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < HEAD_DIM
     kv_range = tl.arange(0, BLOCK_KV)
-    byte_idx = d_offs // 4
-    bit_shift = (d_offs % 4) * 2
+    if HEAD_DIM == 128:
+        byte_idx = d_offs % VALUE_DATA_BYTES
+        bit_shift = (d_offs // VALUE_DATA_BYTES) * 2
+    else:
+        byte_idx = d_offs // 4
+        bit_shift = (d_offs % 4) * 2
     m0 = -float("inf")
     m1 = -float("inf")
     m2 = -float("inf")
@@ -1000,6 +1016,401 @@ def _oscar_decode_stage1_grouped_h4_v(
 
 
 @triton.jit
+def _oscar_decode_quant_stage1_grouped_h4(
+    Q_rot_ptr,
+    KV_cache_ptr,
+    KV_meta_ptr,
+    Query_to_req_ptr,
+    Shared_hit_lens_ptr,
+    Block_table_ptr,
+    Seq_lens_ptr,
+    Mid_o_ptr,
+    stride_qb,
+    stride_qh,
+    stride_cache_block,
+    stride_cache_pos,
+    stride_cache_head,
+    stride_bt_b,
+    stride_mid_b,
+    stride_mid_h,
+    stride_mid_s,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_QUANT_SPLITS: tl.constexpr,
+    KEY_DATA_BYTES: tl.constexpr,
+    KEY_PACKED: tl.constexpr,
+    VALUE_DATA_BYTES: tl.constexpr,
+    KEY_LEVELS: tl.constexpr,
+    VALUE_LEVELS: tl.constexpr,
+    ATTN_SCALE: tl.constexpr,
+    MIXED_KV: tl.constexpr,
+    MAPPED_QUERIES: tl.constexpr,
+    PREFIX_TOKENS: tl.constexpr,
+    RECENT_TOKENS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Tensor-core INT2 stage for D128/Hq:Hk=4 using quarter packing."""
+    bid = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    sid = tl.program_id(2)
+    head0 = kv_head * 4
+    heads = head0 + tl.arange(0, 4)
+    req_idx = tl.load(Query_to_req_ptr + bid) if MAPPED_QUERIES else bid
+    seq_len = tl.load(Seq_lens_ptr + bid)
+
+    quant_start = 0
+    quant_end = seq_len
+    if MIXED_KV:
+        shared_hit_len = tl.load(Shared_hit_lens_ptr + req_idx)
+        quant_start = tl.minimum(PREFIX_TOKENS, seq_len)
+        quant_end = tl.minimum(
+            seq_len,
+            tl.maximum(
+                tl.maximum(PREFIX_TOKENS, shared_hit_len),
+                seq_len - RECENT_TOKENS,
+            ),
+        )
+    quant_len = tl.maximum(quant_end - quant_start, 0)
+    split_len = tl.cdiv(quant_len, NUM_QUANT_SPLITS)
+    split_start = quant_start + split_len * sid
+    split_end = tl.minimum(split_start + split_len, quant_end)
+
+    offs_quarter = tl.arange(0, 32)
+    q_base = bid * stride_qb + heads[:, None] * stride_qh
+    q0 = tl.load(Q_rot_ptr + q_base + offs_quarter[None, :]).to(tl.bfloat16)
+    q1 = tl.load(Q_rot_ptr + q_base + (offs_quarter + 32)[None, :]).to(
+        tl.bfloat16
+    )
+    q2 = tl.load(Q_rot_ptr + q_base + (offs_quarter + 64)[None, :]).to(
+        tl.bfloat16
+    )
+    q3 = tl.load(Q_rot_ptr + q_base + (offs_quarter + 96)[None, :]).to(
+        tl.bfloat16
+    )
+    q01 = tl.join(q0, q1)
+    q23 = tl.join(q2, q3)
+    query = tl.join(q01, q23)
+    query = tl.reshape(query, (4, 32, 4))
+    query = tl.permute(query, (0, 2, 1))
+    query = tl.reshape(query, (4, 128))
+    n_range = tl.arange(0, BLOCK_N)
+    bt_base = req_idx * stride_bt_b
+
+    e_max = tl.zeros([4], dtype=tl.float32) - float("inf")
+    e_sum = tl.zeros([4], dtype=tl.float32)
+    acc0 = tl.zeros([4, 32], dtype=tl.float32)
+    acc1 = tl.zeros([4, 32], dtype=tl.float32)
+    acc2 = tl.zeros([4, 32], dtype=tl.float32)
+    acc3 = tl.zeros([4, 32], dtype=tl.float32)
+
+    if split_end > split_start:
+        for start_n in range(split_start, split_end, BLOCK_N):
+            kv_offs = start_n + n_range
+            kv_mask = kv_offs < split_end
+            page_idx = kv_offs // BLOCK_SIZE
+            page_off = kv_offs % BLOCK_SIZE
+            block_nums = tl.load(
+                Block_table_ptr + bt_base + page_idx, mask=kv_mask, other=0
+            ).to(tl.int64)
+            slot_bases = (
+                block_nums * stride_cache_block
+                + page_off.to(tl.int64) * stride_cache_pos
+                + tl.cast(kv_head, tl.int64) * stride_cache_head
+            )
+
+            k_packed = tl.load(
+                KV_cache_ptr + slot_bases[None, :] + offs_quarter[:, None],
+                mask=kv_mask[None, :],
+                other=0,
+            )
+            k_scale = tl.load(
+                KV_meta_ptr + (slot_bases + KEY_DATA_BYTES) // 2,
+                mask=kv_mask,
+                other=1.0,
+            ).to(tl.bfloat16)
+            k_zero = tl.load(
+                KV_meta_ptr + (slot_bases + KEY_DATA_BYTES) // 2 + 1,
+                mask=kv_mask,
+                other=0.0,
+            ).to(tl.bfloat16)
+            k0 = (
+                (k_packed & (KEY_LEVELS - 1)).to(tl.bfloat16) - k_zero[None, :]
+            ) * k_scale[None, :]
+            k1 = (
+                ((k_packed >> 2) & (KEY_LEVELS - 1)).to(tl.bfloat16) - k_zero[None, :]
+            ) * k_scale[None, :]
+            k2 = (
+                ((k_packed >> 4) & (KEY_LEVELS - 1)).to(tl.bfloat16) - k_zero[None, :]
+            ) * k_scale[None, :]
+            k3 = (
+                ((k_packed >> 6) & (KEY_LEVELS - 1)).to(tl.bfloat16) - k_zero[None, :]
+            ) * k_scale[None, :]
+            k01 = tl.join(k0, k1)
+            k23 = tl.join(k2, k3)
+            keys = tl.join(k01, k23)
+            keys = tl.reshape(keys, (32, BLOCK_N, 4))
+            keys = tl.permute(keys, (2, 0, 1))
+            keys = tl.reshape(keys, (128, BLOCK_N))
+            scores = tl.dot(query, keys) * ATTN_SCALE
+            scores = tl.where(kv_mask[None, :], scores, -float("inf"))
+
+            v_base = slot_bases + KEY_PACKED
+            v_packed = tl.load(
+                KV_cache_ptr + v_base[:, None] + offs_quarter[None, :],
+                mask=kv_mask[:, None],
+                other=0,
+            )
+            v_scale = tl.load(
+                KV_meta_ptr + (v_base + VALUE_DATA_BYTES) // 2,
+                mask=kv_mask,
+                other=1.0,
+            ).to(tl.bfloat16)
+            v_zero = tl.load(
+                KV_meta_ptr + (v_base + VALUE_DATA_BYTES) // 2 + 1,
+                mask=kv_mask,
+                other=0.0,
+            ).to(tl.bfloat16)
+            v0 = (
+                (v_packed & (VALUE_LEVELS - 1)).to(tl.bfloat16) - v_zero[:, None]
+            ) * v_scale[:, None]
+            v1 = (
+                ((v_packed >> 2) & (VALUE_LEVELS - 1)).to(tl.bfloat16) - v_zero[:, None]
+            ) * v_scale[:, None]
+            v2 = (
+                ((v_packed >> 4) & (VALUE_LEVELS - 1)).to(tl.bfloat16) - v_zero[:, None]
+            ) * v_scale[:, None]
+            v3 = (
+                ((v_packed >> 6) & (VALUE_LEVELS - 1)).to(tl.bfloat16) - v_zero[:, None]
+            ) * v_scale[:, None]
+
+            next_max = tl.maximum(tl.max(scores, 1), e_max)
+            rescale = tl.exp(e_max - next_max)
+            probs = tl.exp(scores - next_max[:, None])
+            acc0 = acc0 * rescale[:, None] + tl.dot(probs.to(tl.bfloat16), v0)
+            acc1 = acc1 * rescale[:, None] + tl.dot(probs.to(tl.bfloat16), v1)
+            acc2 = acc2 * rescale[:, None] + tl.dot(probs.to(tl.bfloat16), v2)
+            acc3 = acc3 * rescale[:, None] + tl.dot(probs.to(tl.bfloat16), v3)
+            e_sum = e_sum * rescale + tl.sum(probs, 1)
+            e_max = next_max
+
+    safe_sum = tl.where(e_sum > 0.0, e_sum, 1.0)
+    base = bid * stride_mid_b + heads[:, None] * stride_mid_h + sid * stride_mid_s
+    tl.store(Mid_o_ptr + base + offs_quarter[None, :], acc0 / safe_sum[:, None])
+    tl.store(
+        Mid_o_ptr + base + (offs_quarter + 32)[None, :],
+        acc1 / safe_sum[:, None],
+    )
+    tl.store(
+        Mid_o_ptr + base + (offs_quarter + 64)[None, :],
+        acc2 / safe_sum[:, None],
+    )
+    tl.store(
+        Mid_o_ptr + base + (offs_quarter + 96)[None, :],
+        acc3 / safe_sum[:, None],
+    )
+    lse = tl.where(e_sum > 0.0, e_max + tl.log(safe_sum), -float("inf"))
+    lse_base = bid * stride_mid_b + heads * stride_mid_h + sid * stride_mid_s
+    tl.store(Mid_o_ptr + lse_base + HEAD_DIM, lse)
+
+
+@triton.jit
+def _oscar_decode_hp_stage1(
+    Q_rot_ptr,
+    Prefix_cache_ptr,
+    Recent_cache_ptr,
+    HP_rows_ptr,
+    Prefix_pages_ptr,
+    Query_to_req_ptr,
+    Shared_hit_lens_ptr,
+    Seq_lens_ptr,
+    Mid_o_ptr,
+    stride_qb,
+    stride_qh,
+    stride_prefix_slot,
+    stride_prefix_head,
+    stride_prefix_kv,
+    stride_recent_slot,
+    stride_recent_head,
+    stride_recent_kv,
+    stride_prefix_pages_req,
+    stride_mid_b,
+    stride_mid_h,
+    stride_mid_s,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    KV_GROUP_SIZE: tl.constexpr,
+    ATTN_SCALE: tl.constexpr,
+    MIXED_KV: tl.constexpr,
+    MAPPED_QUERIES: tl.constexpr,
+    USE_PREFIX_PAGE_TABLE: tl.constexpr,
+    PREFIX_TOKENS: tl.constexpr,
+    RECENT_TOKENS: tl.constexpr,
+    HP_PARTIAL_IDX: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+):
+    """Preserve the previous-keep per-head BF16 math in one HP partial."""
+    bid = tl.program_id(0)
+    hid = tl.program_id(1)
+    req_idx = tl.load(Query_to_req_ptr + bid) if MAPPED_QUERIES else bid
+    d_offs = tl.arange(0, BLOCK_D)
+    d_mask = d_offs < HEAD_DIM
+    out_base = bid * stride_mid_b + hid * stride_mid_h + HP_PARTIAL_IDX * stride_mid_s
+
+    if not MIXED_KV:
+        tl.store(Mid_o_ptr + out_base + d_offs, 0.0, mask=d_mask)
+        tl.store(Mid_o_ptr + out_base + HEAD_DIM, -float("inf"))
+        return
+
+    seq_len = tl.load(Seq_lens_ptr + bid)
+    hp_row = tl.load(HP_rows_ptr + req_idx)
+    shared_hit_len = tl.load(Shared_hit_lens_ptr + req_idx)
+    prefix_len = tl.minimum(PREFIX_TOKENS, seq_len)
+    recent_start = tl.minimum(
+        seq_len,
+        tl.maximum(tl.maximum(PREFIX_TOKENS, shared_hit_len), seq_len - RECENT_TOKENS),
+    )
+    hp_len = prefix_len + seq_len - recent_start
+    kv_head = hid // KV_GROUP_SIZE
+    q_base = bid * stride_qb + hid * stride_qh
+    query = tl.load(Q_rot_ptr + q_base + d_offs, mask=d_mask, other=0.0).to(tl.bfloat16)
+    kv_range = tl.arange(0, BLOCK_KV)
+    m_prev = -float("inf")
+    l_prev = 0.0
+    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+    for start_n in range(0, hp_len, BLOCK_KV):
+        hp_offs = start_n + kv_range
+        kv_mask = hp_offs < hp_len
+        is_prefix = hp_offs < prefix_len
+        logical_pos = tl.where(is_prefix, hp_offs, recent_start + hp_offs - prefix_len)
+        if USE_PREFIX_PAGE_TABLE:
+            prefix_page = tl.load(
+                Prefix_pages_ptr
+                + req_idx * stride_prefix_pages_req
+                + logical_pos // BLOCK_SIZE,
+                mask=kv_mask & is_prefix,
+                other=0,
+            )
+            prefix_idx = prefix_page * BLOCK_SIZE + logical_pos % BLOCK_SIZE
+        else:
+            prefix_idx = hp_row * PREFIX_TOKENS + logical_pos
+        prefix_base = (
+            prefix_idx.to(tl.int64) * stride_prefix_slot
+            + tl.cast(kv_head, tl.int64) * stride_prefix_head
+        )
+        prefix_keys = tl.load(
+            Prefix_cache_ptr + prefix_base[:, None] + d_offs[None, :],
+            mask=(kv_mask & is_prefix)[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+        recent_idx = (
+            hp_row * RECENT_TOKENS
+            + (logical_pos - PREFIX_TOKENS) % RECENT_TOKENS
+        )
+        recent_base = (
+            recent_idx.to(tl.int64) * stride_recent_slot
+            + tl.cast(kv_head, tl.int64) * stride_recent_head
+        )
+        recent_keys = tl.load(
+            Recent_cache_ptr + recent_base[:, None] + d_offs[None, :],
+            mask=(kv_mask & ~is_prefix)[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+        keys = tl.where(is_prefix[:, None], prefix_keys, recent_keys).to(tl.bfloat16)
+        scores = (
+            tl.sum(tl.where(d_mask[None, :], query[None, :] * keys, 0.0), axis=1)
+            * ATTN_SCALE
+        )
+        scores = tl.where(kv_mask, scores, -float("inf"))
+        next_max = tl.maximum(tl.max(scores, 0), m_prev)
+        rescale = tl.exp(m_prev - next_max)
+        probs = tl.exp(scores - next_max)
+
+        prefix_values = tl.load(
+            Prefix_cache_ptr
+            + prefix_base[:, None]
+            + stride_prefix_kv
+            + d_offs[None, :],
+            mask=(kv_mask & is_prefix)[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+        recent_values = tl.load(
+            Recent_cache_ptr
+            + recent_base[:, None]
+            + stride_recent_kv
+            + d_offs[None, :],
+            mask=(kv_mask & ~is_prefix)[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+        values = tl.where(is_prefix[:, None], prefix_values, recent_values)
+        acc = acc * rescale + tl.sum(probs[:, None] * values, 0)
+        l_prev = l_prev * rescale + tl.sum(probs, 0)
+        m_prev = next_max
+
+    safe_l = tl.where(l_prev > 0.0, l_prev, 1.0)
+    tl.store(Mid_o_ptr + out_base + d_offs, acc / safe_l, mask=d_mask)
+    lse = tl.where(l_prev > 0.0, m_prev + tl.log(safe_l), -float("inf"))
+    tl.store(Mid_o_ptr + out_base + HEAD_DIM, lse)
+
+
+@triton.jit
+def _oscar_finite_lse_stage2(
+    Mid_O,
+    Output_ptr,
+    LSE_ptr,
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
+    stride_obs,
+    stride_oh,
+    stride_lse_bs,
+    NUM_PARTIALS: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    Lv: tl.constexpr,
+):
+    """Merge OSCAR partials by finite LSE, independent of token geometry."""
+    cur_batch = tl.program_id(0)
+    cur_head = tl.program_id(1)
+    offs_d = tl.arange(0, BLOCK_DV)
+    mask_d = offs_d < Lv
+
+    e_sum = 0.0
+    e_max = -float("inf")
+    acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
+    mid_base = cur_batch * stride_mid_ob + cur_head * stride_mid_oh
+
+    for partial_idx in range(0, NUM_PARTIALS):
+        partial_base = mid_base + partial_idx * stride_mid_os
+        tlogic = tl.load(Mid_O + partial_base + Lv)
+        is_finite = (tlogic > -float("inf")) & (tlogic < float("inf"))
+        if is_finite:
+            partial = tl.load(
+                Mid_O + partial_base + offs_d,
+                mask=mask_d,
+                other=0.0,
+            )
+            next_max = tl.maximum(tlogic, e_max)
+            old_scale = tl.exp(e_max - next_max)
+            partial_scale = tl.exp(tlogic - next_max)
+            acc = acc * old_scale + partial * partial_scale
+            e_sum = e_sum * old_scale + partial_scale
+            e_max = next_max
+
+    safe_e_sum = tl.where(e_sum > 0.0, e_sum, 1.0)
+    out = tl.where(e_sum > 0.0, acc / safe_e_sum, 0.0)
+    tl.store(
+        Output_ptr + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
+        out,
+        mask=mask_d,
+    )
+    lse_out = tl.where(
+        e_sum > 0.0, e_max + tl.log(safe_e_sum), -float("inf")
+    )
+    tl.store(LSE_ptr + cur_batch * stride_lse_bs + cur_head, lse_out)
+
+
+@triton.jit
 def _oscar_full_dequant_kv(
     KV_cache_ptr,
     KV_meta_ptr,
@@ -1043,8 +1454,12 @@ def _oscar_full_dequant_kv(
 
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < HEAD_DIM
-    byte_idx = d_offs // 4
-    bit_shift = (d_offs % 4) * 2
+    if HEAD_DIM == 128:
+        byte_idx = d_offs % KEY_DATA_BYTES
+        bit_shift = (d_offs // KEY_DATA_BYTES) * 2
+    else:
+        byte_idx = d_offs // 4
+        bit_shift = (d_offs % 4) * 2
 
     # K
     k_byte = tl.load(KV_cache_ptr + slot_base + byte_idx, mask=d_mask, other=0).to(
@@ -1115,6 +1530,11 @@ def _use_grouped_h4_stage1(
         and num_kv_heads > 0
         and num_query_heads == 4 * num_kv_heads
     )
+
+
+def _grouped_h4_partial_counts(num_quant_splits: int) -> tuple[int, int]:
+    """Return quant-only and unified (quant + BF16 HP) partial counts."""
+    return num_quant_splits, num_quant_splits + 1
 
 
 @triton.jit
@@ -1194,6 +1614,11 @@ def oscar_decode_attention(
     device = q_rot.device
     BLOCK_D = triton.next_power_of_2(D)
     NUM_KV_SPLITS = max_num_kv_splits
+    _, NUM_TOTAL_SPLITS = (
+        _grouped_h4_partial_counts(NUM_KV_SPLITS)
+        if grouped_h4
+        else (NUM_KV_SPLITS, NUM_KV_SPLITS)
+    )
     mixed_kv = prefix_cache is not None
     mapped_queries = query_to_req_indices is not None
     use_prefix_page_table = prefix_page_ids is not None
@@ -1232,79 +1657,62 @@ def oscar_decode_attention(
     if (
         mid_o_buf is not None
         and mid_o_buf.shape[0] >= B
-        and mid_o_buf.shape[2] >= NUM_KV_SPLITS
+        and mid_o_buf.shape[2] >= NUM_TOTAL_SPLITS
     ):
-        mid_o = mid_o_buf[:B, :Hq, :NUM_KV_SPLITS, :]
+        mid_o = mid_o_buf[:B, :Hq, :NUM_TOTAL_SPLITS, :]
     else:
         mid_o = torch.empty(
-            B, Hq, NUM_KV_SPLITS, D + 1, dtype=torch.float32, device=device
+            B, Hq, NUM_TOTAL_SPLITS, D + 1, dtype=torch.float32, device=device
         )
 
     if grouped_h4:
-        score_workspace = _get_grouped_h4_score_workspace(
-            q_rot, block_table, block_size
-        )
-        grid = (B, Hk, NUM_KV_SPLITS)
-        _oscar_decode_stage1_grouped_h4_qk[grid](
+        _oscar_decode_quant_stage1_grouped_h4[(B, Hk, NUM_KV_SPLITS)](
             q_rot,
             kv_cache,
             kv_cache.view(torch.bfloat16),
-            prefix_cache,
-            recent_cache,
-            hp_row_ids,
-            prefix_page_ids,
             query_to_req_indices,
             shared_hit_tokens,
             block_table,
             seq_lens,
-            score_workspace,
+            mid_o,
             q_rot.stride(0),
             q_rot.stride(1),
             kv_cache.stride(0),
             kv_cache.stride(1),
             kv_cache.stride(2),
-            prefix_cache.stride(0),
-            prefix_cache.stride(1),
-            recent_cache.stride(0),
-            recent_cache.stride(1),
-            prefix_page_ids.stride(0) if use_prefix_page_table else 0,
             block_table.stride(0),
-            score_workspace.stride(0),
-            score_workspace.stride(1),
-            score_workspace.stride(2),
+            mid_o.stride(0),
+            mid_o.stride(1),
+            mid_o.stride(2),
             HEAD_DIM=D,
             BLOCK_SIZE=block_size,
-            NUM_KV_SPLITS=NUM_KV_SPLITS,
-            KV_GROUP_SIZE=kv_group_size,
+            NUM_QUANT_SPLITS=NUM_KV_SPLITS,
             KEY_DATA_BYTES=key_data_bytes,
+            KEY_PACKED=key_packed_size,
+            VALUE_DATA_BYTES=value_data_bytes,
             KEY_LEVELS=key_levels,
+            VALUE_LEVELS=value_levels,
             ATTN_SCALE=scale,
             MIXED_KV=mixed_kv,
             MAPPED_QUERIES=mapped_queries,
-            USE_PREFIX_PAGE_TABLE=use_prefix_page_table,
             PREFIX_TOKENS=prefix_tokens,
             RECENT_TOKENS=recent_tokens,
-            BLOCK_D=BLOCK_D,
-            BLOCK_KV=64,
-            num_warps=2,
-            num_stages=2,
+            BLOCK_N=128,
+            num_warps=4,
+            num_stages=3,
         )
-        _oscar_decode_stage1_grouped_h4_v[grid](
-            kv_cache,
-            kv_cache.view(torch.bfloat16),
+        _oscar_decode_hp_stage1[(B, Hq)](
+            q_rot,
             prefix_cache,
             recent_cache,
             hp_row_ids,
             prefix_page_ids,
             query_to_req_indices,
             shared_hit_tokens,
-            block_table,
             seq_lens,
-            score_workspace,
             mid_o,
-            kv_cache.stride(0),
-            kv_cache.stride(1),
-            kv_cache.stride(2),
+            q_rot.stride(0),
+            q_rot.stride(1),
             prefix_cache.stride(0),
             prefix_cache.stride(1),
             prefix_cache.stride(2),
@@ -1312,25 +1720,19 @@ def oscar_decode_attention(
             recent_cache.stride(1),
             recent_cache.stride(2),
             prefix_page_ids.stride(0) if use_prefix_page_table else 0,
-            block_table.stride(0),
-            score_workspace.stride(0),
-            score_workspace.stride(1),
-            score_workspace.stride(2),
             mid_o.stride(0),
             mid_o.stride(1),
             mid_o.stride(2),
             HEAD_DIM=D,
             BLOCK_SIZE=block_size,
-            NUM_KV_SPLITS=NUM_KV_SPLITS,
             KV_GROUP_SIZE=kv_group_size,
-            KEY_PACKED=key_packed_size,
-            VALUE_DATA_BYTES=value_data_bytes,
-            VALUE_LEVELS=value_levels,
+            ATTN_SCALE=scale,
             MIXED_KV=mixed_kv,
             MAPPED_QUERIES=mapped_queries,
             USE_PREFIX_PAGE_TABLE=use_prefix_page_table,
             PREFIX_TOKENS=prefix_tokens,
             RECENT_TOKENS=recent_tokens,
+            HP_PARTIAL_IDX=NUM_KV_SPLITS,
             BLOCK_D=BLOCK_D,
             BLOCK_KV=64,
             num_warps=2,
@@ -1400,24 +1802,42 @@ def oscar_decode_attention(
         lse = torch.empty(B, Hq, dtype=torch.float32, device=device)
 
     grid2 = (B, Hq)
-    _fwd_kernel_stage2[grid2](
-        mid_o,
-        output,
-        lse,
-        seq_lens,
-        mid_o.stride(0),
-        mid_o.stride(1),
-        mid_o.stride(2),
-        output.stride(0),
-        output.stride(1),
-        lse.stride(0),
-        NUM_KV_SPLITS=NUM_KV_SPLITS,
-        BLOCK_DV=BLOCK_D,
-        Lv=D,
-        OUTPUT_FP16=0,
-        num_warps=4,
-        num_stages=2,
-    )
+    if grouped_h4:
+        _oscar_finite_lse_stage2[grid2](
+            mid_o,
+            output,
+            lse,
+            mid_o.stride(0),
+            mid_o.stride(1),
+            mid_o.stride(2),
+            output.stride(0),
+            output.stride(1),
+            lse.stride(0),
+            NUM_PARTIALS=NUM_TOTAL_SPLITS,
+            BLOCK_DV=BLOCK_D,
+            Lv=D,
+            num_warps=4,
+            num_stages=2,
+        )
+    else:
+        _fwd_kernel_stage2[grid2](
+            mid_o,
+            output,
+            lse,
+            seq_lens,
+            mid_o.stride(0),
+            mid_o.stride(1),
+            mid_o.stride(2),
+            output.stride(0),
+            output.stride(1),
+            lse.stride(0),
+            NUM_KV_SPLITS=NUM_TOTAL_SPLITS,
+            BLOCK_DV=BLOCK_D,
+            Lv=D,
+            OUTPUT_FP16=0,
+            num_warps=4,
+            num_stages=2,
+        )
     if v_rotation_t is not None:
         rotated_output = torch.empty_like(output)
         _inverse_v_rotation_kernel[(B, Hq)](
