@@ -87,12 +87,8 @@ def _oscar_materialize_prefill_kv_kernel(
     is_recent = is_cached & (token_offs >= recent_start)
     quant_mask = is_cached & ~(is_prefix | is_recent)
 
-    if HEAD_DIM == 128:
-        byte_idx = d_offs % KEY_DATA_BYTES
-        bit_shift = (d_offs // KEY_DATA_BYTES) * 2
-    else:
-        byte_idx = d_offs // 4
-        bit_shift = (d_offs % 4) * 2
+    byte_idx = d_offs // 4
+    bit_shift = (d_offs % 4) * 2
     k_byte = tl.load(
         KV_cache_ptr + slot_base[:, None] + byte_idx[None, :],
         mask=quant_mask[:, None] & dim_mask[None, :],
@@ -402,12 +398,8 @@ def _oscar_cached_prefill_kernel(
     hp_row = tl.load(HP_rows_ptr + req_idx)
     bt_base = req_idx * stride_bt_req
 
-    if HEAD_DIM == 128:
-        byte_idx = d_offs % KEY_DATA_BYTES
-        bit_shift = (d_offs // KEY_DATA_BYTES) * 2
-    else:
-        byte_idx = d_offs // 4
-        bit_shift = (d_offs % 4) * 2
+    byte_idx = d_offs // 4
+    bit_shift = (d_offs % 4) * 2
     m_i = tl.full([BLOCK_M * QUERY_HEADS_PER_PROGRAM], -float("inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M * QUERY_HEADS_PER_PROGRAM], tl.float32)
     acc = tl.zeros([BLOCK_M * QUERY_HEADS_PER_PROGRAM, BLOCK_D], tl.float32)
