@@ -315,12 +315,53 @@ class TestOscarConfigAndLayout(unittest.TestCase):
             self.assertEqual(byte_idx, dim // 4)
             self.assertEqual(shift, (dim % 4) * 2)
 
-    def test_grouped_h4_split_contract_is_32_quant_plus_one_hp(self):
+    def test_grouped_h4_split_contract_is_mixed_40_and_quant_only_33(self):
         from vllm.v1.attention.ops.triton_oscar_decode import (
             _grouped_h4_partial_counts,
         )
 
-        self.assertEqual(_grouped_h4_partial_counts(32), (32, 33))
+        self.assertEqual(_grouped_h4_partial_counts(32, True), (8, 40))
+        self.assertEqual(_grouped_h4_partial_counts(32, False), (1, 33))
+
+    def test_grouped_h4_hp_stage1_uses_dot_and_eight_splits(self):
+        from vllm.v1.attention.ops import triton_oscar_decode
+
+        source = Path(triton_oscar_decode.__file__).read_text()
+        kernel_start = source.index("def _oscar_decode_hp_stage1(")
+        kernel_end = source.index("\n\n@triton.jit", kernel_start)
+        kernel_source = source[kernel_start:kernel_end]
+        self.assertIn("sid = tl.program_id(2)", kernel_source)
+        self.assertIn("heads = head0 + tl.arange(0, BLOCK_H)", kernel_source)
+        self.assertIn("head_mask = heads < head0 + KV_GROUP_SIZE", kernel_source)
+        self.assertIn(
+            "tl.cdiv(tl.cdiv(hp_len, NUM_HP_SPLITS), BLOCK_N) * BLOCK_N",
+            kernel_source,
+        )
+        hp_tokens = 320
+        split_len = ((hp_tokens + 7) // 8 + 31) // 32 * 32
+        effective_splits = (hp_tokens + split_len - 1) // split_len
+        self.assertEqual((split_len, effective_splits), (64, 5))
+        self.assertEqual(effective_splits * (split_len // 32), 10)
+        self.assertIn("scores = tl.dot(query, keys)", kernel_source)
+        self.assertIn("tl.dot(probs.to(tl.bfloat16), values)", kernel_source)
+
+        dispatch_source = source[source.index("def oscar_decode_attention(") :]
+        self.assertIn(
+            "_oscar_decode_quant_stage1_grouped_h4[(B, Hk, NUM_KV_SPLITS)](",
+            dispatch_source,
+        )
+        self.assertIn(
+            "_oscar_decode_hp_stage1[(B, Hk, NUM_HP_SPLITS)](",
+            dispatch_source,
+        )
+        self.assertIn("HP_PARTIAL_START=NUM_KV_SPLITS", dispatch_source)
+        self.assertIn("BLOCK_N=32", dispatch_source)
+        self.assertIn("BLOCK_H=16", dispatch_source)
+        self.assertIn(
+            "_grouped_h4_partial_counts(NUM_KV_SPLITS, mixed_kv)",
+            dispatch_source,
+        )
+        self.assertIn("NUM_PARTIALS=NUM_TOTAL_SPLITS", dispatch_source)
 
     def test_grouped_h4_uses_private_finite_lse_reducer(self):
         from vllm.v1.attention.ops import triton_oscar_decode

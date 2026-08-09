@@ -1245,21 +1245,43 @@ def _oscar_decode_hp_stage1(
     USE_PREFIX_PAGE_TABLE: tl.constexpr,
     PREFIX_TOKENS: tl.constexpr,
     RECENT_TOKENS: tl.constexpr,
-    HP_PARTIAL_IDX: tl.constexpr,
+    NUM_HP_SPLITS: tl.constexpr,
+    HP_PARTIAL_START: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    BLOCK_KV: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
 ):
-    """Preserve the previous-keep per-head BF16 math in one HP partial."""
+    """Compute grouped-H4 BF16 HP partials with tensor-core dots."""
     bid = tl.program_id(0)
-    hid = tl.program_id(1)
+    kv_head = tl.program_id(1)
+    sid = tl.program_id(2)
+    head0 = kv_head * KV_GROUP_SIZE
+    heads = head0 + tl.arange(0, BLOCK_H)
+    head_mask = heads < head0 + KV_GROUP_SIZE
     req_idx = tl.load(Query_to_req_ptr + bid) if MAPPED_QUERIES else bid
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < HEAD_DIM
-    out_base = bid * stride_mid_b + hid * stride_mid_h + HP_PARTIAL_IDX * stride_mid_s
+    partial_idx = HP_PARTIAL_START + sid
+    out_base = (
+        bid * stride_mid_b + heads[:, None] * stride_mid_h + partial_idx * stride_mid_s
+    )
 
     if not MIXED_KV:
-        tl.store(Mid_o_ptr + out_base + d_offs, 0.0, mask=d_mask)
-        tl.store(Mid_o_ptr + out_base + HEAD_DIM, -float("inf"))
+        tl.store(
+            Mid_o_ptr + out_base + d_offs[None, :],
+            0.0,
+            mask=head_mask[:, None] & d_mask[None, :],
+        )
+        lse_base = (
+            bid * stride_mid_b
+            + heads * stride_mid_h
+            + partial_idx * stride_mid_s
+        )
+        tl.store(
+            Mid_o_ptr + lse_base + HEAD_DIM,
+            -float("inf"),
+            mask=head_mask,
+        )
         return
 
     seq_len = tl.load(Seq_lens_ptr + bid)
@@ -1271,17 +1293,23 @@ def _oscar_decode_hp_stage1(
         tl.maximum(tl.maximum(PREFIX_TOKENS, shared_hit_len), seq_len - RECENT_TOKENS),
     )
     hp_len = prefix_len + seq_len - recent_start
-    kv_head = hid // KV_GROUP_SIZE
-    q_base = bid * stride_qb + hid * stride_qh
-    query = tl.load(Q_rot_ptr + q_base + d_offs, mask=d_mask, other=0.0).to(tl.bfloat16)
-    kv_range = tl.arange(0, BLOCK_KV)
-    m_prev = -float("inf")
-    l_prev = 0.0
-    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+    split_len = tl.cdiv(tl.cdiv(hp_len, NUM_HP_SPLITS), BLOCK_N) * BLOCK_N
+    split_start = split_len * sid
+    split_end = tl.minimum(split_start + split_len, hp_len)
+    q_base = bid * stride_qb + heads[:, None] * stride_qh
+    query = tl.load(
+        Q_rot_ptr + q_base + d_offs[None, :],
+        mask=head_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    ).to(tl.bfloat16)
+    kv_range = tl.arange(0, BLOCK_N)
+    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
+    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
 
-    for start_n in range(0, hp_len, BLOCK_KV):
+    for start_n in range(split_start, split_end, BLOCK_N):
         hp_offs = start_n + kv_range
-        kv_mask = hp_offs < hp_len
+        kv_mask = hp_offs < split_end
         is_prefix = hp_offs < prefix_len
         logical_pos = tl.where(is_prefix, hp_offs, recent_start + hp_offs - prefix_len)
         if USE_PREFIX_PAGE_TABLE:
@@ -1300,32 +1328,29 @@ def _oscar_decode_hp_stage1(
             + tl.cast(kv_head, tl.int64) * stride_prefix_head
         )
         prefix_keys = tl.load(
-            Prefix_cache_ptr + prefix_base[:, None] + d_offs[None, :],
-            mask=(kv_mask & is_prefix)[:, None] & d_mask[None, :],
+            Prefix_cache_ptr + prefix_base[None, :] + d_offs[:, None],
+            mask=(kv_mask & is_prefix)[None, :] & d_mask[:, None],
             other=0.0,
         )
         recent_idx = (
-            hp_row * RECENT_TOKENS
-            + (logical_pos - PREFIX_TOKENS) % RECENT_TOKENS
+            hp_row * RECENT_TOKENS + (logical_pos - PREFIX_TOKENS) % RECENT_TOKENS
         )
         recent_base = (
             recent_idx.to(tl.int64) * stride_recent_slot
             + tl.cast(kv_head, tl.int64) * stride_recent_head
         )
         recent_keys = tl.load(
-            Recent_cache_ptr + recent_base[:, None] + d_offs[None, :],
-            mask=(kv_mask & ~is_prefix)[:, None] & d_mask[None, :],
+            Recent_cache_ptr + recent_base[None, :] + d_offs[:, None],
+            mask=(kv_mask & ~is_prefix)[None, :] & d_mask[:, None],
             other=0.0,
         )
-        keys = tl.where(is_prefix[:, None], prefix_keys, recent_keys).to(tl.bfloat16)
-        scores = (
-            tl.sum(tl.where(d_mask[None, :], query[None, :] * keys, 0.0), axis=1)
-            * ATTN_SCALE
+        keys = tl.where(is_prefix[None, :], prefix_keys, recent_keys).to(tl.bfloat16)
+        scores = tl.dot(query, keys) * ATTN_SCALE
+        scores = tl.where(
+            head_mask[:, None] & kv_mask[None, :],
+            scores,
+            -float("inf"),
         )
-        scores = tl.where(kv_mask, scores, -float("inf"))
-        next_max = tl.maximum(tl.max(scores, 0), m_prev)
-        rescale = tl.exp(m_prev - next_max)
-        probs = tl.exp(scores - next_max)
 
         prefix_values = tl.load(
             Prefix_cache_ptr
@@ -1343,15 +1368,25 @@ def _oscar_decode_hp_stage1(
             mask=(kv_mask & ~is_prefix)[:, None] & d_mask[None, :],
             other=0.0,
         )
-        values = tl.where(is_prefix[:, None], prefix_values, recent_values)
-        acc = acc * rescale + tl.sum(probs[:, None] * values, 0)
-        l_prev = l_prev * rescale + tl.sum(probs, 0)
-        m_prev = next_max
+        values = tl.where(is_prefix[:, None], prefix_values, recent_values).to(
+            tl.bfloat16
+        )
+        next_max = tl.maximum(tl.max(scores, 1), e_max)
+        rescale = tl.exp(e_max - next_max)
+        probs = tl.exp(scores - next_max[:, None])
+        acc = acc * rescale[:, None] + tl.dot(probs.to(tl.bfloat16), values)
+        e_sum = e_sum * rescale + tl.sum(probs, 1)
+        e_max = next_max
 
-    safe_l = tl.where(l_prev > 0.0, l_prev, 1.0)
-    tl.store(Mid_o_ptr + out_base + d_offs, acc / safe_l, mask=d_mask)
-    lse = tl.where(l_prev > 0.0, m_prev + tl.log(safe_l), -float("inf"))
-    tl.store(Mid_o_ptr + out_base + HEAD_DIM, lse)
+    safe_sum = tl.where(e_sum > 0.0, e_sum, 1.0)
+    tl.store(
+        Mid_o_ptr + out_base + d_offs[None, :],
+        acc / safe_sum[:, None],
+        mask=head_mask[:, None] & d_mask[None, :],
+    )
+    lse = tl.where(e_sum > 0.0, e_max + tl.log(safe_sum), -float("inf"))
+    lse_base = bid * stride_mid_b + heads * stride_mid_h + partial_idx * stride_mid_s
+    tl.store(Mid_o_ptr + lse_base + HEAD_DIM, lse, mask=head_mask)
 
 
 @triton.jit
@@ -1532,9 +1567,12 @@ def _use_grouped_h4_stage1(
     )
 
 
-def _grouped_h4_partial_counts(num_quant_splits: int) -> tuple[int, int]:
-    """Return quant-only and unified (quant + BF16 HP) partial counts."""
-    return num_quant_splits, num_quant_splits + 1
+def _grouped_h4_partial_counts(
+    num_quant_splits: int, mixed_kv: bool
+) -> tuple[int, int]:
+    """Return BF16 HP and unified (quant + BF16 HP) partial counts."""
+    num_hp_splits = 8 if mixed_kv else 1
+    return num_hp_splits, num_quant_splits + num_hp_splits
 
 
 @triton.jit
@@ -1614,12 +1652,12 @@ def oscar_decode_attention(
     device = q_rot.device
     BLOCK_D = triton.next_power_of_2(D)
     NUM_KV_SPLITS = max_num_kv_splits
-    _, NUM_TOTAL_SPLITS = (
-        _grouped_h4_partial_counts(NUM_KV_SPLITS)
-        if grouped_h4
-        else (NUM_KV_SPLITS, NUM_KV_SPLITS)
-    )
     mixed_kv = prefix_cache is not None
+    NUM_HP_SPLITS, NUM_TOTAL_SPLITS = (
+        _grouped_h4_partial_counts(NUM_KV_SPLITS, mixed_kv)
+        if grouped_h4
+        else (0, NUM_KV_SPLITS)
+    )
     mapped_queries = query_to_req_indices is not None
     use_prefix_page_table = prefix_page_ids is not None
     if mixed_kv and (
@@ -1701,7 +1739,7 @@ def oscar_decode_attention(
             num_warps=4,
             num_stages=3,
         )
-        _oscar_decode_hp_stage1[(B, Hq)](
+        _oscar_decode_hp_stage1[(B, Hk, NUM_HP_SPLITS)](
             q_rot,
             prefix_cache,
             recent_cache,
@@ -1732,10 +1770,12 @@ def oscar_decode_attention(
             USE_PREFIX_PAGE_TABLE=use_prefix_page_table,
             PREFIX_TOKENS=prefix_tokens,
             RECENT_TOKENS=recent_tokens,
-            HP_PARTIAL_IDX=NUM_KV_SPLITS,
+            NUM_HP_SPLITS=NUM_HP_SPLITS,
+            HP_PARTIAL_START=NUM_KV_SPLITS,
             BLOCK_D=BLOCK_D,
-            BLOCK_KV=64,
-            num_warps=2,
+            BLOCK_N=32,
+            BLOCK_H=16,
+            num_warps=4,
             num_stages=2,
         )
     else:
