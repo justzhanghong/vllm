@@ -133,10 +133,15 @@ class TestOscarConfigAndLayout(unittest.TestCase):
             scheduler_config=SimpleNamespace(
                 max_num_batched_tokens=8,
                 max_num_seqs=1,
+                enable_chunked_prefill=False,
             ),
-            cache_config=SimpleNamespace(kv_cache_memory_bytes=None),
-            model_config=SimpleNamespace(dtype=torch.bfloat16),
-            parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+            cache_config=SimpleNamespace(enable_prefix_caching=False),
+            model_config=SimpleNamespace(dtype=torch.bfloat16, max_model_len=8),
+            parallel_config=SimpleNamespace(
+                decode_context_parallel_size=1,
+                use_ubatching=False,
+            ),
+            speculative_config=None,
         )
         kv_cache_spec = SimpleNamespace(num_kv_heads=1, head_size=128)
         builder = OscarMetadataBuilder(
@@ -284,17 +289,115 @@ class TestOscarConfigAndLayout(unittest.TestCase):
         ):
             OscarConfig.from_cache_dtype("oscar_int2", 128)
 
-    def test_serving_materialize_capacity_is_disabled(self):
-        from vllm.v1.attention.backends.oscar_attn import (
-            _materialize_token_capacity,
-        )
+    def test_serving_materialize_capacity_is_bounded_and_fail_closed(self):
+        from vllm.v1.attention.backends import oscar_attn
+
+        def config(
+            *,
+            chunked=True,
+            max_num_seqs=1,
+            prefix=False,
+            spec=None,
+            use_ubatching=False,
+            max_model_len=33792,
+        ):
+            return SimpleNamespace(
+                scheduler_config=SimpleNamespace(
+                    enable_chunked_prefill=chunked,
+                    max_num_seqs=max_num_seqs,
+                ),
+                cache_config=SimpleNamespace(enable_prefix_caching=prefix),
+                speculative_config=spec,
+                parallel_config=SimpleNamespace(use_ubatching=use_ubatching),
+                model_config=SimpleNamespace(max_model_len=max_model_len),
+            )
+
+        with patch.object(oscar_attn, "_HAS_FLASH_ATTN", True):
+            capacity = oscar_attn._materialize_token_capacity(
+                config(), 8, 128, torch.bfloat16
+            )
+            self.assertEqual(capacity, 33792)
+            self.assertEqual(
+                capacity * 2 * 8 * 128 * torch.bfloat16.itemsize,
+                132 * 1024**2,
+            )
+
+            for unsafe_config in (
+                config(chunked=False),
+                config(max_num_seqs=2),
+                config(prefix=True),
+                config(spec=SimpleNamespace()),
+                config(use_ubatching=True),
+                config(max_model_len=0),
+                config(max_model_len=-1),
+                config(max_model_len=33792.0),
+                config(max_model_len=True),
+                config(max_model_len=None),
+            ):
+                with self.subTest(config=unsafe_config):
+                    self.assertEqual(
+                        oscar_attn._materialize_token_capacity(
+                            unsafe_config, 8, 128, torch.bfloat16
+                        ),
+                        0,
+                    )
+
+        with patch.object(oscar_attn, "_HAS_FLASH_ATTN", False):
+            self.assertEqual(
+                oscar_attn._materialize_token_capacity(
+                    config(), 8, 128, torch.bfloat16
+                ),
+                0,
+            )
+
+    def test_eligible_materialize_builder_reserves_two_bf16_views(self):
+        from vllm.v1.attention.backends import oscar_attn
 
         vllm_config = SimpleNamespace(
-            cache_config=SimpleNamespace(kv_cache_memory_bytes=10 * 1024**3)
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=8192,
+                max_num_seqs=1,
+                enable_chunked_prefill=True,
+            ),
+            cache_config=SimpleNamespace(enable_prefix_caching=False),
+            model_config=SimpleNamespace(
+                dtype=torch.bfloat16,
+                max_model_len=33792,
+            ),
+            parallel_config=SimpleNamespace(
+                decode_context_parallel_size=1,
+                use_ubatching=False,
+            ),
+            speculative_config=None,
         )
-        self.assertEqual(
-            _materialize_token_capacity(vllm_config, 8, 128, torch.bfloat16), 0
+        kv_cache_spec = SimpleNamespace(num_kv_heads=8, head_size=128)
+        calls = []
+        workspace = SimpleNamespace(
+            get_simultaneous=lambda *args: calls.append(args)
         )
+
+        with (
+            patch.object(oscar_attn, "_HAS_FLASH_ATTN", True),
+            patch.object(
+                oscar_attn,
+                "is_workspace_manager_initialized",
+                return_value=True,
+            ),
+            patch.object(
+                oscar_attn,
+                "current_workspace_manager",
+                return_value=workspace,
+            ),
+        ):
+            OscarMetadataBuilder(
+                kv_cache_spec,
+                ["model.layers.0.self_attn.attn"],
+                vllm_config,
+                "cpu",
+            )
+
+        workspace_spec = ((33792, 8, 128), torch.bfloat16)
+        self.assertEqual(calls, [(workspace_spec, workspace_spec)])
 
     def test_grouped_h4_decode_stage1_dispatch_is_narrow(self):
         from vllm.v1.attention.ops.triton_oscar_decode import (

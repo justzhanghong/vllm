@@ -61,9 +61,6 @@ from vllm.v1.worker.workspace import (
 
 logger = init_logger(__name__)
 
-# Full-history materialization is reserved for direct correctness oracles.
-_MATERIALIZE_WORKSPACE_FRACTION = 0.0
-
 _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
 if _HAS_FLASH_ATTN:
     from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
@@ -72,11 +69,25 @@ if _HAS_FLASH_ATTN:
 def _materialize_token_capacity(
     vllm_config, num_kv_heads: int, head_size: int, dtype: torch.dtype
 ) -> int:
-    kv_budget = vllm_config.cache_config.kv_cache_memory_bytes
-    if kv_budget is None:
+    scheduler_config = vllm_config.scheduler_config
+    cache_config = vllm_config.cache_config
+    if (
+        not _HAS_FLASH_ATTN
+        or not scheduler_config.enable_chunked_prefill
+        or scheduler_config.max_num_seqs != 1
+        or cache_config.enable_prefix_caching
+        or vllm_config.speculative_config is not None
+        or vllm_config.parallel_config.use_ubatching
+    ):
         return 0
-    bytes_per_token = 2 * num_kv_heads * head_size * dtype.itemsize
-    return int(kv_budget * _MATERIALIZE_WORKSPACE_FRACTION) // bytes_per_token
+    max_model_len = vllm_config.model_config.max_model_len
+    if (
+        not isinstance(max_model_len, int)
+        or isinstance(max_model_len, bool)
+        or max_model_len <= 0
+    ):
+        return 0
+    return max_model_len
 
 
 class OscarAttentionBackend(AttentionBackend):
