@@ -165,10 +165,11 @@ class OscarMetadataBuilder(AttentionMetadataBuilder[OscarMetadata]):
         cache_config = vllm_config.cache_config
         if (
             scheduler_config.max_num_seqs == 1
-            and not scheduler_config.enable_chunked_prefill
             and not cache_config.enable_prefix_caching
             and vllm_config.speculative_config is None
         ):
+            if scheduler_config.enable_chunked_prefill:
+                return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
             return AttentionCGSupport.ALWAYS
         return AttentionCGSupport.NEVER
 

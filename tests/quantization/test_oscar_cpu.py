@@ -108,9 +108,15 @@ class TestOscarConfigAndLayout(unittest.TestCase):
             OscarMetadataBuilder.get_cudagraph_support(config(), kv_cache_spec),
             AttentionCGSupport.ALWAYS,
         )
+        self.assertEqual(
+            OscarMetadataBuilder.get_cudagraph_support(
+                config(chunked=True), kv_cache_spec
+            ),
+            AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE,
+        )
         for unsafe_config in (
             config(max_num_seqs=2),
-            config(chunked=True),
+            config(max_num_seqs=2, chunked=True),
             config(prefix=True),
             config(spec=SimpleNamespace()),
         ):
