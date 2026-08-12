@@ -1273,6 +1273,36 @@ class TestOscarConfigAndLayout(unittest.TestCase):
         self.assertIn("q3 = tl.load(", kernel_source)
         self.assertNotIn("q_main = tl.load(", kernel_source)
 
+    def test_grouped_h4_prefetches_v_once_before_k_dequant_and_qk(self):
+        from vllm.v1.attention.ops.triton_oscar_decode import (
+            _oscar_decode_quant_stage1_grouped_h4,
+        )
+
+        kernel_source = inspect.getsource(_oscar_decode_quant_stage1_grouped_h4)
+        k_load = kernel_source.index("k_packed = tl.load(")
+        k_zero = kernel_source.index("k_zero = tl.load(")
+        v_load = kernel_source.index("v_packed = tl.load(")
+        v_scale = kernel_source.index("v_scale = tl.load(")
+        v_zero = kernel_source.index("v_zero = tl.load(")
+        k_dequant = kernel_source.index("k0 = (")
+        qk = kernel_source.index("scores = tl.dot(query, keys)")
+        v_dequant = kernel_source.index("v0 = (")
+
+        self.assertTrue(
+            k_load
+            < k_zero
+            < v_load
+            < v_scale
+            < v_zero
+            < k_dequant
+            < qk
+            < v_dequant
+        )
+        self.assertEqual(kernel_source.count("v_packed = tl.load("), 1)
+        self.assertEqual(kernel_source.count("v_scale = tl.load("), 1)
+        self.assertEqual(kernel_source.count("v_zero = tl.load("), 1)
+        self.assertNotIn("tl.debug_barrier", kernel_source)
+
     def test_d128_quarter_layout_and_d64_legacy_layout_are_explicit(self):
         from vllm.v1.attention.ops.triton_oscar_store import (
             _int2_byte_index_and_shift,

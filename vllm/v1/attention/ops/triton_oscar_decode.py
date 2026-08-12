@@ -1245,6 +1245,21 @@ def _oscar_decode_quant_stage1_grouped_h4(
                 mask=kv_mask,
                 other=0.0,
             ).to(tl.bfloat16)
+            v_packed = tl.load(
+                V_data_ptr + data_bases[:, None] + offs_quarter[None, :],
+                mask=kv_mask[:, None],
+                other=0,
+            )
+            v_scale = tl.load(
+                V_meta_ptr + meta_bases,
+                mask=kv_mask,
+                other=1.0,
+            ).to(tl.bfloat16)
+            v_zero = tl.load(
+                V_meta_ptr + meta_bases + 1,
+                mask=kv_mask,
+                other=0.0,
+            ).to(tl.bfloat16)
             k0 = (
                 (k_packed & (KEY_LEVELS - 1)).to(tl.bfloat16) - k_zero[None, :]
             ) * k_scale[None, :]
@@ -1266,21 +1281,6 @@ def _oscar_decode_quant_stage1_grouped_h4(
             scores = tl.dot(query, keys) * ATTN_SCALE
             scores = tl.where(kv_mask[None, :], scores, -float("inf"))
 
-            v_packed = tl.load(
-                V_data_ptr + data_bases[:, None] + offs_quarter[None, :],
-                mask=kv_mask[:, None],
-                other=0,
-            )
-            v_scale = tl.load(
-                V_meta_ptr + meta_bases,
-                mask=kv_mask,
-                other=1.0,
-            ).to(tl.bfloat16)
-            v_zero = tl.load(
-                V_meta_ptr + meta_bases + 1,
-                mask=kv_mask,
-                other=0.0,
-            ).to(tl.bfloat16)
             v0 = (
                 (v_packed & (VALUE_LEVELS - 1)).to(tl.bfloat16) - v_zero[:, None]
             ) * v_scale[:, None]
