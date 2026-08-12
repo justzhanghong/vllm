@@ -18,6 +18,10 @@ import math
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.oscar_cache_contract import (
+    has_linear_oscar_arena_layout,
+    validate_oscar_separated_arenas,
+)
 from vllm.v1.attention.ops.triton_decode_attention import _fwd_kernel_stage2
 
 _GROUPED_H4_PREINDEXED_QUANT_SPLITS = 12
@@ -90,8 +94,10 @@ def materialize_oscar_slot_ids(
 @triton.jit
 def _oscar_decode_stage1(
     Q_rot_ptr,  # [B, Hq, D] fp32 — query already rotated by R_k
-    KV_cache_ptr,  # [num_blocks, block_size, Hk, slot_size] uint8
-    KV_meta_ptr,  # BF16 view of the same cache storage
+    K_data_ptr,
+    V_data_ptr,
+    K_meta_ptr,
+    V_meta_ptr,
     Prefix_cache_ptr,  # [prefix_slots, Hk, 2, D] bf16
     Recent_cache_ptr,  # [recent_slots, Hk, 2, D] bf16
     HP_rows_ptr,  # [B] int32
@@ -104,9 +110,12 @@ def _oscar_decode_stage1(
     Mid_o_ptr,  # [B, Hq, NUM_KV_SPLITS, D+1] fp32
     stride_qb,
     stride_qh,
-    stride_cache_block,
-    stride_cache_pos,
-    stride_cache_head,
+    stride_data_block,
+    stride_data_pos,
+    stride_data_head,
+    stride_meta_block,
+    stride_meta_pos,
+    stride_meta_head,
     stride_prefix_slot,
     stride_prefix_head,
     stride_prefix_kv,
@@ -124,7 +133,6 @@ def _oscar_decode_stage1(
     NUM_KV_SPLITS: tl.constexpr,
     KV_GROUP_SIZE: tl.constexpr,
     KEY_DATA_BYTES: tl.constexpr,  # D // 4
-    KEY_PACKED: tl.constexpr,  # key region size incl. meta
     VALUE_DATA_BYTES: tl.constexpr,  # D // 4
     KEY_LEVELS: tl.constexpr,
     VALUE_LEVELS: tl.constexpr,
@@ -187,10 +195,15 @@ def _oscar_decode_stage1(
         block_nums = tl.load(
             Block_table_ptr + bt_base + page_idx, mask=kv_mask, other=0
         ).to(tl.int64)
-        slot_bases = (
-            block_nums * stride_cache_block
-            + page_off.to(tl.int64) * stride_cache_pos
-            + tl.cast(kv_head, tl.int64) * stride_cache_head
+        data_bases = (
+            block_nums * stride_data_block
+            + page_off.to(tl.int64) * stride_data_pos
+            + tl.cast(kv_head, tl.int64) * stride_data_head
+        )
+        meta_bases = (
+            block_nums * stride_meta_block
+            + page_off.to(tl.int64) * stride_meta_pos
+            + tl.cast(kv_head, tl.int64) * stride_meta_head
         )
 
         # ---- dequant K (INT2) and score ----
@@ -206,17 +219,16 @@ def _oscar_decode_stage1(
 
         quant_mask = kv_mask & ~is_hp
         k_byte = tl.load(
-            KV_cache_ptr + slot_bases[:, None] + byte_idx[None, :],
+            K_data_ptr + data_bases[:, None] + byte_idx[None, :],
             mask=quant_mask[:, None] & d_mask[None, :],
             other=0,
         ).to(tl.int32)
         q_k = ((k_byte >> bit_shift[None, :]) & (KEY_LEVELS - 1)).to(tl.float32)
 
-        k_meta = slot_bases + KEY_DATA_BYTES
-        k_scale = tl.load(KV_meta_ptr + k_meta // 2, mask=quant_mask, other=0.0).to(
+        k_scale = tl.load(K_meta_ptr + meta_bases, mask=quant_mask, other=0.0).to(
             tl.float32
         )
-        k_zero = tl.load(KV_meta_ptr + k_meta // 2 + 1, mask=quant_mask, other=0.0).to(
+        k_zero = tl.load(K_meta_ptr + meta_bases + 1, mask=quant_mask, other=0.0).to(
             tl.float32
         )
 
@@ -277,19 +289,17 @@ def _oscar_decode_stage1(
         p = tl.exp(scores - n_e_max)
 
         # ---- dequant V (INT2) ----
-        v_base = slot_bases + KEY_PACKED
         v_byte = tl.load(
-            KV_cache_ptr + v_base[:, None] + byte_idx[None, :],
+            V_data_ptr + data_bases[:, None] + byte_idx[None, :],
             mask=quant_mask[:, None] & d_mask[None, :],
             other=0,
         ).to(tl.int32)
         q_v = ((v_byte >> bit_shift[None, :]) & (VALUE_LEVELS - 1)).to(tl.float32)
 
-        v_meta = v_base + VALUE_DATA_BYTES
-        v_scale = tl.load(KV_meta_ptr + v_meta // 2, mask=quant_mask, other=0.0).to(
+        v_scale = tl.load(V_meta_ptr + meta_bases, mask=quant_mask, other=0.0).to(
             tl.float32
         )
-        v_zero = tl.load(KV_meta_ptr + v_meta // 2 + 1, mask=quant_mask, other=0.0).to(
+        v_zero = tl.load(V_meta_ptr + meta_bases + 1, mask=quant_mask, other=0.0).to(
             tl.float32
         )
         values = (q_v - v_zero[:, None]) * v_scale[:, None]
@@ -1112,8 +1122,10 @@ def _oscar_decode_stage1_grouped_h4_v(
 @triton.jit
 def _oscar_decode_quant_stage1_grouped_h4(
     Q_rot_ptr,
-    KV_cache_ptr,
-    KV_meta_ptr,
+    K_data_ptr,
+    V_data_ptr,
+    K_meta_ptr,
+    V_meta_ptr,
     Query_to_req_ptr,
     Shared_hit_lens_ptr,
     Recent_extra_ptr,
@@ -1122,8 +1134,10 @@ def _oscar_decode_quant_stage1_grouped_h4(
     Mid_o_ptr,
     stride_qb,
     stride_qh,
-    stride_cache_pos,
-    stride_cache_head,
+    stride_data_pos,
+    stride_data_head,
+    stride_meta_pos,
+    stride_meta_head,
     stride_slots_b,
     stride_mid_b,
     stride_mid_h,
@@ -1131,7 +1145,6 @@ def _oscar_decode_quant_stage1_grouped_h4(
     HEAD_DIM: tl.constexpr,
     NUM_QUANT_SPLITS: tl.constexpr,
     KEY_DATA_BYTES: tl.constexpr,
-    KEY_PACKED: tl.constexpr,
     VALUE_DATA_BYTES: tl.constexpr,
     KEY_LEVELS: tl.constexpr,
     VALUE_LEVELS: tl.constexpr,
@@ -1204,23 +1217,27 @@ def _oscar_decode_quant_stage1_grouped_h4(
                 mask=kv_mask,
                 other=0,
             ).to(tl.int64)
-            slot_bases = (
-                physical_slots * stride_cache_pos
-                + tl.cast(kv_head, tl.int64) * stride_cache_head
+            data_bases = (
+                physical_slots * stride_data_pos
+                + tl.cast(kv_head, tl.int64) * stride_data_head
+            )
+            meta_bases = (
+                physical_slots * stride_meta_pos
+                + tl.cast(kv_head, tl.int64) * stride_meta_head
             )
 
             k_packed = tl.load(
-                KV_cache_ptr + slot_bases[None, :] + offs_quarter[:, None],
+                K_data_ptr + data_bases[None, :] + offs_quarter[:, None],
                 mask=kv_mask[None, :],
                 other=0,
             )
             k_scale = tl.load(
-                KV_meta_ptr + (slot_bases + KEY_DATA_BYTES) // 2,
+                K_meta_ptr + meta_bases,
                 mask=kv_mask,
                 other=1.0,
             ).to(tl.bfloat16)
             k_zero = tl.load(
-                KV_meta_ptr + (slot_bases + KEY_DATA_BYTES) // 2 + 1,
+                K_meta_ptr + meta_bases + 1,
                 mask=kv_mask,
                 other=0.0,
             ).to(tl.bfloat16)
@@ -1245,19 +1262,18 @@ def _oscar_decode_quant_stage1_grouped_h4(
             scores = tl.dot(query, keys) * ATTN_SCALE
             scores = tl.where(kv_mask[None, :], scores, -float("inf"))
 
-            v_base = slot_bases + KEY_PACKED
             v_packed = tl.load(
-                KV_cache_ptr + v_base[:, None] + offs_quarter[None, :],
+                V_data_ptr + data_bases[:, None] + offs_quarter[None, :],
                 mask=kv_mask[:, None],
                 other=0,
             )
             v_scale = tl.load(
-                KV_meta_ptr + (v_base + VALUE_DATA_BYTES) // 2,
+                V_meta_ptr + meta_bases,
                 mask=kv_mask,
                 other=1.0,
             ).to(tl.bfloat16)
             v_zero = tl.load(
-                KV_meta_ptr + (v_base + VALUE_DATA_BYTES) // 2 + 1,
+                V_meta_ptr + meta_bases + 1,
                 mask=kv_mask,
                 other=0.0,
             ).to(tl.bfloat16)
@@ -1545,8 +1561,10 @@ def _oscar_finite_lse_stage2(
 
 @triton.jit
 def _oscar_full_dequant_kv(
-    KV_cache_ptr,
-    KV_meta_ptr,
+    K_data_ptr,
+    V_data_ptr,
+    K_meta_ptr,
+    V_meta_ptr,
     Block_table_ptr,
     K_out_ptr,  # [B, Hk, max_seq, D] fp16 — rotated-space K
     V_out_ptr,  # [B, Hk, max_seq, D] fp16 — rotated-space V
@@ -1556,15 +1574,17 @@ def _oscar_full_dequant_kv(
     stride_vo_b,
     stride_vo_h,
     stride_vo_s,
-    stride_cache_block,
-    stride_cache_pos,
-    stride_cache_head,
+    stride_data_block,
+    stride_data_pos,
+    stride_data_head,
+    stride_meta_block,
+    stride_meta_pos,
+    stride_meta_head,
     stride_bt_b,
     HEAD_DIM: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     KEY_DATA_BYTES: tl.constexpr,
-    KEY_PACKED: tl.constexpr,
     VALUE_DATA_BYTES: tl.constexpr,
     KEY_LEVELS: tl.constexpr,
     VALUE_LEVELS: tl.constexpr,
@@ -1579,10 +1599,15 @@ def _oscar_full_dequant_kv(
     page_idx = pos // BLOCK_SIZE
     page_off = pos % BLOCK_SIZE
     block_num = tl.load(Block_table_ptr + bid * stride_bt_b + page_idx).to(tl.int64)
-    slot_base = (
-        block_num * stride_cache_block
-        + tl.cast(page_off, tl.int64) * stride_cache_pos
-        + tl.cast(hid, tl.int64) * stride_cache_head
+    data_base = (
+        block_num * stride_data_block
+        + tl.cast(page_off, tl.int64) * stride_data_pos
+        + tl.cast(hid, tl.int64) * stride_data_head
+    )
+    meta_base = (
+        block_num * stride_meta_block
+        + tl.cast(page_off, tl.int64) * stride_meta_pos
+        + tl.cast(hid, tl.int64) * stride_meta_head
     )
 
     d_offs = tl.arange(0, BLOCK_D)
@@ -1595,26 +1620,23 @@ def _oscar_full_dequant_kv(
         bit_shift = (d_offs % 4) * 2
 
     # K
-    k_byte = tl.load(KV_cache_ptr + slot_base + byte_idx, mask=d_mask, other=0).to(
+    k_byte = tl.load(K_data_ptr + data_base + byte_idx, mask=d_mask, other=0).to(
         tl.int32
     )
     q_k = ((k_byte >> bit_shift) & (KEY_LEVELS - 1)).to(tl.float32)
-    k_meta = slot_base + KEY_DATA_BYTES
-    ksc = tl.load(KV_meta_ptr + k_meta // 2).to(tl.float32)
-    kzr = tl.load(KV_meta_ptr + k_meta // 2 + 1).to(tl.float32)
+    ksc = tl.load(K_meta_ptr + meta_base).to(tl.float32)
+    kzr = tl.load(K_meta_ptr + meta_base + 1).to(tl.float32)
     k_recon = (q_k - kzr) * ksc
     ko_base = bid * stride_ko_b + hid * stride_ko_h + pos * stride_ko_s
     tl.store(K_out_ptr + ko_base + d_offs, k_recon.to(tl.float16), mask=d_mask)
 
     # V
-    v_base = slot_base + KEY_PACKED
-    v_byte = tl.load(KV_cache_ptr + v_base + byte_idx, mask=d_mask, other=0).to(
+    v_byte = tl.load(V_data_ptr + data_base + byte_idx, mask=d_mask, other=0).to(
         tl.int32
     )
     q_v = ((v_byte >> bit_shift) & (VALUE_LEVELS - 1)).to(tl.float32)
-    v_meta = v_base + VALUE_DATA_BYTES
-    vsc = tl.load(KV_meta_ptr + v_meta // 2).to(tl.float32)
-    vzr = tl.load(KV_meta_ptr + v_meta // 2 + 1).to(tl.float32)
+    vsc = tl.load(V_meta_ptr + meta_base).to(tl.float32)
+    vzr = tl.load(V_meta_ptr + meta_base + 1).to(tl.float32)
     v_recon = (q_v - vzr) * vsc
     vo_base = bid * stride_vo_b + hid * stride_vo_h + pos * stride_vo_s
     tl.store(V_out_ptr + vo_base + d_offs, v_recon.to(tl.float16), mask=d_mask)
@@ -1665,13 +1687,13 @@ def _use_grouped_h4_stage1(
     )
 
 
-def _has_linear_physical_slot_layout(kv_cache: torch.Tensor) -> bool:
-    return (
-        kv_cache.stride(0) == kv_cache.shape[1] * kv_cache.stride(1)
-        and kv_cache.stride(1) == kv_cache.shape[2] * kv_cache.stride(2)
-        and kv_cache.stride(2) == kv_cache.shape[3] * kv_cache.stride(3)
-        and kv_cache.stride(3) == 1
-    )
+def _has_linear_physical_slot_layout(
+    k_data: torch.Tensor,
+    v_data: torch.Tensor,
+    k_meta: torch.Tensor,
+    v_meta: torch.Tensor,
+) -> bool:
+    return has_linear_oscar_arena_layout(k_data, v_data, k_meta, v_meta)
 
 
 def _grouped_h4_partial_counts(
@@ -1722,7 +1744,10 @@ def _inverse_v_rotation_kernel(
 
 def oscar_decode_attention(
     q_rot: torch.Tensor,  # [B, Hq, D] — query already rotated by R_k
-    kv_cache: torch.Tensor,  # [num_blocks, block_size, Hk, slot_size] uint8
+    k_data: torch.Tensor,
+    v_data: torch.Tensor,
+    k_meta: torch.Tensor,
+    v_meta: torch.Tensor,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     scale: float,
@@ -1751,9 +1776,18 @@ def oscar_decode_attention(
     use_grouped_h4: bool | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Fused OSCAR decode, optionally including the Triton V inverse."""
+    validate_oscar_separated_arenas(
+        k_data,
+        v_data,
+        k_meta,
+        v_meta,
+        data_bytes=key_data_bytes,
+    )
+    if key_packed_size != key_data_bytes + 4:
+        raise ValueError("OSCAR separated decode requires one BF16 K meta pair")
     B, Hq, D = q_rot.shape
-    Hk = kv_cache.shape[2]
-    block_size = kv_cache.shape[1]
+    Hk = k_data.shape[2]
+    block_size = k_data.shape[1]
     kv_group_size = Hq // Hk
     grouped_h4_supported = _use_grouped_h4_stage1(Hq, Hk, D)
     if use_grouped_h4 is True and not grouped_h4_supported:
@@ -1765,7 +1799,9 @@ def oscar_decode_attention(
         if use_grouped_h4 is None
         else use_grouped_h4
     )
-    if grouped_h4 and not _has_linear_physical_slot_layout(kv_cache):
+    if grouped_h4 and not _has_linear_physical_slot_layout(
+        k_data, v_data, k_meta, v_meta
+    ):
         if use_grouped_h4 is True:
             raise ValueError(
                 "Grouped-H4 preindexed slots require a linear paged cache"
@@ -1794,9 +1830,9 @@ def oscar_decode_attention(
             "Both BF16 caches and their window sizes are required for mixed decode"
         )
     if prefix_cache is None:
-        prefix_cache = kv_cache
+        prefix_cache = k_meta
     if recent_cache is None:
-        recent_cache = kv_cache
+        recent_cache = k_meta
     if hp_row_ids is None:
         hp_row_ids = seq_lens
     prefix_tokens = prefix_tokens or 0
@@ -1824,7 +1860,7 @@ def oscar_decode_attention(
             raise ValueError("OSCAR physical slot IDs must be a 2D tensor")
         if physical_slot_ids.dtype != torch.int64:
             raise ValueError("OSCAR physical slot IDs must use int64")
-        if physical_slot_ids.device != kv_cache.device:
+        if physical_slot_ids.device != k_data.device:
             raise ValueError("OSCAR physical slot IDs must share the KV cache device")
         if physical_slot_ids.shape[0] < block_table.shape[0]:
             raise ValueError("OSCAR physical slot IDs have too few request rows")
@@ -1849,8 +1885,10 @@ def oscar_decode_attention(
     if grouped_h4:
         _oscar_decode_quant_stage1_grouped_h4[(B, Hk, NUM_KV_SPLITS)](
             q_rot,
-            kv_cache,
-            kv_cache.view(torch.bfloat16),
+            k_data,
+            v_data,
+            k_meta,
+            v_meta,
             query_to_req_indices,
             shared_hit_tokens,
             recent_extra,
@@ -1859,8 +1897,10 @@ def oscar_decode_attention(
             mid_o,
             q_rot.stride(0),
             q_rot.stride(1),
-            kv_cache.stride(1),
-            kv_cache.stride(2),
+            k_data.stride(1),
+            k_data.stride(2),
+            k_meta.stride(1),
+            k_meta.stride(2),
             physical_slot_ids.stride(0),
             mid_o.stride(0),
             mid_o.stride(1),
@@ -1868,7 +1908,6 @@ def oscar_decode_attention(
             HEAD_DIM=D,
             NUM_QUANT_SPLITS=NUM_KV_SPLITS,
             KEY_DATA_BYTES=key_data_bytes,
-            KEY_PACKED=key_packed_size,
             VALUE_DATA_BYTES=value_data_bytes,
             KEY_LEVELS=key_levels,
             VALUE_LEVELS=value_levels,
@@ -1926,8 +1965,10 @@ def oscar_decode_attention(
         grid = (B, Hq, NUM_KV_SPLITS)
         _oscar_decode_stage1[grid](
             q_rot,
-            kv_cache,
-            kv_cache.view(torch.bfloat16),
+            k_data,
+            v_data,
+            k_meta,
+            v_meta,
             prefix_cache,
             recent_cache,
             hp_row_ids,
@@ -1940,9 +1981,12 @@ def oscar_decode_attention(
             mid_o,
             q_rot.stride(0),
             q_rot.stride(1),
-            kv_cache.stride(0),
-            kv_cache.stride(1),
-            kv_cache.stride(2),
+            k_data.stride(0),
+            k_data.stride(1),
+            k_data.stride(2),
+            k_meta.stride(0),
+            k_meta.stride(1),
+            k_meta.stride(2),
             prefix_cache.stride(0),
             prefix_cache.stride(1),
             prefix_cache.stride(2),
@@ -1960,7 +2004,6 @@ def oscar_decode_attention(
             NUM_KV_SPLITS=NUM_KV_SPLITS,
             KV_GROUP_SIZE=kv_group_size,
             KEY_DATA_BYTES=key_data_bytes,
-            KEY_PACKED=key_packed_size,
             VALUE_DATA_BYTES=value_data_bytes,
             KEY_LEVELS=key_levels,
             VALUE_LEVELS=value_levels,
@@ -2048,7 +2091,10 @@ def oscar_decode_attention(
 
 
 def oscar_full_dequant_kv(
-    kv_cache: torch.Tensor,
+    k_data: torch.Tensor,
+    v_data: torch.Tensor,
+    k_meta: torch.Tensor,
+    v_meta: torch.Tensor,
     block_table: torch.Tensor,
     cached_len: int,
     num_kv_heads: int,
@@ -2063,8 +2109,17 @@ def oscar_full_dequant_kv(
 
     Returns ``(k, v)`` each ``[cached_len, Hk, D]``.
     """
-    device = kv_cache.device
-    block_size = kv_cache.shape[1]
+    validate_oscar_separated_arenas(
+        k_data,
+        v_data,
+        k_meta,
+        v_meta,
+        data_bytes=key_data_bytes,
+    )
+    if key_packed_size != key_data_bytes + 4:
+        raise ValueError("OSCAR separated dequant requires one BF16 K meta pair")
+    device = k_data.device
+    block_size = k_data.shape[1]
     alloc_len = math.ceil(cached_len / block_size) * block_size
     BLOCK_D = triton.next_power_of_2(head_dim)
     k_buf = torch.empty(
@@ -2074,8 +2129,10 @@ def oscar_full_dequant_kv(
 
     grid = (alloc_len, num_kv_heads)
     _oscar_full_dequant_kv[grid](
-        kv_cache,
-        kv_cache.view(torch.bfloat16),
+        k_data,
+        v_data,
+        k_meta,
+        v_meta,
         block_table,
         k_buf,
         v_buf,
@@ -2085,15 +2142,17 @@ def oscar_full_dequant_kv(
         v_buf.stride(0),
         v_buf.stride(1),
         v_buf.stride(2),
-        kv_cache.stride(0),
-        kv_cache.stride(1),
-        kv_cache.stride(2),
+        k_data.stride(0),
+        k_data.stride(1),
+        k_data.stride(2),
+        k_meta.stride(0),
+        k_meta.stride(1),
+        k_meta.stride(2),
         block_table.stride(0),
         HEAD_DIM=head_dim,
         BLOCK_SIZE=block_size,
         NUM_KV_HEADS=num_kv_heads,
         KEY_DATA_BYTES=key_data_bytes,
-        KEY_PACKED=key_packed_size,
         VALUE_DATA_BYTES=value_data_bytes,
         KEY_LEVELS=key_levels,
         VALUE_LEVELS=value_levels,

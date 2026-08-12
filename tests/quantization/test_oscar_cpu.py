@@ -24,6 +24,10 @@ from vllm.model_executor.layers.quantization.oscar.rotation import (
 )
 from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.attention.backends.oscar_attn import OscarMetadataBuilder
+from vllm.v1.attention.ops.oscar_cache_contract import (
+    has_linear_oscar_arena_layout,
+    validate_oscar_separated_arenas,
+)
 from vllm.v1.attention.ops.triton_oscar_bulk_flush import (
     bind_oscar_bulk_flush_state,
     build_oscar_bulk_flush_plan_cpu,
@@ -207,7 +211,10 @@ class TestOscarConfigAndLayout(unittest.TestCase):
         layer_names = [f"layer.{index}" for index in range(36)]
         caches = {
             name: [
-                torch.empty((2, 16, 8, 72), dtype=torch.uint8),
+                torch.empty((2, 16, 8, 32), dtype=torch.uint8),
+                torch.empty((2, 16, 8, 32), dtype=torch.uint8),
+                torch.empty((2, 16, 8, 2), dtype=torch.bfloat16),
+                torch.empty((2, 16, 8, 2), dtype=torch.bfloat16),
                 torch.empty((64, 8, 2, 128), dtype=torch.bfloat16),
                 torch.empty((272, 8, 2, 128), dtype=torch.bfloat16),
             ]
@@ -221,17 +228,59 @@ class TestOscarConfigAndLayout(unittest.TestCase):
         )
 
         self.assertEqual(state.layer_names, tuple(layer_names))
-        self.assertEqual(
-            state.quant_ptrs.tolist(),
-            [caches[name][0].data_ptr() for name in layer_names],
-        )
+        for field, index in (
+            ("k_data_ptrs", 0),
+            ("v_data_ptrs", 1),
+            ("k_meta_ptrs", 2),
+            ("v_meta_ptrs", 3),
+        ):
+            self.assertEqual(
+                getattr(state, field).tolist(),
+                [caches[name][index].data_ptr() for name in layer_names],
+            )
         self.assertEqual(
             state.recent_ptrs.tolist(),
-            [caches[name][2].data_ptr() for name in layer_names],
+            [caches[name][5].data_ptr() for name in layer_names],
         )
         self.assertEqual(state.recent_capacity, 272)
-        self.assertEqual(state.quant_stride, caches["layer.0"][0].stride())
-        self.assertEqual(state.recent_stride, caches["layer.0"][2].stride())
+        self.assertEqual(state.data_stride, caches["layer.0"][0].stride())
+        self.assertEqual(state.meta_stride, caches["layer.0"][2].stride())
+        self.assertEqual(state.recent_stride, caches["layer.0"][5].stride())
+
+    def test_separated_quant_arena_contract_is_linear_and_fail_closed(self):
+        arenas = (
+            torch.empty((2, 16, 8, 32), dtype=torch.uint8),
+            torch.empty((2, 16, 8, 32), dtype=torch.uint8),
+            torch.empty((2, 16, 8, 2), dtype=torch.bfloat16),
+            torch.empty((2, 16, 8, 2), dtype=torch.bfloat16),
+        )
+        self.assertTrue(has_linear_oscar_arena_layout(*arenas))
+        validate_oscar_separated_arenas(*arenas, data_bytes=32, require_linear=True)
+        with self.assertRaisesRegex(ValueError, "data arena width"):
+            validate_oscar_separated_arenas(*arenas, data_bytes=16)
+
+    def test_all_quant_read_write_paths_use_four_pointer_abi(self):
+        paths = (
+            "triton_oscar_store.py",
+            "triton_oscar_mixed_store.py",
+            "triton_oscar_decode.py",
+            "triton_oscar_prefill.py",
+            "triton_oscar_bulk_flush.py",
+        )
+        root = Path("vllm/v1/attention/ops")
+        source = "\n".join((root / path).read_text() for path in paths)
+        for name in ("K_data_ptr", "V_data_ptr", "K_meta_ptr", "V_meta_ptr"):
+            self.assertIn(name, source)
+        for active in (
+            "def _oscar_decode_stage1(",
+            "def _oscar_decode_quant_stage1_grouped_h4(",
+            "def _oscar_full_dequant_kv(",
+        ):
+            start = source.index(active)
+            end = source.index("\n\n@triton.jit", start)
+            closure = source[start:end]
+            self.assertNotIn("KV_cache_ptr", closure)
+            self.assertNotIn("KV_meta_ptr", closure)
 
     def test_bulk_flush_reset_and_generation_prevent_row_aba(self):
         phase = torch.tensor([7], dtype=torch.int32)
@@ -346,10 +395,15 @@ class TestOscarConfigAndLayout(unittest.TestCase):
         self.assertFalse(captured.bulk_flush_plan.valid.any())
 
     def test_bulk_flush_registration_fails_closed(self):
-        quant = torch.empty((2, 16, 8, 72), dtype=torch.uint8)
+        k_data = torch.empty((2, 16, 8, 32), dtype=torch.uint8)
+        v_data = torch.empty((2, 16, 8, 32), dtype=torch.uint8)
+        k_meta = torch.empty((2, 16, 8, 2), dtype=torch.bfloat16)
+        v_meta = torch.empty((2, 16, 8, 2), dtype=torch.bfloat16)
         prefix = torch.empty((128, 8, 2, 128), dtype=torch.bfloat16)
         recent = torch.empty((544, 8, 2, 128), dtype=torch.bfloat16)
-        caches = {"layer.0": [quant, prefix, recent]}
+        caches = {
+            "layer.0": [k_data, v_data, k_meta, v_meta, prefix, recent]
+        }
 
         with self.assertRaisesRegex(ValueError, "unique"):
             register_oscar_bulk_flush_caches(
@@ -372,14 +426,20 @@ class TestOscarConfigAndLayout(unittest.TestCase):
                 expected_recent_capacity=256,
                 max_num_seqs=2,
             )
-        qwen_quant = torch.empty((2, 16, 8, 72), dtype=torch.uint8)
+        qwen_k_data = torch.empty((2, 16, 8, 32), dtype=torch.uint8)
+        qwen_v_data = torch.empty((2, 16, 8, 32), dtype=torch.uint8)
+        qwen_k_meta = torch.empty((2, 16, 8, 2), dtype=torch.bfloat16)
+        qwen_v_meta = torch.empty((2, 16, 8, 2), dtype=torch.bfloat16)
         qwen_prefix = torch.empty((64, 8, 2, 128), dtype=torch.bfloat16)
         qwen_recent = torch.empty((272, 8, 2, 128), dtype=torch.bfloat16)
         with self.assertRaisesRegex(ValueError, "uint8"):
             register_oscar_bulk_flush_caches(
                 {
                     "layer.0": [
-                        qwen_quant.to(torch.int8),
+                        qwen_k_data.to(torch.int8),
+                        qwen_v_data,
+                        qwen_k_meta,
+                        qwen_v_meta,
                         qwen_prefix,
                         qwen_recent,
                     ]
@@ -392,7 +452,10 @@ class TestOscarConfigAndLayout(unittest.TestCase):
             register_oscar_bulk_flush_caches(
                 {
                     "layer.0": [
-                        qwen_quant[:, :, :4],
+                        qwen_k_data[:, :, :4],
+                        qwen_v_data,
+                        qwen_k_meta,
+                        qwen_v_meta,
                         qwen_prefix,
                         qwen_recent,
                     ]
@@ -404,9 +467,18 @@ class TestOscarConfigAndLayout(unittest.TestCase):
         padded_recent = torch.empty(
             (272, 8, 2, 129), dtype=torch.bfloat16
         )[..., :128]
-        with self.assertRaisesRegex(ValueError, "combined K/V offset"):
+        with self.assertRaisesRegex(ValueError, "BF16 K/V dimension"):
             register_oscar_bulk_flush_caches(
-                {"layer.0": [qwen_quant, qwen_prefix, padded_recent]},
+                {
+                    "layer.0": [
+                        qwen_k_data,
+                        qwen_v_data,
+                        qwen_k_meta,
+                        qwen_v_meta,
+                        qwen_prefix,
+                        padded_recent,
+                    ]
+                },
                 ["layer.0"],
                 expected_recent_capacity=272,
                 max_num_seqs=1,
@@ -416,7 +488,10 @@ class TestOscarConfigAndLayout(unittest.TestCase):
         layer_names = [f"layer.{index}" for index in range(36)]
         caches = {
             name: [
-                torch.empty((2, 16, 8, 72), dtype=torch.uint8),
+                torch.empty((2, 16, 8, 32), dtype=torch.uint8),
+                torch.empty((2, 16, 8, 32), dtype=torch.uint8),
+                torch.empty((2, 16, 8, 2), dtype=torch.bfloat16),
+                torch.empty((2, 16, 8, 2), dtype=torch.bfloat16),
                 torch.empty((64, 8, 2, 128), dtype=torch.bfloat16),
                 torch.empty((272, 8, 2, 128), dtype=torch.bfloat16),
             ]
@@ -1126,9 +1201,16 @@ class TestOscarConfigAndLayout(unittest.TestCase):
             with self.subTest(shape=shape):
                 self.assertFalse(_use_grouped_h4_stage1(*shape))
 
-        contiguous = torch.empty(4, 16, 8, 72, dtype=torch.uint8)
-        self.assertTrue(_has_linear_physical_slot_layout(contiguous))
-        self.assertFalse(_has_linear_physical_slot_layout(contiguous[:, ::2]))
+        data = torch.empty(4, 16, 8, 32, dtype=torch.uint8)
+        meta = torch.empty(4, 16, 8, 2, dtype=torch.bfloat16)
+        self.assertTrue(
+            _has_linear_physical_slot_layout(data, data, meta, meta)
+        )
+        self.assertFalse(
+            _has_linear_physical_slot_layout(
+                data[:, ::2], data[:, ::2], meta[:, ::2], meta[:, ::2]
+            )
+        )
 
     def test_d128_quarter_layout_and_d64_legacy_layout_are_explicit(self):
         from vllm.v1.attention.ops.triton_oscar_store import (
@@ -1162,7 +1244,7 @@ class TestOscarConfigAndLayout(unittest.TestCase):
         kernel_end = source.index("\n\n@triton.jit", kernel_start)
         kernel_source = source[kernel_start:kernel_end]
         self.assertIn("Physical_slot_ids_ptr", kernel_source)
-        self.assertIn("physical_slots * stride_cache_pos", kernel_source)
+        self.assertIn("physical_slots * stride_data_pos", kernel_source)
         self.assertNotIn("Block_table_ptr", kernel_source)
         self.assertNotIn("kv_offs // BLOCK_SIZE", kernel_source)
         self.assertNotIn("kv_offs % BLOCK_SIZE", kernel_source)
@@ -1183,7 +1265,12 @@ class TestOscarConfigAndLayout(unittest.TestCase):
             dispatch_source,
         )
         self.assertIn("physical_slot_ids.stride(0)", dispatch_source)
-        self.assertIn("_has_linear_physical_slot_layout(kv_cache)", dispatch_source)
+        self.assertIn(
+            "_has_linear_physical_slot_layout(\n"
+            "        k_data, v_data, k_meta, v_meta\n"
+            "    )",
+            dispatch_source,
+        )
 
         backend_source = (
             Path(triton_oscar_decode.__file__).parents[1] / "backends" / "oscar_attn.py"

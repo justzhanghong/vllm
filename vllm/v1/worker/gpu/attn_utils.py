@@ -158,7 +158,7 @@ def _reshape_oscar_kv_cache(
     num_blocks: int,
     max_num_seqs: int,
 ) -> list[torch.Tensor]:
-    """Split one accounted allocation into quant, prefix, and recent tensors."""
+    """Split one allocation into separated quant arenas and BF16 pools."""
     if kv_cache_spec.head_size_v != kv_cache_spec.head_size:
         raise ValueError("OSCAR requires equal key and value head sizes")
 
@@ -180,17 +180,63 @@ def _reshape_oscar_kv_cache(
             f"actual={kv_raw_tensor.numel()}, expected={expected_bytes}"
         )
 
-    permuted_shape = tuple(kv_cache_shape[i] for i in kv_cache_stride_order)
-    inv_order = [
-        kv_cache_stride_order.index(i) for i in range(len(kv_cache_stride_order))
-    ]
-    quant_cache = (
-        kv_raw_tensor[:quant_bytes]
-        .view(kv_cache_spec.dtype)
-        .view(permuted_shape)
-        .permute(*inv_order)
+    expected_shape = (
+        num_blocks,
+        kv_cache_spec.block_size,
+        kv_cache_spec.num_kv_heads,
+        kv_cache_spec.quant_slot_size,
     )
-    hp_shape_tail = (kv_cache_spec.num_kv_heads, 2, kv_cache_spec.head_size)
+    if kv_cache_shape != expected_shape or kv_cache_stride_order != (0, 1, 2, 3):
+        raise ValueError("OSCAR requires a token-major quant cache layout")
+
+    data_bytes = (kv_cache_spec.head_size + 3) // 4
+    num_groups = (
+        kv_cache_spec.head_size + kv_cache_spec.group_size - 1
+    ) // kv_cache_spec.group_size
+    meta_elements = 2 * num_groups
+    meta_bytes = meta_elements * get_dtype_size(kv_cache_spec.hp_dtype)
+    separated_slot_bytes = 2 * data_bytes + 2 * meta_bytes
+    if separated_slot_bytes != kv_cache_spec.quant_slot_size:
+        raise ValueError(
+            "OSCAR quant slot size does not match separated arena geometry: "
+            f"actual={kv_cache_spec.quant_slot_size}, "
+            f"expected={separated_slot_bytes}"
+        )
+
+    quant_slots = num_blocks * kv_cache_spec.block_size
+    data_region_bytes = quant_slots * kv_cache_spec.num_kv_heads * data_bytes
+    meta_region_bytes = quant_slots * kv_cache_spec.num_kv_heads * meta_bytes
+    offsets = (
+        0,
+        data_region_bytes,
+        2 * data_region_bytes,
+        2 * data_region_bytes + meta_region_bytes,
+        quant_bytes,
+    )
+    if any(offset % get_dtype_size(kv_cache_spec.hp_dtype) for offset in offsets[2:]):
+        raise RuntimeError("OSCAR BF16 arena offset is not aligned")
+    if offsets[-1] != 2 * data_region_bytes + 2 * meta_region_bytes:
+        raise RuntimeError("OSCAR separated quant arena size mismatch")
+
+    data_shape = (*expected_shape[:3], data_bytes)
+    meta_shape = (*expected_shape[:3], meta_elements)
+    k_data = kv_raw_tensor[offsets[0] : offsets[1]].view(torch.uint8).view(data_shape)
+    v_data = kv_raw_tensor[offsets[1] : offsets[2]].view(torch.uint8).view(data_shape)
+    k_meta = (
+        kv_raw_tensor[offsets[2] : offsets[3]]
+        .view(kv_cache_spec.hp_dtype)
+        .view(meta_shape)
+    )
+    v_meta = (
+        kv_raw_tensor[offsets[3] : offsets[4]]
+        .view(kv_cache_spec.hp_dtype)
+        .view(meta_shape)
+    )
+    hp_shape_tail = (
+        kv_cache_spec.num_kv_heads,
+        2,
+        kv_cache_spec.head_size,
+    )
     prefix_cache = (
         kv_raw_tensor[quant_bytes : quant_bytes + prefix_bytes]
         .view(kv_cache_spec.hp_dtype)
@@ -201,7 +247,7 @@ def _reshape_oscar_kv_cache(
         .view(kv_cache_spec.hp_dtype)
         .view(recent_slots, *hp_shape_tail)
     )
-    return [quant_cache, prefix_cache, recent_cache]
+    return [k_data, v_data, k_meta, v_meta, prefix_cache, recent_cache]
 
 
 def _reshape_kv_cache(

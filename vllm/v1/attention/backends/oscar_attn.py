@@ -221,18 +221,14 @@ class OscarMetadataBuilder(AttentionMetadataBuilder[OscarMetadata]):
         self._prefix_tokens = getattr(kv_cache_spec, "prefix_tokens", 64)
         self._recent_tokens = getattr(kv_cache_spec, "recent_tokens", 256)
         self._recent_capacity = getattr(
-            kv_cache_spec,
-            "recent_row_capacity",
-            self._recent_tokens,
+            kv_cache_spec, "recent_row_capacity", self._recent_tokens
         )
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         self.flush_phase = torch.zeros(max_num_seqs, dtype=torch.int32, device=device)
         self.row_generations = torch.full(
             (max_num_seqs,), -1, dtype=torch.int64, device=device
         )
-        self.recent_extra = torch.zeros(
-            max_num_seqs, dtype=torch.int32, device=device
-        )
+        self.recent_extra = torch.zeros(max_num_seqs, dtype=torch.int32, device=device)
         plan_shape = (max_num_seqs, self._flush_interval)
         self.flush_positions = torch.full(
             plan_shape, -1, dtype=torch.int32, device=device
@@ -477,7 +473,7 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
         rotated_key: torch.Tensor | None = None,
         rotated_value: torch.Tensor | None = None,
     ) -> None:
-        quant_cache, prefix_cache, recent_cache = kv_cache
+        k_data, v_data, k_meta, v_meta, prefix_cache, recent_cache = kv_cache
         num_tokens = attn_metadata.num_actual_tokens
         if num_tokens <= 0:
             return
@@ -520,11 +516,13 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
             oscar_store(
                 k_rot,
                 v_rot,
-                quant_cache,
+                k_data,
+                v_data,
+                k_meta,
+                v_meta,
                 attn_metadata.slot_mapping[:num_tokens],
                 key_levels=self.cfg.key_levels,
                 value_levels=self.cfg.value_levels,
-                key_packed_size=self.cfg.key_packed_size,
                 data_bytes=self.cfg.key_data_bytes,
                 k_clip_ratio=self.cfg.k_clip_ratio,
                 v_clip_ratio=self.cfg.v_clip_ratio,
@@ -537,7 +535,10 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
         if demote_recent and not bulk_flush:
             oscar_demote_hp(
                 recent_cache,
-                quant_cache,
+                k_data,
+                v_data,
+                k_meta,
+                v_meta,
                 attn_metadata.block_table,
                 attn_metadata.seq_lens,
                 attn_metadata.hp_row_ids,
@@ -549,7 +550,6 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
                 recent_capacity=recent_cache.shape[0] // self._max_num_seqs,
                 key_levels=self.cfg.key_levels,
                 value_levels=self.cfg.value_levels,
-                key_packed_size=self.cfg.key_packed_size,
                 data_bytes=self.cfg.key_data_bytes,
                 k_clip_ratio=self.cfg.k_clip_ratio,
                 v_clip_ratio=self.cfg.v_clip_ratio,
@@ -565,7 +565,7 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
             seq_lens=attn_metadata.seq_lens,
             hp_row_ids=attn_metadata.hp_row_ids,
             prefix_page_ids=attn_metadata.prefix_page_ids,
-            prefix_block_size=quant_cache.shape[1],
+            prefix_block_size=k_data.shape[1],
             prefix_tokens=self.cfg.prefix_tokens,
             recent_tokens=self.cfg.recent_tokens,
             recent_capacity=recent_cache.shape[0] // self._max_num_seqs,
@@ -902,7 +902,7 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
                 attn_metadata.query_start_loc[1:] - attn_metadata.query_start_loc[:-1]
             )
             cached_lens_per_req = attn_metadata.seq_lens - query_lens
-        quant_cache, prefix_cache, recent_cache = kv_cache
+        k_data, v_data, k_meta, v_meta, prefix_cache, recent_cache = kv_cache
         v_rotation_absorbed = self._v_rotation_absorbed(layer)
         if v_rotation_absorbed:
             assert rotated_key is not None and rotated_value is not None
@@ -914,7 +914,10 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
             q_rot = torch.matmul(query.float(), layer._oscar_Rk)
         cached_output, cached_lse = oscar_cached_prefill_attention(
             q_rot,
-            quant_cache,
+            k_data,
+            v_data,
+            k_meta,
+            v_meta,
             prefix_cache,
             recent_cache,
             attn_metadata.block_table,
@@ -984,7 +987,7 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
                 (workspace_shape, query.dtype),
             )
         )
-        quant_cache, prefix_cache, recent_cache = kv_cache
+        k_data, v_data, k_meta, v_meta, prefix_cache, recent_cache = kv_cache
         cached_lens = attn_metadata.cached_lens
         if cached_lens is None:
             query_lens = (
@@ -994,7 +997,10 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
         oscar_materialize_prefill_kv(
             rotated_key,
             rotated_value,
-            quant_cache,
+            k_data,
+            v_data,
+            k_meta,
+            v_meta,
             prefix_cache,
             recent_cache,
             attn_metadata.block_table,
@@ -1091,7 +1097,7 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
         return out[0].transpose(0, 1)
 
     def _decode_attention(self, query, kv_cache, attn_metadata, layer):
-        quant_cache, prefix_cache, recent_cache = kv_cache
+        k_data, v_data, k_meta, v_meta, prefix_cache, recent_cache = kv_cache
         # Rotate the query into the same space as the rotated stored keys.
         q_rot = torch.matmul(query.float(), layer._oscar_Rk)
         logger.info_once(
@@ -1100,7 +1106,10 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
         )
         out_rot = oscar_decode_attention(
             q_rot,
-            quant_cache,
+            k_data,
+            v_data,
+            k_meta,
+            v_meta,
             attn_metadata.block_table,
             attn_metadata.seq_lens,
             self.scale,

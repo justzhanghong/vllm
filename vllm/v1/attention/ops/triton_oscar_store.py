@@ -8,8 +8,8 @@ This kernel takes rotated K/V and, per (token, head):
   1. applies OSCAR percentile clipping;
   2. computes the per-vector asymmetric INT2 quantizer;
   3. packs four 2-bit indices per byte;
-  4. scatters the packed bytes plus a BF16 ``(scale, zero_point)`` pair into the
-     combined KV cache slot ``[key_packed | value_packed]``.
+  4. scatters packed bytes and BF16 ``(scale, zero_point)`` pairs into four
+     separated token-major arenas.
 
 Single quantization group per vector (``group_size >= head_dim``); this is
 the ``head_dim <= 128`` regime that the OSCAR presets target.
@@ -18,6 +18,9 @@ the ``head_dim <= 128`` regime that the OSCAR presets target.
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.oscar_cache_contract import (
+    validate_oscar_separated_arenas,
+)
 
 
 def _int2_byte_index_and_shift(dim: int, head_dim: int) -> tuple[int, int]:
@@ -31,10 +34,10 @@ def _int2_byte_index_and_shift(dim: int, head_dim: int) -> tuple[int, int]:
 @triton.jit
 def _quantize_pack_int2_vec(
     vec,
-    KV_cache_ptr,  # flattened uint8 cache
-    KV_meta_ptr,  # BF16 view of the same cache storage
-    region_base,  # byte offset of this region within the slot (0 or key_packed)
-    slot_base,  # byte offset of this slot+head in the cache
+    Data_ptr,
+    Meta_ptr,
+    data_base,
+    meta_base,
     d_offs,  # tl.arange(0, BLOCK_D)
     d_mask,  # d_offs < D
     D: tl.constexpr,
@@ -69,27 +72,24 @@ def _quantize_pack_int2_vec(
     pack_offs = tl.arange(0, BLOCK_PACK)
     pack_mask = pack_offs < DATA_BYTES
     tl.store(
-        KV_cache_ptr + slot_base + region_base + pack_offs,
+        Data_ptr + data_base + pack_offs,
         packed,
         mask=pack_mask,
     )
 
-    # Store BF16 scale and zero point right after the packed data.
-    meta = region_base + DATA_BYTES
-    meta_offset = (slot_base + meta) // 2
-    tl.store(KV_meta_ptr + meta_offset, scale.to(tl.bfloat16))
-    tl.store(KV_meta_ptr + meta_offset + 1, zero.to(tl.bfloat16))
+    tl.store(Meta_ptr + meta_base, scale.to(tl.bfloat16))
+    tl.store(Meta_ptr + meta_base + 1, zero.to(tl.bfloat16))
 
 
 @triton.jit
 def _store_int2_vec(
     Src_ptr,  # [N, H, D] — rotated K or V
-    KV_cache_ptr,  # flattened uint8 cache
-    KV_meta_ptr,  # BF16 view of the same cache storage
+    Data_ptr,
+    Meta_ptr,
     base,  # token/head offset into Src_ptr
     stride_dim: tl.constexpr,
-    region_base,  # byte offset of this region within the slot (0 or key_packed)
-    slot_base,  # byte offset of this slot+head in the cache
+    data_base,
+    meta_base,
     d_offs,
     d_mask,
     D: tl.constexpr,
@@ -104,10 +104,10 @@ def _store_int2_vec(
     )
     _quantize_pack_int2_vec(
         vec,
-        KV_cache_ptr,
-        KV_meta_ptr,
-        region_base,
-        slot_base,
+        Data_ptr,
+        Meta_ptr,
+        data_base,
+        meta_base,
         d_offs,
         d_mask,
         D=D,
@@ -123,8 +123,10 @@ def _store_int2_vec(
 def _oscar_store_kernel(
     Key_ptr,  # [N, H, D] — rotated+clipped keys
     Value_ptr,  # [N, H, D] — rotated+clipped values
-    KV_cache_ptr,  # flattened uint8
-    KV_meta_ptr,  # BF16 view of the same cache storage
+    K_data_ptr,
+    V_data_ptr,
+    K_meta_ptr,
+    V_meta_ptr,
     Slot_mapping_ptr,  # [N] int
     Token_req_ptr,
     Query_start_ptr,
@@ -135,14 +137,16 @@ def _oscar_store_kernel(
     stride_value_token: tl.constexpr,
     stride_value_head: tl.constexpr,
     stride_value_dim: tl.constexpr,
-    stride_cache_block: tl.constexpr,
-    stride_cache_pos: tl.constexpr,
-    stride_cache_head: tl.constexpr,
+    stride_data_block: tl.constexpr,
+    stride_data_pos: tl.constexpr,
+    stride_data_head: tl.constexpr,
+    stride_meta_block: tl.constexpr,
+    stride_meta_pos: tl.constexpr,
+    stride_meta_head: tl.constexpr,
     D: tl.constexpr,
     H: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    KEY_PACKED: tl.constexpr,  # bytes of the key region (incl. its meta)
     KEY_LEVELS: tl.constexpr,
     VALUE_LEVELS: tl.constexpr,
     K_CLIP_INDEX: tl.constexpr,
@@ -172,10 +176,15 @@ def _oscar_store_kernel(
         return
     blk = (slot // BLOCK_SIZE).to(tl.int64)
     off = (slot % BLOCK_SIZE).to(tl.int64)
-    slot_base = (
-        blk * stride_cache_block
-        + off * stride_cache_pos
-        + tl.cast(head_idx, tl.int64) * stride_cache_head
+    data_base = (
+        blk * stride_data_block
+        + off * stride_data_pos
+        + tl.cast(head_idx, tl.int64) * stride_data_head
+    )
+    meta_base = (
+        blk * stride_meta_block
+        + off * stride_meta_pos
+        + tl.cast(head_idx, tl.int64) * stride_meta_head
     )
 
     key_base = (
@@ -189,15 +198,14 @@ def _oscar_store_kernel(
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < D
 
-    # Key region at offset 0, value region at offset KEY_PACKED.
     _store_int2_vec(
         Key_ptr,
-        KV_cache_ptr,
-        KV_meta_ptr,
+        K_data_ptr,
+        K_meta_ptr,
         key_base,
         stride_key_dim,
-        0,
-        slot_base,
+        data_base,
+        meta_base,
         d_offs,
         d_mask,
         D=D,
@@ -209,12 +217,12 @@ def _oscar_store_kernel(
     )
     _store_int2_vec(
         Value_ptr,
-        KV_cache_ptr,
-        KV_meta_ptr,
+        V_data_ptr,
+        V_meta_ptr,
         value_base,
         stride_value_dim,
-        KEY_PACKED,
-        slot_base,
+        data_base,
+        meta_base,
         d_offs,
         d_mask,
         D=D,
@@ -229,11 +237,13 @@ def _oscar_store_kernel(
 def oscar_store(
     key_rot: torch.Tensor,  # [N, H, D] fp32/fp16 — rotated (+clipped) keys
     value_rot: torch.Tensor,  # [N, H, D] — rotated (+clipped) values
-    kv_cache: torch.Tensor,  # [num_blocks, block_size, Hk, slot_size] uint8
+    k_data: torch.Tensor,
+    v_data: torch.Tensor,
+    k_meta: torch.Tensor,
+    v_meta: torch.Tensor,
     slot_mapping: torch.Tensor,  # [N]
     key_levels: int,
     value_levels: int,
-    key_packed_size: int,
     data_bytes: int,
     k_clip_ratio: float = 0.0,
     v_clip_ratio: float = 0.0,
@@ -243,12 +253,19 @@ def oscar_store(
     prefix_tokens: int = 0,
     recent_tokens: int = 0,
 ) -> None:
-    """Quantize rotated K/V to INT2 and scatter into the combined cache."""
+    """Quantize rotated K/V into separate data and metadata arenas."""
+    validate_oscar_separated_arenas(
+        k_data,
+        v_data,
+        k_meta,
+        v_meta,
+        data_bytes=data_bytes,
+    )
     N, H, D = key_rot.shape
     if N == 0:
         return
     NH = N * H
-    block_size = kv_cache.shape[1]
+    block_size = k_data.shape[1]
     BLOCK_D = triton.next_power_of_2(D)
     BLOCK_PACK = triton.next_power_of_2(data_bytes)
     mixed_layout = token_to_req_indices is not None
@@ -270,8 +287,10 @@ def oscar_store(
     _oscar_store_kernel[grid](
         key_rot,
         value_rot,
-        kv_cache,
-        kv_cache.view(torch.bfloat16),
+        k_data,
+        v_data,
+        k_meta,
+        v_meta,
         slot_mapping,
         token_to_req_indices,
         query_start_loc,
@@ -282,14 +301,16 @@ def oscar_store(
         stride_value_token=value_rot.stride(0),
         stride_value_head=value_rot.stride(1),
         stride_value_dim=value_rot.stride(2),
-        stride_cache_block=kv_cache.stride(0),
-        stride_cache_pos=kv_cache.stride(1),
-        stride_cache_head=kv_cache.stride(2),
+        stride_data_block=k_data.stride(0),
+        stride_data_pos=k_data.stride(1),
+        stride_data_head=k_data.stride(2),
+        stride_meta_block=k_meta.stride(0),
+        stride_meta_pos=k_meta.stride(1),
+        stride_meta_head=k_meta.stride(2),
         D=D,
         H=H,
         BLOCK_SIZE=block_size,
         BLOCK_D=BLOCK_D,
-        KEY_PACKED=key_packed_size,
         KEY_LEVELS=key_levels,
         VALUE_LEVELS=value_levels,
         K_CLIP_INDEX=clip_index(k_clip_ratio),

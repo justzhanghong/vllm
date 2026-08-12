@@ -32,11 +32,16 @@ class OscarBulkFlushCacheState:
     """Stable per-layer cache address table and uniform layout."""
 
     layer_names: tuple[str, ...]
-    quant_ptrs: torch.Tensor
+    k_data_ptrs: torch.Tensor
+    v_data_ptrs: torch.Tensor
+    k_meta_ptrs: torch.Tensor
+    v_meta_ptrs: torch.Tensor
     recent_ptrs: torch.Tensor
-    quant_sample: torch.Tensor
+    data_sample: torch.Tensor
+    meta_sample: torch.Tensor
     recent_sample: torch.Tensor
-    quant_stride: tuple[int, ...]
+    data_stride: tuple[int, ...]
+    meta_stride: tuple[int, ...]
     recent_stride: tuple[int, ...]
     recent_capacity: int
 
@@ -204,34 +209,45 @@ def register_oscar_bulk_flush_caches(
         raise ValueError(f"OSCAR bulk flush cache layers are missing: {missing}")
     if max_num_seqs <= 0 or expected_recent_capacity <= 0:
         raise ValueError("OSCAR bulk flush capacities must be positive")
-    malformed = [name for name in names if len(kv_caches[name]) != 3]
+    malformed = [name for name in names if len(kv_caches[name]) != 6]
     if malformed:
-        raise ValueError(f"OSCAR mixed cache triples are malformed: {malformed}")
-    quant = [kv_caches[name][0] for name in names]
-    prefix = [kv_caches[name][1] for name in names]
-    recent = [kv_caches[name][2] for name in names]
-    if any(tensor.data_ptr() == 0 for tensor in (*quant, *prefix, *recent)):
+        raise ValueError(f"OSCAR separated caches are malformed: {malformed}")
+    k_data = [kv_caches[name][0] for name in names]
+    v_data = [kv_caches[name][1] for name in names]
+    k_meta = [kv_caches[name][2] for name in names]
+    v_meta = [kv_caches[name][3] for name in names]
+    prefix = [kv_caches[name][4] for name in names]
+    recent = [kv_caches[name][5] for name in names]
+    all_caches = (*k_data, *v_data, *k_meta, *v_meta, *prefix, *recent)
+    if any(tensor.data_ptr() == 0 for tensor in all_caches):
         raise ValueError("OSCAR bulk flush cache pointers must be nonzero")
-    device = quant[0].device
-    if any(tensor.device != device for tensor in (*quant, *prefix, *recent)):
+    device = k_data[0].device
+    if any(tensor.device != device for tensor in all_caches):
         raise ValueError("OSCAR mixed caches must share one device")
-    if any(tensor.dtype != torch.uint8 for tensor in quant):
-        raise ValueError("OSCAR quant caches must use uint8")
-    if any(tensor.dtype != torch.bfloat16 for tensor in (*prefix, *recent)):
+    if any(tensor.dtype != torch.uint8 for tensor in (*k_data, *v_data)):
+        raise ValueError("OSCAR quant data caches must use uint8")
+    if any(
+        tensor.dtype != torch.bfloat16
+        for tensor in (*k_meta, *v_meta, *prefix, *recent)
+    ):
         raise ValueError("OSCAR BF16 caches must use bfloat16")
-    if any(tensor.ndim != 4 for tensor in (*quant, *prefix, *recent)):
+    if any(tensor.ndim != 4 for tensor in all_caches):
         raise ValueError("OSCAR mixed caches must be four-dimensional")
     if (
-        quant[0].shape[1:] != (16, 8, 72)
+        k_data[0].shape[1:] != (16, 8, 32)
+        or v_data[0].shape != k_data[0].shape
+        or k_meta[0].shape[1:] != (16, 8, 2)
+        or v_meta[0].shape != k_meta[0].shape
         or prefix[0].shape[1:] != (8, 2, 128)
         or recent[0].shape[1:] != (8, 2, 128)
     ):
-        raise ValueError("OSCAR quant/prefix/recent K/V shapes are inconsistent")
-    quant_stride = quant[0].stride()
+        raise ValueError("OSCAR separated quant and BF16 shapes are inconsistent")
+    data_stride = k_data[0].stride()
+    meta_stride = k_meta[0].stride()
     prefix_stride = prefix[0].stride()
     recent_stride = recent[0].stride()
     recent_slots = recent[0].shape[0]
-    if quant[0].shape[0] <= 0 or prefix[0].shape[0] != max_num_seqs * 64:
+    if k_data[0].shape[0] <= 0 or prefix[0].shape[0] != max_num_seqs * 64:
         raise ValueError("OSCAR quant/prefix cache capacities are inconsistent")
     if recent_slots != max_num_seqs * expected_recent_capacity:
         raise ValueError(
@@ -239,7 +255,8 @@ def register_oscar_bulk_flush_caches(
         )
     recent_capacity = expected_recent_capacity
     if (
-        quant_stride[-1] != 1
+        data_stride[-1] != 1
+        or meta_stride[-1] != 1
         or prefix_stride[-1] != 1
         or recent_stride[-1] != 1
     ):
@@ -248,7 +265,7 @@ def register_oscar_bulk_flush_caches(
         prefix_stride[2] != prefix[0].shape[3]
         or recent_stride[2] != recent[0].shape[3]
     ):
-        raise ValueError("OSCAR combined K/V offset does not match head size")
+        raise ValueError("OSCAR BF16 K/V dimension does not match head size")
     if (
         prefix_stride[1] != 2 * prefix_stride[2]
         or recent_stride[1] != 2 * recent_stride[2]
@@ -260,14 +277,29 @@ def register_oscar_bulk_flush_caches(
     ):
         raise ValueError("OSCAR BF16 slot stride is not tightly packed")
     if (
-        quant_stride[2] != quant[0].shape[3]
-        or quant_stride[1] != quant[0].shape[2] * quant_stride[2]
-        or quant_stride[0] != quant[0].shape[1] * quant_stride[1]
+        data_stride[2] != k_data[0].shape[3]
+        or data_stride[1] != k_data[0].shape[2] * data_stride[2]
+        or data_stride[0] != k_data[0].shape[1] * data_stride[1]
+        or meta_stride[2] != k_meta[0].shape[3]
+        or meta_stride[1] != k_meta[0].shape[2] * meta_stride[2]
+        or meta_stride[0] != k_meta[0].shape[1] * meta_stride[1]
     ):
-        raise ValueError("OSCAR bulk flush requires a linear paged quant cache")
-    for layer_quant, layer_prefix, layer_recent in zip(quant, prefix, recent):
-        if layer_quant.stride() != quant_stride or layer_quant.shape != quant[0].shape:
-            raise ValueError("OSCAR quant cache layouts must be uniform across layers")
+        raise ValueError("OSCAR bulk flush requires linear quant arenas")
+    for layer_index in range(len(names)):
+        layer_data = (k_data[layer_index], v_data[layer_index])
+        layer_meta = (k_meta[layer_index], v_meta[layer_index])
+        layer_prefix = prefix[layer_index]
+        layer_recent = recent[layer_index]
+        if any(
+            tensor.stride() != data_stride or tensor.shape != k_data[0].shape
+            for tensor in layer_data
+        ):
+            raise ValueError("OSCAR quant data layouts must be uniform across layers")
+        if any(
+            tensor.stride() != meta_stride or tensor.shape != k_meta[0].shape
+            for tensor in layer_meta
+        ):
+            raise ValueError("OSCAR quant meta layouts must be uniform across layers")
         if (
             layer_prefix.stride() != prefix[0].stride()
             or layer_prefix.shape != prefix[0].shape
@@ -280,19 +312,37 @@ def register_oscar_bulk_flush_caches(
             raise ValueError("OSCAR recent cache layouts must be uniform across layers")
     state = OscarBulkFlushCacheState(
         layer_names=names,
-        quant_ptrs=torch.tensor(
-            [tensor.data_ptr() for tensor in quant], dtype=torch.int64, device=device
+        k_data_ptrs=torch.tensor(
+            [tensor.data_ptr() for tensor in k_data], dtype=torch.int64, device=device
+        ),
+        v_data_ptrs=torch.tensor(
+            [tensor.data_ptr() for tensor in v_data], dtype=torch.int64, device=device
+        ),
+        k_meta_ptrs=torch.tensor(
+            [tensor.data_ptr() for tensor in k_meta], dtype=torch.int64, device=device
+        ),
+        v_meta_ptrs=torch.tensor(
+            [tensor.data_ptr() for tensor in v_meta], dtype=torch.int64, device=device
         ),
         recent_ptrs=torch.tensor(
             [tensor.data_ptr() for tensor in recent], dtype=torch.int64, device=device
         ),
-        quant_sample=quant[0],
+        data_sample=k_data[0],
+        meta_sample=k_meta[0],
         recent_sample=recent[0],
-        quant_stride=quant_stride,
+        data_stride=data_stride,
+        meta_stride=meta_stride,
         recent_stride=recent_stride,
         recent_capacity=recent_capacity,
     )
-    if torch.any(state.quant_ptrs == 0) or torch.any(state.recent_ptrs == 0):
+    pointer_tables = (
+        state.k_data_ptrs,
+        state.v_data_ptrs,
+        state.k_meta_ptrs,
+        state.v_meta_ptrs,
+        state.recent_ptrs,
+    )
+    if any(torch.any(table == 0) for table in pointer_tables):
         raise ValueError("OSCAR pointer tables contain a null address")
     return state
 
@@ -474,10 +524,10 @@ def prepare_oscar_bulk_flush_plan(
 @triton.jit
 def _bulk_quantize_pack_int2_tile(
     vec,
-    Quant_ptr,
-    Quant_meta_ptr,
-    region_base,
-    dst_base,
+    Data_ptr,
+    Meta_ptr,
+    data_dst,
+    meta_dst,
     active,
     D: tl.constexpr,
     LEVELS: tl.constexpr,
@@ -526,21 +576,24 @@ def _bulk_quantize_pack_int2_tile(
     pack_offs = tl.arange(0, BLOCK_PACK)
     pack_mask = active[:, None] & (pack_offs[None, :] < DATA_BYTES)
     tl.store(
-        Quant_ptr + dst_base[:, None] + region_base + pack_offs[None, :],
+        Data_ptr + data_dst[:, None] + pack_offs[None, :],
         packed,
         mask=pack_mask,
     )
-    meta_offset = (dst_base + region_base + DATA_BYTES) // 2
-    tl.store(Quant_meta_ptr + meta_offset, scale, mask=active)
-    tl.store(Quant_meta_ptr + meta_offset + 1, zero, mask=active)
+    tl.store(Meta_ptr + meta_dst, scale, mask=active)
+    tl.store(Meta_ptr + meta_dst + 1, zero, mask=active)
 
 
 @triton.jit
 def _bulk_flush_quant_kernel(
     Recent_ptrs,
-    Quant_ptrs,
+    K_data_ptrs,
+    V_data_ptrs,
+    K_meta_ptrs,
+    V_meta_ptrs,
     Recent_sample,
-    Quant_sample,
+    Data_sample,
+    Meta_sample,
     Src_slots,
     Dst_slots,
     Valid,
@@ -548,12 +601,13 @@ def _bulk_flush_quant_kernel(
     stride_recent_slot: tl.constexpr,
     stride_recent_head: tl.constexpr,
     stride_recent_kv: tl.constexpr,
-    stride_quant_pos: tl.constexpr,
-    stride_quant_head: tl.constexpr,
+    stride_data_pos: tl.constexpr,
+    stride_data_head: tl.constexpr,
+    stride_meta_pos: tl.constexpr,
+    stride_meta_head: tl.constexpr,
     NUM_HEADS: tl.constexpr,
     NUM_LAYERS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
-    KEY_PACKED: tl.constexpr,
     KEY_LEVELS: tl.constexpr,
     VALUE_LEVELS: tl.constexpr,
     DATA_BYTES: tl.constexpr,
@@ -576,10 +630,18 @@ def _bulk_flush_quant_kernel(
     recent_base = tl.load(Recent_ptrs + layer).to(
         tl.pointer_type(Recent_sample.dtype.element_ty)
     )
-    quant_base = tl.load(Quant_ptrs + layer).to(
-        tl.pointer_type(Quant_sample.dtype.element_ty)
+    k_data_base = tl.load(K_data_ptrs + layer).to(
+        tl.pointer_type(Data_sample.dtype.element_ty)
     )
-    quant_meta = quant_base.to(tl.pointer_type(tl.bfloat16))
+    v_data_base = tl.load(V_data_ptrs + layer).to(
+        tl.pointer_type(Data_sample.dtype.element_ty)
+    )
+    k_meta_base = tl.load(K_meta_ptrs + layer).to(
+        tl.pointer_type(Meta_sample.dtype.element_ty)
+    )
+    v_meta_base = tl.load(V_meta_ptrs + layer).to(
+        tl.pointer_type(Meta_sample.dtype.element_ty)
+    )
     src = tl.load(Src_slots + offsets, mask=token_mask, other=0).to(tl.int64)
     dst_slot = tl.load(Dst_slots + offsets, mask=token_mask, other=0).to(tl.int64)
     d_offs = tl.arange(0, BLOCK_D)
@@ -595,13 +657,14 @@ def _bulk_flush_quant_kernel(
         mask=active[:, None] & d_mask[None, :],
         other=0.0,
     ).to(tl.float32)
-    dst = dst_slot * stride_quant_pos + head * stride_quant_head
+    data_dst = dst_slot * stride_data_pos + head * stride_data_head
+    meta_dst = dst_slot * stride_meta_pos + head * stride_meta_head
     _bulk_quantize_pack_int2_tile(
         key,
-        quant_base,
-        quant_meta,
-        0,
-        dst,
+        k_data_base,
+        k_meta_base,
+        data_dst,
+        meta_dst,
         active,
         D=HEAD_DIM,
         LEVELS=KEY_LEVELS,
@@ -613,10 +676,10 @@ def _bulk_flush_quant_kernel(
     )
     _bulk_quantize_pack_int2_tile(
         value,
-        quant_base,
-        quant_meta,
-        KEY_PACKED,
-        dst,
+        v_data_base,
+        v_meta_base,
+        data_dst,
+        meta_dst,
         active,
         D=HEAD_DIM,
         LEVELS=VALUE_LEVELS,
@@ -634,13 +697,15 @@ def oscar_bulk_flush(
     *,
     key_levels: int,
     value_levels: int,
-    key_packed_size: int,
     data_bytes: int,
     k_clip_ratio: float,
     v_clip_ratio: float,
+    key_packed_size: int | None = None,
 ) -> None:
     """Quantize one 8-token plan for all layers in one Triton launch."""
-    num_heads = state.quant_sample.shape[2]
+    if key_packed_size is not None and key_packed_size != data_bytes + 4:
+        raise ValueError("OSCAR separated bulk flush requires one BF16 K meta pair")
+    num_heads = state.data_sample.shape[2]
     head_dim = data_bytes * 4
     flush_interval = plan.valid.shape[1]
     if flush_interval != 8:
@@ -652,9 +717,13 @@ def oscar_bulk_flush(
     grid = (4, num_heads, len(state.layer_names))
     _bulk_flush_quant_kernel[grid](
         state.recent_ptrs,
-        state.quant_ptrs,
+        state.k_data_ptrs,
+        state.v_data_ptrs,
+        state.k_meta_ptrs,
+        state.v_meta_ptrs,
         state.recent_sample,
-        state.quant_sample,
+        state.data_sample,
+        state.meta_sample,
         plan.src_recent_slots.reshape(-1),
         plan.dst_slots.reshape(-1),
         plan.valid.reshape(-1),
@@ -662,12 +731,13 @@ def oscar_bulk_flush(
         stride_recent_slot=state.recent_stride[0],
         stride_recent_head=state.recent_stride[1],
         stride_recent_kv=state.recent_stride[2],
-        stride_quant_pos=state.quant_stride[1],
-        stride_quant_head=state.quant_stride[2],
+        stride_data_pos=state.data_stride[1],
+        stride_data_head=state.data_stride[2],
+        stride_meta_pos=state.meta_stride[1],
+        stride_meta_head=state.meta_stride[2],
         NUM_HEADS=num_heads,
         NUM_LAYERS=len(state.layer_names),
         HEAD_DIM=head_dim,
-        KEY_PACKED=key_packed_size,
         KEY_LEVELS=key_levels,
         VALUE_LEVELS=value_levels,
         DATA_BYTES=data_bytes,

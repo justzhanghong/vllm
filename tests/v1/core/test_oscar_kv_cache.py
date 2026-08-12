@@ -188,7 +188,7 @@ def test_oscar_reshape_uses_explicit_cache_dtype() -> None:
     assert _get_layer_cache_dtype_str(generic, "oscar_int2") == "auto"
 
 
-def test_worker_reshape_splits_accounted_backing_into_three_tensors() -> None:
+def test_worker_reshape_splits_accounted_backing_into_six_views() -> None:
     spec = qwen3_spec()
     num_blocks = 8
     max_num_seqs = 1
@@ -197,7 +197,7 @@ def test_worker_reshape_splits_accounted_backing_into_three_tensors() -> None:
     recent_bytes = 17 * spec.hp_page_size_bytes
     raw = torch.zeros(quant_bytes + prefix_bytes + recent_bytes, dtype=torch.int8)
 
-    quant, prefix, recent = _reshape_oscar_kv_cache(
+    k_data, v_data, k_meta, v_meta, prefix, recent = _reshape_oscar_kv_cache(
         raw,
         spec,
         (num_blocks, 16, 8, 72),
@@ -206,13 +206,25 @@ def test_worker_reshape_splits_accounted_backing_into_three_tensors() -> None:
         max_num_seqs,
     )
 
-    assert quant.shape == (8, 16, 8, 72)
+    assert k_data.shape == v_data.shape == (8, 16, 8, 32)
+    assert k_meta.shape == v_meta.shape == (8, 16, 8, 2)
     assert prefix.shape == (64, 8, 2, 128)
     assert recent.shape == (272, 8, 2, 128)
-    assert quant.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
+    assert k_data.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
+    assert v_data.storage_offset() == k_data.numel()
+    assert k_meta.storage_offset() * k_meta.element_size() == (
+        k_data.numel() + v_data.numel()
+    )
+    assert v_meta.storage_offset() - k_meta.storage_offset() == k_meta.numel()
     assert prefix.storage_offset() * prefix.element_size() == quant_bytes
     assert recent.storage_offset() * recent.element_size() == quant_bytes + prefix_bytes
-    assert quant.numel() + prefix.numel() * 2 + recent.numel() * 2 == raw.numel()
+    quant_view_bytes = (
+        k_data.numel()
+        + v_data.numel()
+        + (k_meta.numel() + v_meta.numel()) * k_meta.element_size()
+    )
+    assert quant_view_bytes == quant_bytes
+    assert quant_view_bytes + prefix.numel() * 2 + recent.numel() * 2 == raw.numel()
 
 
 def test_multirow_recent_physical_stride_preserves_ownership() -> None:
@@ -224,7 +236,7 @@ def test_multirow_recent_physical_stride_preserves_ownership() -> None:
     recent_bytes = max_num_seqs * 17 * spec.hp_page_size_bytes
     raw = torch.zeros(quant_bytes + prefix_bytes + recent_bytes, dtype=torch.int8)
 
-    _, _, recent = _reshape_oscar_kv_cache(
+    *_, recent = _reshape_oscar_kv_cache(
         raw,
         spec,
         (num_blocks, 16, 8, 72),

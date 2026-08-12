@@ -26,7 +26,8 @@ DEVICE = "cuda"
 BLOCK_SIZE = 16
 NUM_HEADS = 8
 HEAD_DIM = 128
-SLOT_SIZE = 72
+DATA_BYTES = 32
+META_WIDTH = 2
 RECENT_CAPACITY = 272
 
 
@@ -35,8 +36,23 @@ def _make_caches(num_layers: int, *, max_num_seqs: int = 1):
     for index in range(num_layers):
         caches[f"layer.{index}"] = [
             torch.zeros(
-                (16, BLOCK_SIZE, NUM_HEADS, SLOT_SIZE),
+                (16, BLOCK_SIZE, NUM_HEADS, DATA_BYTES),
                 dtype=torch.uint8,
+                device=DEVICE,
+            ),
+            torch.zeros(
+                (16, BLOCK_SIZE, NUM_HEADS, DATA_BYTES),
+                dtype=torch.uint8,
+                device=DEVICE,
+            ),
+            torch.zeros(
+                (16, BLOCK_SIZE, NUM_HEADS, META_WIDTH),
+                dtype=torch.bfloat16,
+                device=DEVICE,
+            ),
+            torch.zeros(
+                (16, BLOCK_SIZE, NUM_HEADS, META_WIDTH),
+                dtype=torch.bfloat16,
                 device=DEVICE,
             ),
             torch.zeros(
@@ -123,7 +139,7 @@ def test_gpu_plan_matches_cpu_reference_across_pages():
     checkpoints = {}
     for step in range(1, 17):
         cached_lens.fill_(330 + step - 1)
-        before = caches["layer.0"][0].clone()
+        before = tuple(tensor.clone() for tensor in caches["layer.0"][:4])
         gpu = prepare_oscar_bulk_flush_plan(
             phase=phase,
             row_generations=generations,
@@ -168,7 +184,10 @@ def test_gpu_plan_matches_cpu_reference_across_pages():
             v_clip_ratio=0.92,
         )
         torch.cuda.synchronize()
-        if not torch.equal(before, caches["layer.0"][0]):
+        if any(
+            not torch.equal(old, new)
+            for old, new in zip(before, caches["layer.0"][:4])
+        ):
             written_steps.append(step)
         if step in (1, 7, 8, 9, 15, 16):
             checkpoints[step] = (
@@ -201,56 +220,69 @@ def test_bulk_quant_matches_production_single_token_store(num_layers: int):
 
     _run_bulk(caches, plan, max_num_seqs=2)
     for cache in caches.values():
-        reference = torch.zeros_like(cache[0])
+        reference = [torch.zeros_like(tensor) for tensor in cache[:4]]
         valid = plan.valid.reshape(-1)
         src = plan.src_recent_slots.reshape(-1)[valid]
         dst = plan.dst_slots.reshape(-1)[valid]
         oscar_store(
-            cache[2][src, :, 0, :],
-            cache[2][src, :, 1, :],
-            reference,
+            cache[5][src, :, 0, :],
+            cache[5][src, :, 1, :],
+            *reference,
             dst,
             key_levels=4,
             value_levels=4,
-            key_packed_size=36,
             data_bytes=32,
             k_clip_ratio=0.96,
             v_clip_ratio=0.92,
         )
 
-        assert torch.equal(cache[0], reference)
+        assert all(
+            torch.equal(actual, expected)
+            for actual, expected in zip(cache[:4], reference)
+        )
 
 
 def test_bulk_quant_respects_partial_valid_mask():
     caches = _make_caches(1, max_num_seqs=2)
-    caches["layer.0"][2][:RECENT_CAPACITY].zero_()
+    caches["layer.0"][5][:RECENT_CAPACITY].zero_()
     plan = _full_plan()
     plan.src_recent_slots.add_(RECENT_CAPACITY)
     plan.valid[0, 1::2] = False
 
     _run_bulk(caches, plan, max_num_seqs=2)
 
-    written = caches["layer.0"][0].view(-1, NUM_HEADS, SLOT_SIZE)
-    assert torch.all(written[0:8:2].ne(0).any(dim=(1, 2)))
-    assert torch.all(written[1:8:2] == 0)
-    reference = torch.zeros_like(caches["layer.0"][0])
+    written = torch.stack(
+        [
+            tensor.view(tensor.shape[0] * BLOCK_SIZE, NUM_HEADS, -1)
+            .ne(0)
+            .any(dim=(1, 2))
+            for tensor in caches["layer.0"][:4]
+        ]
+    ).any(dim=0)
+    assert torch.all(written[0:8:2])
+    assert torch.all(~written[1:8:2])
+    reference = [
+        torch.zeros_like(tensor) for tensor in caches["layer.0"][:4]
+    ]
     valid = plan.valid.reshape(-1)
     src = plan.src_recent_slots.reshape(-1)[valid]
     dst = plan.dst_slots.reshape(-1)[valid]
-    recent = caches["layer.0"][2]
+    recent = caches["layer.0"][5]
     oscar_store(
         recent[src, :, 0, :],
         recent[src, :, 1, :],
-        reference,
+        *reference,
         dst,
         key_levels=4,
         value_levels=4,
-        key_packed_size=36,
         data_bytes=32,
         k_clip_ratio=0.96,
         v_clip_ratio=0.92,
     )
-    assert torch.equal(caches["layer.0"][0], reference)
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(caches["layer.0"][:4], reference)
+    )
 
 
 def test_bulk_quant_flushes_all_registered_layers():
@@ -292,8 +324,15 @@ def test_bulk_quant_flushes_all_registered_layers():
     _run_bulk(caches, plan)
 
     for cache in caches.values():
-        slots = cache[0].view(-1, NUM_HEADS, SLOT_SIZE)
-        assert torch.all(slots[8:16].ne(0).any(dim=(1, 2)))
+        written = torch.stack(
+            [
+                tensor.view(tensor.shape[0] * BLOCK_SIZE, NUM_HEADS, -1)
+                .ne(0)
+                .any(dim=(1, 2))
+                for tensor in cache[:4]
+            ]
+        ).any(dim=0)
+        assert torch.all(written[8:16])
 
 
 def test_bulk_quant_cuda_graph_replay_smoke():
@@ -321,7 +360,10 @@ def test_bulk_quant_cuda_graph_replay_smoke():
         )
 
     stable_pointers = (
-        state.quant_ptrs.data_ptr(),
+        state.k_data_ptrs.data_ptr(),
+        state.v_data_ptrs.data_ptr(),
+        state.k_meta_ptrs.data_ptr(),
+        state.v_meta_ptrs.data_ptr(),
         state.recent_ptrs.data_ptr(),
         plan.src_recent_slots.data_ptr(),
         plan.dst_slots.data_ptr(),
@@ -331,21 +373,25 @@ def test_bulk_quant_cuda_graph_replay_smoke():
     with torch.cuda.graph(graph):
         run()
     for cache in caches.values():
-        cache[0].zero_()
+        for tensor in cache[:4]:
+            tensor.zero_()
 
     graph.replay()
     torch.cuda.synchronize()
     for cache in caches.values():
-        assert torch.count_nonzero(cache[0]).item() == 0
+        assert sum(torch.count_nonzero(tensor).item() for tensor in cache[:4]) == 0
 
     plan.valid.fill_(True)
     graph.replay()
     torch.cuda.synchronize()
 
     for cache in caches.values():
-        assert torch.any(cache[0] != 0)
+        assert any(torch.any(tensor != 0) for tensor in cache[:4])
     assert stable_pointers == (
-        state.quant_ptrs.data_ptr(),
+        state.k_data_ptrs.data_ptr(),
+        state.v_data_ptrs.data_ptr(),
+        state.k_meta_ptrs.data_ptr(),
+        state.v_meta_ptrs.data_ptr(),
         state.recent_ptrs.data_ptr(),
         plan.src_recent_slots.data_ptr(),
         plan.dst_slots.data_ptr(),

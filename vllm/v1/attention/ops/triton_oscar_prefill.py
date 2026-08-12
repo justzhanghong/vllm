@@ -5,14 +5,19 @@
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.oscar_cache_contract import (
+    validate_oscar_separated_arenas,
+)
 
 
 @triton.jit
 def _oscar_materialize_prefill_kv_kernel(
     Current_k_ptr,
     Current_v_ptr,
-    KV_cache_ptr,
-    KV_meta_ptr,
+    K_data_ptr,
+    V_data_ptr,
+    K_meta_ptr,
+    V_meta_ptr,
     Prefix_cache_ptr,
     Recent_cache_ptr,
     Block_table_ptr,
@@ -30,9 +35,12 @@ def _oscar_materialize_prefill_kv_kernel(
     stride_current_v_token,
     stride_current_v_head,
     stride_current_v_dim,
-    stride_cache_block,
-    stride_cache_pos,
-    stride_cache_head,
+    stride_data_block,
+    stride_data_pos,
+    stride_data_head,
+    stride_meta_block,
+    stride_meta_pos,
+    stride_meta_head,
     stride_prefix_slot,
     stride_prefix_head,
     stride_prefix_kv,
@@ -46,7 +54,6 @@ def _oscar_materialize_prefill_kv_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     KEY_DATA_BYTES: tl.constexpr,
-    KEY_PACKED: tl.constexpr,
     VALUE_DATA_BYTES: tl.constexpr,
     KEY_LEVELS: tl.constexpr,
     VALUE_LEVELS: tl.constexpr,
@@ -75,10 +82,15 @@ def _oscar_materialize_prefill_kv_kernel(
         mask=is_cached,
         other=0,
     ).to(tl.int64)
-    slot_base = (
-        block_num * stride_cache_block
-        + page_off.to(tl.int64) * stride_cache_pos
-        + tl.cast(head_idx, tl.int64) * stride_cache_head
+    data_base = (
+        block_num * stride_data_block
+        + page_off.to(tl.int64) * stride_data_pos
+        + tl.cast(head_idx, tl.int64) * stride_data_head
+    )
+    meta_base = (
+        block_num * stride_meta_block
+        + page_off.to(tl.int64) * stride_meta_pos
+        + tl.cast(head_idx, tl.int64) * stride_meta_head
     )
     shared_hit_len = tl.load(Shared_hit_lens_ptr + req_idx)
     recent_start = tl.maximum(
@@ -95,32 +107,29 @@ def _oscar_materialize_prefill_kv_kernel(
         byte_idx = d_offs // 4
         bit_shift = (d_offs % 4) * 2
     k_byte = tl.load(
-        KV_cache_ptr + slot_base[:, None] + byte_idx[None, :],
+        K_data_ptr + data_base[:, None] + byte_idx[None, :],
         mask=quant_mask[:, None] & dim_mask[None, :],
         other=0,
     ).to(tl.int32)
     q_k = ((k_byte >> bit_shift[None, :]) & (KEY_LEVELS - 1)).to(tl.float32)
-    k_meta = slot_base + KEY_DATA_BYTES
-    k_scale = tl.load(KV_meta_ptr + k_meta // 2, mask=quant_mask, other=0.0).to(
+    k_scale = tl.load(K_meta_ptr + meta_base, mask=quant_mask, other=0.0).to(
         tl.float32
     )
-    k_zero = tl.load(KV_meta_ptr + k_meta // 2 + 1, mask=quant_mask, other=0.0).to(
+    k_zero = tl.load(K_meta_ptr + meta_base + 1, mask=quant_mask, other=0.0).to(
         tl.float32
     )
     keys = (q_k - k_zero[:, None]) * k_scale[:, None]
 
-    v_base = slot_base + KEY_PACKED
     v_byte = tl.load(
-        KV_cache_ptr + v_base[:, None] + byte_idx[None, :],
+        V_data_ptr + data_base[:, None] + byte_idx[None, :],
         mask=quant_mask[:, None] & dim_mask[None, :],
         other=0,
     ).to(tl.int32)
     q_v = ((v_byte >> bit_shift[None, :]) & (VALUE_LEVELS - 1)).to(tl.float32)
-    v_meta = v_base + VALUE_DATA_BYTES
-    v_scale = tl.load(KV_meta_ptr + v_meta // 2, mask=quant_mask, other=0.0).to(
+    v_scale = tl.load(V_meta_ptr + meta_base, mask=quant_mask, other=0.0).to(
         tl.float32
     )
-    v_zero = tl.load(KV_meta_ptr + v_meta // 2 + 1, mask=quant_mask, other=0.0).to(
+    v_zero = tl.load(V_meta_ptr + meta_base + 1, mask=quant_mask, other=0.0).to(
         tl.float32
     )
     values = (q_v - v_zero[:, None]) * v_scale[:, None]
@@ -213,7 +222,10 @@ def _oscar_materialize_prefill_kv_kernel(
 def oscar_materialize_prefill_kv(
     current_key: torch.Tensor,
     current_value: torch.Tensor,
-    kv_cache: torch.Tensor,
+    k_data: torch.Tensor,
+    v_data: torch.Tensor,
+    k_meta: torch.Tensor,
+    v_meta: torch.Tensor,
     prefix_cache: torch.Tensor,
     recent_cache: torch.Tensor,
     block_table: torch.Tensor,
@@ -236,6 +248,15 @@ def oscar_materialize_prefill_kv(
     max_seq_len: int,
     recent_capacity: int | None = None,
 ) -> None:
+    validate_oscar_separated_arenas(
+        k_data,
+        v_data,
+        k_meta,
+        v_meta,
+        data_bytes=key_data_bytes,
+    )
+    if key_packed_size != key_data_bytes + 4:
+        raise ValueError("OSCAR separated materialize requires one BF16 K meta pair")
     num_reqs = cached_lens.shape[0]
     head_dim = current_key.shape[-1]
     block_tokens = 8
@@ -248,8 +269,10 @@ def oscar_materialize_prefill_kv(
     _oscar_materialize_prefill_kv_kernel[grid](
         current_key,
         current_value,
-        kv_cache,
-        kv_cache.view(torch.bfloat16),
+        k_data,
+        v_data,
+        k_meta,
+        v_meta,
         prefix_cache,
         recent_cache,
         block_table,
@@ -267,9 +290,12 @@ def oscar_materialize_prefill_kv(
         current_value.stride(0),
         current_value.stride(1),
         current_value.stride(2),
-        kv_cache.stride(0),
-        kv_cache.stride(1),
-        kv_cache.stride(2),
+        k_data.stride(0),
+        k_data.stride(1),
+        k_data.stride(2),
+        k_meta.stride(0),
+        k_meta.stride(1),
+        k_meta.stride(2),
         prefix_cache.stride(0),
         prefix_cache.stride(1),
         prefix_cache.stride(2),
@@ -281,9 +307,8 @@ def oscar_materialize_prefill_kv(
         output_key.stride(0),
         output_key.stride(1),
         HEAD_DIM=head_dim,
-        BLOCK_SIZE=kv_cache.shape[1],
+        BLOCK_SIZE=k_data.shape[1],
         KEY_DATA_BYTES=key_data_bytes,
-        KEY_PACKED=key_packed_size,
         VALUE_DATA_BYTES=value_data_bytes,
         KEY_LEVELS=key_levels,
         VALUE_LEVELS=value_levels,
@@ -324,8 +349,10 @@ def _oscar_cached_prefill_kernel(
     Q_ptr,
     Current_k_ptr,
     Current_v_ptr,
-    KV_cache_ptr,
-    KV_meta_ptr,
+    K_data_ptr,
+    V_data_ptr,
+    K_meta_ptr,
+    V_meta_ptr,
     Prefix_cache_ptr,
     Recent_cache_ptr,
     HP_rows_ptr,
@@ -344,9 +371,12 @@ def _oscar_cached_prefill_kernel(
     stride_current_v_token,
     stride_current_v_head,
     stride_current_v_dim,
-    stride_cache_block,
-    stride_cache_pos,
-    stride_cache_head,
+    stride_data_block,
+    stride_data_pos,
+    stride_data_head,
+    stride_meta_block,
+    stride_meta_pos,
+    stride_meta_head,
     stride_prefix_slot,
     stride_prefix_head,
     stride_prefix_kv,
@@ -365,7 +395,6 @@ def _oscar_cached_prefill_kernel(
     BLOCK_SIZE: tl.constexpr,
     KV_GROUP_SIZE: tl.constexpr,
     KEY_DATA_BYTES: tl.constexpr,
-    KEY_PACKED: tl.constexpr,
     VALUE_DATA_BYTES: tl.constexpr,
     KEY_LEVELS: tl.constexpr,
     VALUE_LEVELS: tl.constexpr,
@@ -459,39 +488,41 @@ def _oscar_cached_prefill_kernel(
         block_nums = tl.load(
             Block_table_ptr + bt_base + page_idx, mask=n_mask, other=0
         ).to(tl.int64)
-        slot_bases = (
-            block_nums * stride_cache_block
-            + page_off.to(tl.int64) * stride_cache_pos
-            + tl.cast(kv_head, tl.int64) * stride_cache_head
+        data_bases = (
+            block_nums * stride_data_block
+            + page_off.to(tl.int64) * stride_data_pos
+            + tl.cast(kv_head, tl.int64) * stride_data_head
+        )
+        meta_bases = (
+            block_nums * stride_meta_block
+            + page_off.to(tl.int64) * stride_meta_pos
+            + tl.cast(kv_head, tl.int64) * stride_meta_head
         )
 
         k_byte = tl.load(
-            KV_cache_ptr + slot_bases[:, None] + byte_idx[None, :],
+            K_data_ptr + data_bases[:, None] + byte_idx[None, :],
             mask=n_mask[:, None] & d_mask[None, :],
             other=0,
         ).to(tl.int32)
         q_k = ((k_byte >> bit_shift[None, :]) & (KEY_LEVELS - 1)).to(tl.float32)
-        k_meta = slot_bases + KEY_DATA_BYTES
-        k_scale = tl.load(KV_meta_ptr + k_meta // 2, mask=n_mask, other=0.0).to(
+        k_scale = tl.load(K_meta_ptr + meta_bases, mask=n_mask, other=0.0).to(
             tl.float32
         )
-        k_zero = tl.load(KV_meta_ptr + k_meta // 2 + 1, mask=n_mask, other=0.0).to(
+        k_zero = tl.load(K_meta_ptr + meta_bases + 1, mask=n_mask, other=0.0).to(
             tl.float32
         )
         keys = (q_k - k_zero[:, None]) * k_scale[:, None]
 
-        v_base = slot_bases + KEY_PACKED
         v_byte = tl.load(
-            KV_cache_ptr + v_base[:, None] + byte_idx[None, :],
+            V_data_ptr + data_bases[:, None] + byte_idx[None, :],
             mask=n_mask[:, None] & d_mask[None, :],
             other=0,
         ).to(tl.int32)
         q_v = ((v_byte >> bit_shift[None, :]) & (VALUE_LEVELS - 1)).to(tl.float32)
-        v_meta = v_base + VALUE_DATA_BYTES
-        v_scale = tl.load(KV_meta_ptr + v_meta // 2, mask=n_mask, other=0.0).to(
+        v_scale = tl.load(V_meta_ptr + meta_bases, mask=n_mask, other=0.0).to(
             tl.float32
         )
-        v_zero = tl.load(KV_meta_ptr + v_meta // 2 + 1, mask=n_mask, other=0.0).to(
+        v_zero = tl.load(V_meta_ptr + meta_bases + 1, mask=n_mask, other=0.0).to(
             tl.float32
         )
         values = (q_v - v_zero[:, None]) * v_scale[:, None]
@@ -586,7 +617,10 @@ def _oscar_cached_prefill_kernel(
 
 def oscar_cached_prefill_attention(
     q_rot: torch.Tensor,
-    kv_cache: torch.Tensor,
+    k_data: torch.Tensor,
+    v_data: torch.Tensor,
+    k_meta: torch.Tensor,
+    v_meta: torch.Tensor,
     prefix_cache: torch.Tensor,
     recent_cache: torch.Tensor,
     block_table: torch.Tensor,
@@ -610,11 +644,20 @@ def oscar_cached_prefill_attention(
     current_key: torch.Tensor | None = None,
     current_value: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    validate_oscar_separated_arenas(
+        k_data,
+        v_data,
+        k_meta,
+        v_meta,
+        data_bytes=key_data_bytes,
+    )
+    if key_packed_size != key_data_bytes + 4:
+        raise ValueError("OSCAR separated prefill requires one BF16 K meta pair")
     num_tokens, num_query_heads, head_dim = q_rot.shape
     recent_capacity = recent_capacity or recent_tokens
     num_reqs = cached_lens.shape[0]
-    num_kv_heads = kv_cache.shape[2]
-    block_size = kv_cache.shape[1]
+    num_kv_heads = k_data.shape[2]
+    block_size = k_data.shape[1]
     if prefix_page_ids.ndim != 2:
         raise ValueError("OSCAR prefix page table must be a 2D tensor")
     if prefix_page_ids.shape[1] * block_size != prefix_tokens:
@@ -659,8 +702,10 @@ def oscar_cached_prefill_attention(
         q_rot,
         current_key,
         current_value,
-        kv_cache,
-        kv_cache.view(torch.bfloat16),
+        k_data,
+        v_data,
+        k_meta,
+        v_meta,
         prefix_cache,
         recent_cache,
         hp_row_ids,
@@ -679,9 +724,12 @@ def oscar_cached_prefill_attention(
         current_value.stride(0),
         current_value.stride(1),
         current_value.stride(2),
-        kv_cache.stride(0),
-        kv_cache.stride(1),
-        kv_cache.stride(2),
+        k_data.stride(0),
+        k_data.stride(1),
+        k_data.stride(2),
+        k_meta.stride(0),
+        k_meta.stride(1),
+        k_meta.stride(2),
         prefix_cache.stride(0),
         prefix_cache.stride(1),
         prefix_cache.stride(2),
@@ -700,7 +748,6 @@ def oscar_cached_prefill_attention(
         BLOCK_SIZE=block_size,
         KV_GROUP_SIZE=kv_group_size,
         KEY_DATA_BYTES=key_data_bytes,
-        KEY_PACKED=key_packed_size,
         VALUE_DATA_BYTES=value_data_bytes,
         KEY_LEVELS=key_levels,
         VALUE_LEVELS=value_levels,

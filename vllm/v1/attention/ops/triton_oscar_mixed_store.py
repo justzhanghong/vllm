@@ -5,6 +5,9 @@
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.oscar_cache_contract import (
+    validate_oscar_separated_arenas,
+)
 from vllm.v1.attention.ops.triton_oscar_store import _quantize_pack_int2_vec
 
 
@@ -124,8 +127,10 @@ def _store_hp_kernel(
 @triton.jit
 def _demote_hp_kernel(
     Recent_ptr,
-    Cache_ptr,
-    Cache_meta_ptr,
+    K_data_ptr,
+    V_data_ptr,
+    K_meta_ptr,
+    V_meta_ptr,
     Block_table_ptr,
     Seq_lens_ptr,
     HP_rows_ptr,
@@ -134,14 +139,16 @@ def _demote_hp_kernel(
     stride_recent_slot: tl.constexpr,
     stride_recent_head: tl.constexpr,
     stride_recent_kv: tl.constexpr,
-    stride_cache_block: tl.constexpr,
-    stride_cache_pos: tl.constexpr,
-    stride_cache_head: tl.constexpr,
+    stride_data_block: tl.constexpr,
+    stride_data_pos: tl.constexpr,
+    stride_data_head: tl.constexpr,
+    stride_meta_block: tl.constexpr,
+    stride_meta_pos: tl.constexpr,
+    stride_meta_head: tl.constexpr,
     stride_bt_b: tl.constexpr,
     NUM_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-    KEY_PACKED: tl.constexpr,
     KEY_LEVELS: tl.constexpr,
     VALUE_LEVELS: tl.constexpr,
     DATA_BYTES: tl.constexpr,
@@ -194,17 +201,22 @@ def _demote_hp_kernel(
 
     block = (slot // BLOCK_SIZE).to(tl.int64)
     offset = (slot % BLOCK_SIZE).to(tl.int64)
-    dst = (
-        block * stride_cache_block
-        + offset * stride_cache_pos
-        + head_idx.to(tl.int64) * stride_cache_head
+    data_dst = (
+        block * stride_data_block
+        + offset * stride_data_pos
+        + head_idx.to(tl.int64) * stride_data_head
+    )
+    meta_dst = (
+        block * stride_meta_block
+        + offset * stride_meta_pos
+        + head_idx.to(tl.int64) * stride_meta_head
     )
     _quantize_pack_int2_vec(
         key,
-        Cache_ptr,
-        Cache_meta_ptr,
-        0,
-        dst,
+        K_data_ptr,
+        K_meta_ptr,
+        data_dst,
+        meta_dst,
         d_offs,
         d_mask,
         D=HEAD_DIM,
@@ -216,10 +228,10 @@ def _demote_hp_kernel(
     )
     _quantize_pack_int2_vec(
         value,
-        Cache_ptr,
-        Cache_meta_ptr,
-        KEY_PACKED,
-        dst,
+        V_data_ptr,
+        V_meta_ptr,
+        data_dst,
+        meta_dst,
         d_offs,
         d_mask,
         D=HEAD_DIM,
@@ -309,7 +321,10 @@ def oscar_store_hp(
 
 def oscar_demote_hp(
     recent_cache: torch.Tensor,
-    kv_cache: torch.Tensor,
+    k_data: torch.Tensor,
+    v_data: torch.Tensor,
+    k_meta: torch.Tensor,
+    v_meta: torch.Tensor,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     hp_row_ids: torch.Tensor,
@@ -322,15 +337,21 @@ def oscar_demote_hp(
     recent_capacity: int | None = None,
     key_levels: int,
     value_levels: int,
-    key_packed_size: int,
     data_bytes: int,
     k_clip_ratio: float,
     v_clip_ratio: float,
 ) -> None:
+    validate_oscar_separated_arenas(
+        k_data,
+        v_data,
+        k_meta,
+        v_meta,
+        data_bytes=data_bytes,
+    )
     if max_query_len <= 0:
         return
     recent_capacity = recent_capacity or recent_tokens
-    num_heads = kv_cache.shape[2]
+    num_heads = k_data.shape[2]
     head_dim = data_bytes * 4
     block_d = triton.next_power_of_2(head_dim)
     block_pack = triton.next_power_of_2(data_bytes)
@@ -344,8 +365,10 @@ def oscar_demote_hp(
         raise ValueError("OSCAR shared hit lengths must be a 1D tensor")
     _demote_hp_kernel[(num_reqs, max_query_len, num_heads)](
         recent_cache,
-        kv_cache,
-        kv_cache.view(torch.bfloat16),
+        k_data,
+        v_data,
+        k_meta,
+        v_meta,
         block_table,
         seq_lens,
         hp_row_ids,
@@ -354,14 +377,16 @@ def oscar_demote_hp(
         stride_recent_slot=recent_cache.stride(0),
         stride_recent_head=recent_cache.stride(1),
         stride_recent_kv=recent_cache.stride(2),
-        stride_cache_block=kv_cache.stride(0),
-        stride_cache_pos=kv_cache.stride(1),
-        stride_cache_head=kv_cache.stride(2),
+        stride_data_block=k_data.stride(0),
+        stride_data_pos=k_data.stride(1),
+        stride_data_head=k_data.stride(2),
+        stride_meta_block=k_meta.stride(0),
+        stride_meta_pos=k_meta.stride(1),
+        stride_meta_head=k_meta.stride(2),
         stride_bt_b=block_table.stride(0),
         NUM_HEADS=num_heads,
         HEAD_DIM=head_dim,
-        BLOCK_SIZE=kv_cache.shape[1],
-        KEY_PACKED=key_packed_size,
+        BLOCK_SIZE=k_data.shape[1],
         KEY_LEVELS=key_levels,
         VALUE_LEVELS=value_levels,
         DATA_BYTES=data_bytes,
