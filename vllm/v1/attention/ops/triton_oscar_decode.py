@@ -1487,8 +1487,8 @@ def _oscar_finite_lse_stage2(
                 other=0.0,
             )
             next_max = tl.maximum(tlogic, e_max)
-            old_scale = tl.exp(e_max - next_max)
-            partial_scale = tl.exp(tlogic - next_max)
+            old_scale = tl.exp2((e_max - next_max) * 1.4426950408889634)
+            partial_scale = tl.exp2((tlogic - next_max) * 1.4426950408889634)
             acc = acc * old_scale + partial * partial_scale
             e_sum = e_sum * old_scale + partial_scale
             e_max = next_max
