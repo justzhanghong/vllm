@@ -43,6 +43,7 @@ from vllm.v1.attention.backends.fa_utils import (
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.ops.triton_oscar_decode import (
+    materialize_oscar_slot_ids,
     oscar_decode_attention,
 )
 from vllm.v1.attention.ops.triton_oscar_mixed_store import (
@@ -153,6 +154,7 @@ class OscarMetadata(AttentionMetadata):
     prefix_page_ids: torch.Tensor
     shared_hit_tokens: torch.Tensor
     token_to_req_indices: torch.Tensor
+    physical_slot_ids: torch.Tensor | None = None
     seq_start_loc: torch.Tensor | None = None
     cached_lens: torch.Tensor | None = None
     num_actual_tokens: int = 0
@@ -200,6 +202,16 @@ class OscarMetadataBuilder(AttentionMetadataBuilder[OscarMetadata]):
         self.cached_lens = torch.zeros(
             vllm_config.scheduler_config.max_num_seqs,
             dtype=torch.int32,
+            device=device,
+        )
+        self._block_size = kv_cache_spec.block_size
+        self.physical_slot_ids = torch.full(
+            (
+                vllm_config.scheduler_config.max_num_seqs,
+                vllm_config.model_config.max_model_len,
+            ),
+            -1,
+            dtype=torch.int64,
             device=device,
         )
         max_materialized_tokens = _materialize_token_capacity(
@@ -258,6 +270,17 @@ class OscarMetadataBuilder(AttentionMetadataBuilder[OscarMetadata]):
         num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
             cam, decode_threshold=self.reorder_batch_threshold
         )
+        physical_slot_ids = None
+        if num_decodes:
+            physical_slot_ids = self.physical_slot_ids[:num_decodes]
+            # V2 metadata preparation and full-graph replay use the same
+            # current stream, so this update precedes every layer's read.
+            materialize_oscar_slot_ids(
+                cam.block_table_tensor[:num_decodes],
+                cam.seq_lens[:num_decodes],
+                physical_slot_ids,
+                self._block_size,
+            )
         return OscarMetadata(
             seq_lens=cam.seq_lens,
             slot_mapping=cam.slot_mapping,
@@ -267,6 +290,7 @@ class OscarMetadataBuilder(AttentionMetadataBuilder[OscarMetadata]):
             prefix_page_ids=cam.oscar_prefix_page_ids,
             shared_hit_tokens=cam.oscar_shared_hit_tokens,
             token_to_req_indices=token_to_req_indices,
+            physical_slot_ids=physical_slot_ids,
             seq_start_loc=self.seq_start_loc[: num_reqs + 1],
             cached_lens=self.cached_lens[:num_reqs],
             num_actual_tokens=cam.num_actual_tokens,
@@ -538,6 +562,11 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
                 token_to_req_indices=attn_metadata.token_to_req_indices[
                     :num_decode_tokens
                 ],
+                physical_slot_ids=(
+                    attn_metadata.physical_slot_ids[:num_decodes]
+                    if attn_metadata.physical_slot_ids is not None
+                    else None
+                ),
                 seq_start_loc=None,
                 cached_lens=attn_metadata.cached_lens[:num_decodes]
                 if attn_metadata.cached_lens is not None
@@ -971,6 +1000,7 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
             hp_row_ids=attn_metadata.hp_row_ids,
             prefix_page_ids=attn_metadata.prefix_page_ids,
             shared_hit_tokens=attn_metadata.shared_hit_tokens,
+            physical_slot_ids=attn_metadata.physical_slot_ids,
             prefix_tokens=self.cfg.prefix_tokens,
             recent_tokens=self.cfg.recent_tokens,
             v_rotation_t=layer._oscar_RvT,

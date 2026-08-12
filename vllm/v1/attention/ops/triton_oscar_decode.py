@@ -20,6 +20,72 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.triton_decode_attention import _fwd_kernel_stage2
 
+_GROUPED_H4_PREINDEXED_QUANT_SPLITS = 12
+
+
+@triton.jit
+def _materialize_oscar_slot_ids_kernel(
+    Block_table_ptr,
+    Seq_lens_ptr,
+    Physical_slot_ids_ptr,
+    stride_bt_b,
+    stride_slots_b,
+    BLOCK_SIZE: tl.constexpr,
+    MAX_SEQ_LEN: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+    offsets = tl.program_id(1) * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
+    seq_len = tl.load(Seq_lens_ptr + req_idx)
+    mask = (offsets < seq_len) & (offsets < MAX_SEQ_LEN)
+    physical_blocks = tl.load(
+        Block_table_ptr + req_idx * stride_bt_b + offsets // BLOCK_SIZE,
+        mask=mask,
+        other=0,
+    ).to(tl.int64)
+    page_offsets = offsets % BLOCK_SIZE
+    physical_slots = physical_blocks * BLOCK_SIZE + page_offsets.to(tl.int64)
+    tl.store(
+        Physical_slot_ids_ptr + req_idx * stride_slots_b + offsets,
+        physical_slots,
+        mask=mask,
+    )
+
+
+def materialize_oscar_slot_ids(
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    physical_slot_ids: torch.Tensor,
+    block_size: int,
+) -> None:
+    """Expand one KV group's decode block table into its stable slot buffer."""
+    if block_table.ndim != 2 or physical_slot_ids.ndim != 2:
+        raise ValueError("OSCAR block table and physical slot IDs must be 2D")
+    if seq_lens.ndim != 1 or seq_lens.shape[0] != block_table.shape[0]:
+        raise ValueError("OSCAR sequence lengths must match the block table")
+    if physical_slot_ids.shape[0] < block_table.shape[0]:
+        raise ValueError("OSCAR physical slot buffer has too few request rows")
+    if physical_slot_ids.dtype != torch.int64:
+        raise ValueError("OSCAR physical slot IDs must use int64")
+    if block_size <= 0:
+        raise ValueError("OSCAR block size must be positive")
+    max_seq_len = physical_slot_ids.shape[1]
+    if max_seq_len <= 0:
+        return
+    block_tokens = 256
+    grid = (block_table.shape[0], triton.cdiv(max_seq_len, block_tokens))
+    _materialize_oscar_slot_ids_kernel[grid](
+        block_table,
+        seq_lens,
+        physical_slot_ids,
+        block_table.stride(0),
+        physical_slot_ids.stride(0),
+        BLOCK_SIZE=block_size,
+        MAX_SEQ_LEN=max_seq_len,
+        BLOCK_TOKENS=block_tokens,
+        num_warps=4,
+    )
+
 
 @triton.jit
 def _oscar_decode_stage1(
@@ -1022,20 +1088,18 @@ def _oscar_decode_quant_stage1_grouped_h4(
     KV_meta_ptr,
     Query_to_req_ptr,
     Shared_hit_lens_ptr,
-    Block_table_ptr,
+    Physical_slot_ids_ptr,
     Seq_lens_ptr,
     Mid_o_ptr,
     stride_qb,
     stride_qh,
-    stride_cache_block,
     stride_cache_pos,
     stride_cache_head,
-    stride_bt_b,
+    stride_slots_b,
     stride_mid_b,
     stride_mid_h,
     stride_mid_s,
     HEAD_DIM: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
     NUM_QUANT_SPLITS: tl.constexpr,
     KEY_DATA_BYTES: tl.constexpr,
     KEY_PACKED: tl.constexpr,
@@ -1094,8 +1158,6 @@ def _oscar_decode_quant_stage1_grouped_h4(
     query = tl.permute(query, (0, 2, 1))
     query = tl.reshape(query, (4, 128))
     n_range = tl.arange(0, BLOCK_N)
-    bt_base = req_idx * stride_bt_b
-
     e_max = tl.zeros([4], dtype=tl.float32) - float("inf")
     e_sum = tl.zeros([4], dtype=tl.float32)
     acc0 = tl.zeros([4, 32], dtype=tl.float32)
@@ -1107,14 +1169,13 @@ def _oscar_decode_quant_stage1_grouped_h4(
         for start_n in range(split_start, split_end, BLOCK_N):
             kv_offs = start_n + n_range
             kv_mask = kv_offs < split_end
-            page_idx = kv_offs // BLOCK_SIZE
-            page_off = kv_offs % BLOCK_SIZE
-            block_nums = tl.load(
-                Block_table_ptr + bt_base + page_idx, mask=kv_mask, other=0
+            physical_slots = tl.load(
+                Physical_slot_ids_ptr + req_idx * stride_slots_b + kv_offs,
+                mask=kv_mask,
+                other=0,
             ).to(tl.int64)
             slot_bases = (
-                block_nums * stride_cache_block
-                + page_off.to(tl.int64) * stride_cache_pos
+                physical_slots * stride_cache_pos
                 + tl.cast(kv_head, tl.int64) * stride_cache_head
             )
 
@@ -1567,6 +1628,15 @@ def _use_grouped_h4_stage1(
     )
 
 
+def _has_linear_physical_slot_layout(kv_cache: torch.Tensor) -> bool:
+    return (
+        kv_cache.stride(0) == kv_cache.shape[1] * kv_cache.stride(1)
+        and kv_cache.stride(1) == kv_cache.shape[2] * kv_cache.stride(2)
+        and kv_cache.stride(2) == kv_cache.shape[3] * kv_cache.stride(3)
+        and kv_cache.stride(3) == 1
+    )
+
+
 def _grouped_h4_partial_counts(
     num_quant_splits: int, mixed_kv: bool
 ) -> tuple[int, int]:
@@ -1637,6 +1707,7 @@ def oscar_decode_attention(
     v_rotation_t: torch.Tensor | None = None,
     query_to_req_indices: torch.Tensor | None = None,
     shared_hit_tokens: torch.Tensor | None = None,
+    physical_slot_ids: torch.Tensor | None = None,
     return_lse: bool = False,
     use_grouped_h4: bool | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -1648,10 +1719,24 @@ def oscar_decode_attention(
     grouped_h4_supported = _use_grouped_h4_stage1(Hq, Hk, D)
     if use_grouped_h4 is True and not grouped_h4_supported:
         raise ValueError("Grouped-H4 OSCAR decode requires Hq/Hk=4 and head_dim=128")
-    grouped_h4 = grouped_h4_supported if use_grouped_h4 is None else use_grouped_h4
+    if use_grouped_h4 is True and physical_slot_ids is None:
+        raise ValueError("Grouped-H4 OSCAR decode requires preindexed slot IDs")
+    grouped_h4 = (
+        grouped_h4_supported and physical_slot_ids is not None
+        if use_grouped_h4 is None
+        else use_grouped_h4
+    )
+    if grouped_h4 and not _has_linear_physical_slot_layout(kv_cache):
+        if use_grouped_h4 is True:
+            raise ValueError(
+                "Grouped-H4 preindexed slots require a linear paged cache"
+            )
+        grouped_h4 = False
     device = q_rot.device
     BLOCK_D = triton.next_power_of_2(D)
-    NUM_KV_SPLITS = max_num_kv_splits
+    NUM_KV_SPLITS = (
+        _GROUPED_H4_PREINDEXED_QUANT_SPLITS if grouped_h4 else max_num_kv_splits
+    )
     mixed_kv = prefix_cache is not None
     NUM_HP_SPLITS, NUM_TOTAL_SPLITS = (
         _grouped_h4_partial_counts(NUM_KV_SPLITS, mixed_kv)
@@ -1689,6 +1774,20 @@ def oscar_decode_attention(
         shared_hit_tokens = torch.zeros_like(hp_row_ids)
     elif shared_hit_tokens.ndim != 1:
         raise ValueError("OSCAR shared hit lengths must be a 1D tensor")
+    if grouped_h4:
+        assert physical_slot_ids is not None
+        if physical_slot_ids.ndim != 2:
+            raise ValueError("OSCAR physical slot IDs must be a 2D tensor")
+        if physical_slot_ids.dtype != torch.int64:
+            raise ValueError("OSCAR physical slot IDs must use int64")
+        if physical_slot_ids.device != kv_cache.device:
+            raise ValueError("OSCAR physical slot IDs must share the KV cache device")
+        if physical_slot_ids.shape[0] < block_table.shape[0]:
+            raise ValueError("OSCAR physical slot IDs have too few request rows")
+        if physical_slot_ids.shape[1] < block_table.shape[1] * block_size:
+            raise ValueError(
+                "OSCAR physical slot buffer does not cover the block table"
+            )
 
     q_rot = q_rot.contiguous().float()
 
@@ -1710,20 +1809,18 @@ def oscar_decode_attention(
             kv_cache.view(torch.bfloat16),
             query_to_req_indices,
             shared_hit_tokens,
-            block_table,
+            physical_slot_ids,
             seq_lens,
             mid_o,
             q_rot.stride(0),
             q_rot.stride(1),
-            kv_cache.stride(0),
             kv_cache.stride(1),
             kv_cache.stride(2),
-            block_table.stride(0),
+            physical_slot_ids.stride(0),
             mid_o.stride(0),
             mid_o.stride(1),
             mid_o.stride(2),
             HEAD_DIM=D,
-            BLOCK_SIZE=block_size,
             NUM_QUANT_SPLITS=NUM_KV_SPLITS,
             KEY_DATA_BYTES=key_data_bytes,
             KEY_PACKED=key_packed_size,

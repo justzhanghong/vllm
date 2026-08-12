@@ -143,12 +143,19 @@ class TestOscarConfigAndLayout(unittest.TestCase):
             ),
             speculative_config=None,
         )
-        kv_cache_spec = SimpleNamespace(num_kv_heads=1, head_size=128)
+        kv_cache_spec = SimpleNamespace(
+            num_kv_heads=1,
+            head_size=128,
+            block_size=4,
+        )
+        layer_names = [
+            f"model.layers.{index}.self_attn.attn" for index in range(36)
+        ]
         builder = OscarMetadataBuilder(
-            kv_cache_spec, ["model.layers.0.self_attn.attn"], vllm_config, "cpu"
+            kv_cache_spec, layer_names, vllm_config, "cpu"
         )
 
-        def common_metadata(seq_len, query_len, padded_tokens):
+        def common_metadata(seq_len, query_len, padded_tokens, blocks=(3, 1)):
             return CommonAttentionMetadata(
                 query_start_loc=torch.tensor([0, query_len], dtype=torch.int32),
                 query_start_loc_cpu=torch.tensor(
@@ -163,7 +170,7 @@ class TestOscarConfigAndLayout(unittest.TestCase):
                 num_actual_tokens=padded_tokens,
                 max_query_len=query_len,
                 max_seq_len=seq_len,
-                block_table_tensor=torch.zeros((1, 1), dtype=torch.int32),
+                block_table_tensor=torch.tensor([blocks], dtype=torch.int32),
                 slot_mapping=torch.full(
                     (padded_tokens,), -1, dtype=torch.int64
                 ),
@@ -172,17 +179,39 @@ class TestOscarConfigAndLayout(unittest.TestCase):
                 oscar_shared_hit_tokens=torch.tensor([0], dtype=torch.int32),
             )
 
-        with patch(
-            "vllm.v1.attention.backend.np_to_pinned_tensor",
-            side_effect=torch.from_numpy,
+        materialize_calls = []
+
+        def materialize(block_table, seq_lens, physical_slot_ids, block_size):
+            materialize_calls.append(
+                (physical_slot_ids.data_ptr(), tuple(builder.layer_names))
+            )
+            for req_idx, seq_len in enumerate(seq_lens.tolist()):
+                logical = torch.arange(seq_len, dtype=torch.int64)
+                blocks = block_table[req_idx, logical // block_size].to(torch.int64)
+                physical_slot_ids[req_idx, :seq_len] = (
+                    blocks * block_size + logical % block_size
+                )
+
+        with (
+            patch(
+                "vllm.v1.attention.backend.np_to_pinned_tensor",
+                side_effect=torch.from_numpy,
+            ),
+            patch(
+                "vllm.v1.attention.backends.oscar_attn."
+                "materialize_oscar_slot_ids",
+                side_effect=materialize,
+            ),
         ):
             captured = builder.build_for_cudagraph_capture(
                 common_metadata(seq_len=4, query_len=4, padded_tokens=4)
             )
+            self.assertIsNone(captured.physical_slot_ids)
             pointers = (
                 captured.token_to_req_indices.data_ptr(),
                 captured.seq_start_loc.data_ptr(),
                 captured.cached_lens.data_ptr(),
+                builder.physical_slot_ids.data_ptr(),
             )
             self.assertEqual(captured.seq_lens.tolist(), [4])
 
@@ -190,9 +219,25 @@ class TestOscarConfigAndLayout(unittest.TestCase):
                 common_metadata(seq_len=7, query_len=1, padded_tokens=1)
             )
             self.assertEqual(decode_capture.seq_lens.tolist(), [1])
+            self.assertEqual(
+                decode_capture.physical_slot_ids[0, :7].tolist(),
+                [12, 13, 14, 15, 4, 5, 6],
+            )
+            self.assertEqual(decode_capture.physical_slot_ids.dtype, torch.int64)
+            self.assertEqual(decode_capture.physical_slot_ids.shape, (1, 8))
+            self.assertEqual(decode_capture.physical_slot_ids.stride(), (8, 1))
+            capture_storage_ptr = (
+                decode_capture.physical_slot_ids.untyped_storage().data_ptr()
+            )
 
             replay = builder.build(
-                0, common_metadata(seq_len=7, query_len=1, padded_tokens=1)
+                0,
+                common_metadata(
+                    seq_len=8,
+                    query_len=1,
+                    padded_tokens=1,
+                    blocks=(3, 5),
+                ),
             )
         self.assertEqual(
             pointers,
@@ -200,10 +245,30 @@ class TestOscarConfigAndLayout(unittest.TestCase):
                 replay.token_to_req_indices.data_ptr(),
                 replay.seq_start_loc.data_ptr(),
                 replay.cached_lens.data_ptr(),
+                replay.physical_slot_ids.data_ptr(),
             ),
         )
-        self.assertEqual(replay.seq_start_loc.tolist(), [0, 7])
-        self.assertEqual(replay.cached_lens.tolist(), [6])
+        self.assertEqual(replay.seq_start_loc.tolist(), [0, 8])
+        self.assertEqual(replay.cached_lens.tolist(), [7])
+        self.assertEqual(
+            replay.physical_slot_ids[0, :8].tolist(),
+            [12, 13, 14, 15, 20, 21, 22, 23],
+        )
+        self.assertEqual(replay.physical_slot_ids.shape, (1, 8))
+        self.assertEqual(replay.physical_slot_ids.stride(), (8, 1))
+        self.assertEqual(replay.physical_slot_ids.dtype, torch.int64)
+        self.assertEqual(
+            replay.physical_slot_ids.untyped_storage().data_ptr(),
+            capture_storage_ptr,
+        )
+        self.assertEqual(len(materialize_calls), 2)
+        self.assertEqual(
+            {call[0] for call in materialize_calls},
+            {builder.physical_slot_ids.data_ptr()},
+        )
+        self.assertTrue(
+            all(call[1] == tuple(layer_names) for call in materialize_calls)
+        )
 
     def test_task_defaults_and_geometry(self):
         cfg = OscarConfig()
@@ -370,7 +435,11 @@ class TestOscarConfigAndLayout(unittest.TestCase):
             ),
             speculative_config=None,
         )
-        kv_cache_spec = SimpleNamespace(num_kv_heads=8, head_size=128)
+        kv_cache_spec = SimpleNamespace(
+            num_kv_heads=8,
+            head_size=128,
+            block_size=16,
+        )
         calls = []
         workspace = SimpleNamespace(
             get_simultaneous=lambda *args: calls.append(args)
@@ -401,6 +470,7 @@ class TestOscarConfigAndLayout(unittest.TestCase):
 
     def test_grouped_h4_decode_stage1_dispatch_is_narrow(self):
         from vllm.v1.attention.ops.triton_oscar_decode import (
+            _has_linear_physical_slot_layout,
             _use_grouped_h4_stage1,
         )
 
@@ -409,6 +479,10 @@ class TestOscarConfigAndLayout(unittest.TestCase):
         for shape in ((32, 8, 64), (32, 4, 128), (8, 8, 128), (7, 2, 128)):
             with self.subTest(shape=shape):
                 self.assertFalse(_use_grouped_h4_stage1(*shape))
+
+        contiguous = torch.empty(4, 16, 8, 72, dtype=torch.uint8)
+        self.assertTrue(_has_linear_physical_slot_layout(contiguous))
+        self.assertFalse(_has_linear_physical_slot_layout(contiguous[:, ::2]))
 
     def test_d128_quarter_layout_and_d64_legacy_layout_are_explicit(self):
         from vllm.v1.attention.ops.triton_oscar_store import (
@@ -424,13 +498,60 @@ class TestOscarConfigAndLayout(unittest.TestCase):
             self.assertEqual(byte_idx, dim // 4)
             self.assertEqual(shift, (dim % 4) * 2)
 
-    def test_grouped_h4_split_contract_is_mixed_40_and_quant_only_33(self):
+    def test_grouped_h4_split_contract_is_mixed_20(self):
         from vllm.v1.attention.ops.triton_oscar_decode import (
             _grouped_h4_partial_counts,
         )
 
-        self.assertEqual(_grouped_h4_partial_counts(32, True), (8, 40))
-        self.assertEqual(_grouped_h4_partial_counts(32, False), (1, 33))
+        self.assertEqual(_grouped_h4_partial_counts(12, True), (8, 20))
+        self.assertEqual(_grouped_h4_partial_counts(12, False), (1, 13))
+
+    def test_grouped_h4_quant_reader_uses_preindexed_slots(self):
+        from vllm.v1.attention.ops import triton_oscar_decode
+
+        source = Path(triton_oscar_decode.__file__).read_text()
+        kernel_start = source.index(
+            "def _oscar_decode_quant_stage1_grouped_h4("
+        )
+        kernel_end = source.index("\n\n@triton.jit", kernel_start)
+        kernel_source = source[kernel_start:kernel_end]
+        self.assertTrue(
+            "Physical_slot_ids_ptr" in kernel_source,
+            "grouped-H4 reader must consume preindexed physical slots",
+        )
+        self.assertIn("physical_slots * stride_cache_pos", kernel_source)
+        self.assertNotIn("Block_table_ptr", kernel_source)
+        self.assertNotIn("kv_offs // BLOCK_SIZE", kernel_source)
+        self.assertNotIn("kv_offs % BLOCK_SIZE", kernel_source)
+
+        materialize_start = source.index("def _materialize_oscar_slot_ids_kernel(")
+        materialize_end = source.index("\n\ndef materialize_oscar_slot_ids(")
+        materialize_source = source[materialize_start:materialize_end]
+        self.assertIn("offsets // BLOCK_SIZE", materialize_source)
+        self.assertIn("page_offsets = offsets % BLOCK_SIZE", materialize_source)
+        self.assertIn(
+            "physical_blocks * BLOCK_SIZE + page_offsets.to(tl.int64)",
+            materialize_source,
+        )
+
+        dispatch_source = source[source.index("def oscar_decode_attention(") :]
+        self.assertIn(
+            "_GROUPED_H4_PREINDEXED_QUANT_SPLITS if grouped_h4",
+            dispatch_source,
+        )
+        self.assertIn("physical_slot_ids.stride(0)", dispatch_source)
+        self.assertIn("_has_linear_physical_slot_layout(kv_cache)", dispatch_source)
+
+        backend_source = (
+            Path(triton_oscar_decode.__file__).parents[1]
+            / "backends"
+            / "oscar_attn.py"
+        ).read_text()
+        build_start = backend_source.index("    def build(")
+        build_end = backend_source.index("\n\n\nclass OscarAttentionImpl", build_start)
+        build_source = backend_source[build_start:build_end]
+        self.assertIn("materialize_oscar_slot_ids(", build_source)
+        self.assertNotIn("synchronize", build_source)
 
     def test_grouped_h4_hp_stage1_uses_dot_and_eight_splits(self):
         from vllm.v1.attention.ops import triton_oscar_decode

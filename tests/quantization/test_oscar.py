@@ -358,6 +358,243 @@ def test_decode_attention_matches_reference(head_dim, Hq, Hk):
     torch.testing.assert_close(out.float(), ref, atol=5e-3, rtol=5e-3)
 
 
+@pytest.mark.parametrize("mixed_kv", [False, True])
+def test_preindexed_grouped_h4_decode_matches_legacy_and_reference(mixed_kv):
+    from vllm.model_executor.layers.quantization.oscar.layout import partition_tokens
+    from vllm.v1.attention.ops.triton_oscar_decode import (
+        materialize_oscar_slot_ids,
+        oscar_decode_attention,
+        oscar_full_dequant_kv,
+    )
+    from vllm.v1.attention.ops.triton_oscar_mixed_store import oscar_store_hp
+    from vllm.v1.attention.ops.triton_oscar_store import oscar_store
+
+    torch.manual_seed(17)
+    device = "cuda"
+    cfg = OscarConfig.from_cache_dtype("oscar_int2", 128)
+    Hq, Hk, D = 32, 8, 128
+    block_size = 16
+    seq_len = 384 if mixed_kv else 48
+    num_blocks = (seq_len + block_size - 1) // block_size
+    cache = _make_cache(
+        num_blocks,
+        block_size,
+        Hk,
+        cfg.slot_size_aligned,
+        device,
+    )
+    block_table = torch.roll(
+        torch.arange(num_blocks, device=device, dtype=torch.int32), shifts=1
+    )[None, :]
+    assert not torch.equal(
+        block_table,
+        torch.arange(num_blocks, device=device, dtype=torch.int32)[None, :],
+    )
+    positions = torch.arange(seq_len, device=device, dtype=torch.int32)
+    slots = (
+        block_table[0, positions // block_size] * block_size
+        + positions % block_size
+    )
+    key = torch.randn(seq_len, Hk, D, device=device)
+    value = torch.randn(seq_len, Hk, D, device=device)
+
+    prefix_cache = recent_cache = hp_row_ids = None
+    if mixed_kv:
+        _, prefix_cache, recent_cache = _make_mixed_cache(
+            num_blocks, block_size, Hk, cfg, device
+        )
+        part = partition_tokens(
+            seq_len,
+            prefix_tokens=cfg.prefix_tokens,
+            recent_tokens=cfg.recent_tokens,
+        )
+        oscar_store(
+            key[part.history.start : part.history.stop],
+            value[part.history.start : part.history.stop],
+            cache,
+            slots[part.history.start : part.history.stop],
+            key_levels=cfg.key_levels,
+            value_levels=cfg.value_levels,
+            key_packed_size=cfg.key_packed_size,
+            data_bytes=cfg.key_data_bytes,
+            k_clip_ratio=cfg.k_clip_ratio,
+            v_clip_ratio=cfg.v_clip_ratio,
+        )
+        hp_row_ids = torch.zeros(1, dtype=torch.int32, device=device)
+        oscar_store_hp(
+            key,
+            value,
+            prefix_cache,
+            recent_cache,
+            token_to_req_indices=torch.zeros(
+                seq_len, dtype=torch.int32, device=device
+            ),
+            query_start_loc=torch.tensor(
+                [0, seq_len], dtype=torch.int32, device=device
+            ),
+            seq_lens=torch.tensor([seq_len], dtype=torch.int32, device=device),
+            hp_row_ids=hp_row_ids,
+            prefix_tokens=cfg.prefix_tokens,
+            recent_tokens=cfg.recent_tokens,
+        )
+    else:
+        oscar_store(
+            key,
+            value,
+            cache,
+            slots,
+            key_levels=cfg.key_levels,
+            value_levels=cfg.value_levels,
+            key_packed_size=cfg.key_packed_size,
+            data_bytes=cfg.key_data_bytes,
+        )
+
+    seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
+    physical_slot_ids = torch.full(
+        (1, num_blocks * block_size),
+        -1,
+        dtype=torch.int64,
+        device=device,
+    )
+    materialize_oscar_slot_ids(
+        block_table,
+        seq_lens,
+        physical_slot_ids,
+        block_size,
+    )
+    torch.testing.assert_close(
+        physical_slot_ids[0, :seq_len], slots.to(torch.int64), atol=0, rtol=0
+    )
+
+    query = torch.randn(1, Hq, D, device=device)
+    decode_kwargs = {
+        "key_levels": cfg.key_levels,
+        "value_levels": cfg.value_levels,
+        "key_data_bytes": cfg.key_data_bytes,
+        "key_packed_size": cfg.key_packed_size,
+        "value_data_bytes": cfg.value_data_bytes,
+        "max_num_kv_splits": 4,
+        "prefix_cache": prefix_cache,
+        "recent_cache": recent_cache,
+        "hp_row_ids": hp_row_ids,
+        "prefix_tokens": cfg.prefix_tokens if mixed_kv else None,
+        "recent_tokens": cfg.recent_tokens if mixed_kv else None,
+    }
+    fast = oscar_decode_attention(
+        query,
+        cache,
+        block_table,
+        seq_lens,
+        D**-0.5,
+        physical_slot_ids=physical_slot_ids,
+        use_grouped_h4=True,
+        **decode_kwargs,
+    )
+    legacy = oscar_decode_attention(
+        query,
+        cache,
+        block_table,
+        seq_lens,
+        D**-0.5,
+        use_grouped_h4=False,
+        **decode_kwargs,
+    )
+    torch.testing.assert_close(fast, legacy, atol=6e-3, rtol=6e-3)
+
+    key_ref, value_ref = oscar_full_dequant_kv(
+        cache,
+        block_table,
+        seq_len,
+        Hk,
+        D,
+        cfg.key_levels,
+        cfg.value_levels,
+        cfg.key_data_bytes,
+        cfg.key_packed_size,
+        cfg.value_data_bytes,
+    )
+    if mixed_kv:
+        for token_range in (part.prefix, part.recent):
+            start, stop = token_range.start, token_range.stop
+            key_ref[start:stop] = key[start:stop].bfloat16().to(key_ref.dtype)
+            value_ref[start:stop] = value[start:stop].bfloat16().to(
+                value_ref.dtype
+            )
+    reference = torch.empty_like(fast)
+    for head_idx in range(Hq):
+        kv_head = head_idx // (Hq // Hk)
+        scores = (query[0, head_idx].float() @ key_ref[:, kv_head].float().T) * (
+            D**-0.5
+        )
+        reference[0, head_idx] = torch.softmax(scores, dim=-1) @ value_ref[
+            :, kv_head
+        ].float()
+    torch.testing.assert_close(
+        fast.float(), reference.float(), atol=6e-3, rtol=6e-3
+    )
+
+    auto_missing_slots = oscar_decode_attention(
+        query,
+        cache,
+        block_table,
+        seq_lens,
+        D**-0.5,
+        **decode_kwargs,
+    )
+    torch.testing.assert_close(auto_missing_slots, legacy, atol=0, rtol=0)
+    with pytest.raises(ValueError, match="preindexed slot IDs"):
+        oscar_decode_attention(
+            query,
+            cache,
+            block_table,
+            seq_lens,
+            D**-0.5,
+            use_grouped_h4=True,
+            **decode_kwargs,
+        )
+
+    padded_cache = torch.empty(
+        num_blocks,
+        block_size * 2,
+        Hk,
+        cfg.slot_size_aligned,
+        dtype=torch.uint8,
+        device=device,
+    )
+    nonlinear_cache = padded_cache[:, ::2]
+    nonlinear_cache.copy_(cache)
+    nonlinear_auto = oscar_decode_attention(
+        query,
+        nonlinear_cache,
+        block_table,
+        seq_lens,
+        D**-0.5,
+        physical_slot_ids=physical_slot_ids,
+        **decode_kwargs,
+    )
+    nonlinear_legacy = oscar_decode_attention(
+        query,
+        nonlinear_cache,
+        block_table,
+        seq_lens,
+        D**-0.5,
+        use_grouped_h4=False,
+        **decode_kwargs,
+    )
+    torch.testing.assert_close(nonlinear_auto, nonlinear_legacy, atol=0, rtol=0)
+    with pytest.raises(ValueError, match="linear paged cache"):
+        oscar_decode_attention(
+            query,
+            nonlinear_cache,
+            block_table,
+            seq_lens,
+            D**-0.5,
+            physical_slot_ids=physical_slot_ids,
+            use_grouped_h4=True,
+            **decode_kwargs,
+        )
+
+
 def test_mixed_store_demote_and_decode_matches_reference():
     from vllm.model_executor.layers.quantization.oscar.layout import partition_tokens
     from vllm.v1.attention.ops.triton_oscar_decode import (
