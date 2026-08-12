@@ -196,5 +196,7 @@ class DefaultModelState(ModelState):
             oscar_hp_row_ids=input_batch.oscar_hp_row_ids,
             oscar_prefix_page_ids=input_batch.oscar_prefix_page_ids,
             oscar_shared_hit_tokens=input_batch.oscar_shared_hit_tokens,
+            oscar_reset_mask=input_batch.oscar_reset_mask,
+            oscar_row_generations=input_batch.oscar_row_generations,
         )
         return attn_metadata

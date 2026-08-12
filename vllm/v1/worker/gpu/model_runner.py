@@ -45,6 +45,12 @@ from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+from vllm.v1.attention.ops.triton_oscar_bulk_flush import (
+    is_oscar_bulk_flush_supported,
+    is_oscar_bulk_flush_target,
+    update_oscar_bulk_flush_row_generations,
+    validate_oscar_bulk_flush_scheduler_output,
+)
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, OscarKVCacheSpec
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -201,6 +207,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_num_tokens=self.max_num_tokens,
             device=self.device,
         )
+        self._oscar_row_generations = np.zeros(
+            self.max_num_reqs, dtype=np.int64
+        )
+        self._oscar_bulk_flush_enabled = False
 
         self.sampler: Sampler | None = None
         self.rejection_sampler: RejectionSampler | None = None
@@ -338,6 +348,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        oscar_groups = [
+            group
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, OscarKVCacheSpec)
+        ]
+        self._oscar_bulk_flush_enabled = bool(
+            len(oscar_groups) == 1
+            and is_oscar_bulk_flush_supported(self.vllm_config)
+            and is_oscar_bulk_flush_target(
+                oscar_groups[0].kv_cache_spec, oscar_groups[0].layer_names
+            )
+        )
         for group in kv_cache_config.kv_cache_groups:
             if isinstance(group.kv_cache_spec, OscarKVCacheSpec):
                 spec = group.kv_cache_spec
@@ -409,6 +431,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.attn_backends,
             self.device,
             self.cache_config.cache_dtype,
+            self.vllm_config,
         )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
@@ -821,6 +844,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         oscar_hp_row_ids = None
         oscar_prefix_page_ids = None
         oscar_shared_hit_tokens = None
+        oscar_reset_mask = None
+        oscar_row_generations = None
         if self.kv_cache_config.oscar_max_num_seqs is not None:
             expected_req_ids = set(req_ids)
             hp_req_ids = set(scheduler_output.oscar_hp_row_ids)
@@ -868,6 +893,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             oscar_shared_hit_tokens = self.input_buffers.oscar_shared_hit_tokens[
                 :num_reqs_padded
             ]
+            new_req_ids = {
+                request.req_id for request in scheduler_output.scheduled_new_reqs
+            }
+            reset_np, generations_np = update_oscar_bulk_flush_row_generations(
+                self._oscar_row_generations,
+                req_ids,
+                hp_rows_np[:num_reqs],
+                new_req_ids,
+            )
+            async_copy_to_gpu(reset_np, out=self.input_buffers.oscar_reset_mask)
+            async_copy_to_gpu(
+                generations_np, out=self.input_buffers.oscar_row_generations
+            )
+            oscar_reset_mask = self.input_buffers.oscar_reset_mask[:num_reqs_padded]
+            oscar_row_generations = self.input_buffers.oscar_row_generations[
+                :num_reqs_padded
+            ]
 
         return InputBatch(
             req_ids=req_ids,
@@ -895,6 +937,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             oscar_hp_row_ids=oscar_hp_row_ids,
             oscar_prefix_page_ids=oscar_prefix_page_ids,
             oscar_shared_hit_tokens=oscar_shared_hit_tokens,
+            oscar_reset_mask=oscar_reset_mask,
+            oscar_row_generations=oscar_row_generations,
         )
 
     def prepare_attn(
@@ -1015,6 +1059,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        validate_oscar_bulk_flush_scheduler_output(
+            self.vllm_config,
+            scheduler_output,
+            enabled=self._oscar_bulk_flush_enabled,
+        )
         if not dummy_run:
             # Update the request states.
             self.finish_requests(scheduler_output)

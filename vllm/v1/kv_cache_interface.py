@@ -303,6 +303,7 @@ class OscarKVCacheSpec(FullAttentionSpec):
     group_size: int = 128
     prefix_tokens: int = 64
     recent_tokens: int = 256
+    flush_interval: int = 8
     prefix_cache_extra_tokens: int = 0
     hp_dtype: torch.dtype = torch.bfloat16
 
@@ -311,6 +312,7 @@ class OscarKVCacheSpec(FullAttentionSpec):
         positive = {
             "quant_slot_size": self.quant_slot_size,
             "group_size": self.group_size,
+            "flush_interval": self.flush_interval,
         }
         invalid = [name for name, value in positive.items() if value <= 0]
         if invalid:
@@ -323,6 +325,12 @@ class OscarKVCacheSpec(FullAttentionSpec):
             raise ValueError("OSCAR prefix window must be block aligned")
         if self.recent_tokens % self.block_size != 0:
             raise ValueError("OSCAR recent window must be block aligned")
+
+    @property
+    def recent_row_capacity(self) -> int:
+        """Physical BF16 row capacity for one batched demotion interval."""
+        unaligned = self.recent_tokens + self.flush_interval - 1
+        return cdiv(unaligned, self.block_size) * self.block_size
 
     @property
     def real_page_size_bytes(self) -> int:

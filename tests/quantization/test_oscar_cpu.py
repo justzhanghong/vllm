@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import inspect
 import os
 import tempfile
 import unittest
@@ -8,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
 from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode
@@ -22,9 +24,651 @@ from vllm.model_executor.layers.quantization.oscar.rotation import (
 )
 from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.attention.backends.oscar_attn import OscarMetadataBuilder
+from vllm.v1.attention.ops.triton_oscar_bulk_flush import (
+    bind_oscar_bulk_flush_state,
+    build_oscar_bulk_flush_plan_cpu,
+    clear_oscar_bulk_flush_state,
+    is_oscar_bulk_flush_supported,
+    is_oscar_bulk_flush_target,
+    prepare_oscar_bulk_flush_plan,
+    register_oscar_bulk_flush_caches,
+    update_oscar_bulk_flush_row_generations,
+    validate_oscar_bulk_flush_scheduler_output,
+)
 
 
 class TestOscarConfigAndLayout(unittest.TestCase):
+    def test_bulk_flush_plan_crosses_noncontiguous_pages(self):
+        block_table = torch.tensor([[7, 2, 11, 5]], dtype=torch.int32)
+        plan = build_oscar_bulk_flush_plan_cpu(
+            phase=torch.tensor([7], dtype=torch.int32),
+            cached_lens=torch.tensor([49], dtype=torch.int32),
+            hp_row_ids=torch.tensor([0], dtype=torch.int32),
+            shared_hit_tokens=torch.tensor([0], dtype=torch.int32),
+            block_table=block_table,
+            prefix_tokens=8,
+            recent_tokens=32,
+            recent_capacity=48,
+            block_size=16,
+            flush_interval=8,
+        )
+
+        self.assertEqual(plan.next_phase.tolist(), [0])
+        self.assertEqual(plan.recent_extra.tolist(), [0])
+        self.assertEqual(plan.positions.tolist(), [[10, 11, 12, 13, 14, 15, 16, 17]])
+        self.assertEqual(
+            plan.dst_slots.tolist(),
+            [[122, 123, 124, 125, 126, 127, 32, 33]],
+        )
+        self.assertEqual(plan.valid.tolist(), [[True] * 8])
+        self.assertEqual(plan.src_recent_slots.tolist(), [[2, 3, 4, 5, 6, 7, 8, 9]])
+
+        for cached_len, table, expected_valid in (
+            (4, [[7]], [False] * 8),
+            (49, [[7, -1]], [True] * 6 + [False] * 2),
+            (49, [[7]], [True] * 6 + [False] * 2),
+        ):
+            bounded = build_oscar_bulk_flush_plan_cpu(
+                phase=torch.tensor([7], dtype=torch.int32),
+                cached_lens=torch.tensor([cached_len], dtype=torch.int32),
+                hp_row_ids=torch.tensor([0], dtype=torch.int32),
+                shared_hit_tokens=torch.tensor([0], dtype=torch.int32),
+                block_table=torch.tensor(table, dtype=torch.int32),
+                prefix_tokens=8,
+                recent_tokens=32,
+                recent_capacity=48,
+                block_size=16,
+                flush_interval=8,
+            )
+            with self.subTest(cached_len=cached_len, table=table):
+                self.assertEqual(bounded.valid[0].tolist(), expected_valid)
+                self.assertTrue(torch.all(bounded.positions[~bounded.valid] == -1))
+                self.assertTrue(torch.all(bounded.dst_slots[~bounded.valid] == -1))
+                self.assertTrue(
+                    torch.all(bounded.src_recent_slots[~bounded.valid] == -1)
+                )
+
+    def test_bulk_flush_phase_is_periodic_and_resets(self):
+        phase = torch.tensor([0, 0], dtype=torch.int32)
+        block_table = torch.stack(
+            (
+                torch.arange(64, dtype=torch.int32),
+                torch.arange(64, dtype=torch.int32) + 100,
+            )
+        )
+        flush_steps = []
+        live_slots = [dict(), dict()]
+        wrap_count = [0, 0]
+        for step in range(1, 545):
+            cached = 320 + step - 1
+            plan = build_oscar_bulk_flush_plan_cpu(
+                phase=phase,
+                cached_lens=torch.tensor([cached, cached], dtype=torch.int32),
+                hp_row_ids=torch.tensor([0, 1], dtype=torch.int32),
+                shared_hit_tokens=torch.tensor([0, 0], dtype=torch.int32),
+                block_table=block_table,
+                prefix_tokens=64,
+                recent_tokens=256,
+                recent_capacity=272,
+                block_size=16,
+                flush_interval=8,
+            )
+            phase = plan.next_phase
+            if plan.valid.any():
+                flush_steps.append(step)
+            self.assertEqual(plan.recent_extra.tolist(), [step % 8] * 2)
+            for row in range(2):
+                for lane in range(8):
+                    position = cached - 256 - 8 + 1 + lane
+                    valid = step % 8 == 0 and position >= 64
+                    self.assertEqual(plan.valid[row, lane].item(), valid)
+                    self.assertEqual(
+                        plan.positions[row, lane].item(), position if valid else -1
+                    )
+                    if valid:
+                        self.assertEqual(
+                            plan.src_recent_slots[row, lane].item(),
+                            row * 272 + (position - 64) % 272,
+                        )
+                        block = block_table[row, position // 16].item()
+                        self.assertEqual(
+                            plan.dst_slots[row, lane].item(),
+                            block * 16 + position % 16,
+                        )
+
+                write_position = 64 + step - 1
+                slot = row * 272 + (write_position - 64) % 272
+                if slot in live_slots[row]:
+                    wrap_count[row] += 1
+                live_slots[row][slot] = write_position
+                live_start = max(64, write_position - 271)
+                live_slots[row] = {
+                    physical: logical
+                    for physical, logical in live_slots[row].items()
+                    if logical >= live_start
+                }
+                self.assertEqual(len(live_slots[row]), min(step, 272))
+                self.assertEqual(len(set(live_slots[row])), len(live_slots[row]))
+            self.assertTrue(set(live_slots[0]).isdisjoint(live_slots[1]))
+
+        self.assertEqual(flush_steps, list(range(8, 545, 8)))
+        self.assertEqual(wrap_count, [272, 272])
+        self.assertEqual([len(slots) for slots in live_slots], [272, 272])
+
+    def test_bulk_flush_support_gate_fails_closed(self):
+        def config(**overrides):
+            values = {
+                "max_num_seqs": 1,
+                "enable_chunked_prefill": True,
+                "enable_prefix_caching": False,
+                "speculative_config": None,
+                "tp": 1,
+                "pp": 1,
+                "connector": None,
+                "cpu_offload_gb": 0,
+            }
+            values.update(overrides)
+            return SimpleNamespace(
+                scheduler_config=SimpleNamespace(
+                    max_num_seqs=values["max_num_seqs"],
+                    enable_chunked_prefill=values["enable_chunked_prefill"],
+                ),
+                cache_config=SimpleNamespace(
+                    enable_prefix_caching=values["enable_prefix_caching"]
+                ),
+                speculative_config=values["speculative_config"],
+                parallel_config=SimpleNamespace(
+                    tensor_parallel_size=values["tp"],
+                    pipeline_parallel_size=values["pp"],
+                ),
+                kv_transfer_config=SimpleNamespace(
+                    kv_connector=values["connector"]
+                ),
+                offload_config=SimpleNamespace(
+                    cpu_offload_gb=values["cpu_offload_gb"]
+                ),
+            )
+
+        self.assertTrue(is_oscar_bulk_flush_supported(config()))
+        for unsupported in (
+            config(max_num_seqs=2),
+            config(enable_chunked_prefill=False),
+            config(enable_prefix_caching=True),
+            config(speculative_config=SimpleNamespace()),
+            config(tp=2),
+            config(pp=2),
+            config(connector="LMCacheConnectorV1"),
+            config(cpu_offload_gb=1),
+        ):
+            with self.subTest(config=unsupported):
+                self.assertFalse(is_oscar_bulk_flush_supported(unsupported))
+
+    def test_bulk_flush_pointer_table_preserves_layer_order(self):
+        layer_names = [f"layer.{index}" for index in range(36)]
+        caches = {
+            name: [
+                torch.empty((2, 16, 8, 72), dtype=torch.uint8),
+                torch.empty((64, 8, 2, 128), dtype=torch.bfloat16),
+                torch.empty((272, 8, 2, 128), dtype=torch.bfloat16),
+            ]
+            for name in layer_names
+        }
+        state = register_oscar_bulk_flush_caches(
+            caches,
+            layer_names,
+            expected_recent_capacity=272,
+            max_num_seqs=1,
+        )
+
+        self.assertEqual(state.layer_names, tuple(layer_names))
+        self.assertEqual(
+            state.quant_ptrs.tolist(),
+            [caches[name][0].data_ptr() for name in layer_names],
+        )
+        self.assertEqual(
+            state.recent_ptrs.tolist(),
+            [caches[name][2].data_ptr() for name in layer_names],
+        )
+        self.assertEqual(state.recent_capacity, 272)
+        self.assertEqual(state.quant_stride, caches["layer.0"][0].stride())
+        self.assertEqual(state.recent_stride, caches["layer.0"][2].stride())
+
+    def test_bulk_flush_reset_and_generation_prevent_row_aba(self):
+        phase = torch.tensor([7], dtype=torch.int32)
+        stored_generation = torch.tensor([4], dtype=torch.int64)
+        buffers = {
+            "recent_extra": torch.zeros(1, dtype=torch.int32),
+            "positions": torch.full((1, 8), -1, dtype=torch.int32),
+            "src_recent_slots": torch.full((1, 8), -1, dtype=torch.int64),
+            "dst_slots": torch.full((1, 8), -1, dtype=torch.int64),
+            "valid": torch.zeros((1, 8), dtype=torch.bool),
+        }
+        common = {
+            "phase": phase,
+            "row_generations": stored_generation,
+            "cached_lens": torch.tensor([321], dtype=torch.int32),
+            "hp_row_ids": torch.tensor([0], dtype=torch.int32),
+            "shared_hit_tokens": torch.tensor([0], dtype=torch.int32),
+            "block_table": torch.arange(64, dtype=torch.int32).view(1, -1),
+            "prefix_tokens": 64,
+            "recent_tokens": 256,
+            "recent_capacity": 272,
+            "block_size": 16,
+            "flush_interval": 8,
+            **buffers,
+        }
+
+        reset_plan = prepare_oscar_bulk_flush_plan(
+            reset_mask=torch.tensor([True]),
+            request_generations=torch.tensor([5], dtype=torch.int64),
+            **common,
+        )
+        self.assertEqual(reset_plan.recent_extra.tolist(), [1])
+        self.assertFalse(reset_plan.valid.any())
+        self.assertEqual(stored_generation.tolist(), [5])
+
+        phase.fill_(7)
+        aba_plan = prepare_oscar_bulk_flush_plan(
+            reset_mask=torch.tensor([False]),
+            request_generations=torch.tensor([6], dtype=torch.int64),
+            **common,
+        )
+        self.assertEqual(aba_plan.recent_extra.tolist(), [1])
+        self.assertFalse(aba_plan.valid.any())
+        self.assertEqual(stored_generation.tolist(), [6])
+
+    def test_bulk_flush_capture_does_not_advance_phase(self):
+        vllm_config = SimpleNamespace(
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=8,
+                max_num_seqs=1,
+                enable_chunked_prefill=True,
+            ),
+            cache_config=SimpleNamespace(
+                kv_cache_memory_bytes=None,
+                enable_prefix_caching=False,
+            ),
+            model_config=SimpleNamespace(dtype=torch.bfloat16, max_model_len=8),
+            parallel_config=SimpleNamespace(
+                decode_context_parallel_size=1,
+                tensor_parallel_size=1,
+                pipeline_parallel_size=1,
+            ),
+            speculative_config=None,
+            kv_transfer_config=SimpleNamespace(kv_connector=None),
+            offload_config=SimpleNamespace(cpu_offload_gb=0),
+        )
+        spec = SimpleNamespace(
+            num_kv_heads=8,
+            head_size=128,
+            head_size_v=128,
+            block_size=16,
+            quant_slot_size=72,
+            group_size=128,
+            prefix_tokens=64,
+            recent_tokens=256,
+            recent_row_capacity=272,
+            flush_interval=8,
+            hp_dtype=torch.bfloat16,
+        )
+        layer_names = [f"layer.{index}" for index in range(36)]
+        builder = OscarMetadataBuilder(spec, layer_names, vllm_config, "cpu")
+        metadata = CommonAttentionMetadata(
+            query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+            query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+            seq_lens=torch.tensor([7], dtype=torch.int32),
+            _seq_lens_cpu=torch.tensor([7], dtype=torch.int32),
+            seq_lens_cpu_upper_bound=torch.tensor([7], dtype=torch.int32),
+            num_reqs=1,
+            num_actual_tokens=1,
+            max_query_len=1,
+            max_seq_len=7,
+            block_table_tensor=torch.tensor([[0]], dtype=torch.int32),
+            slot_mapping=torch.tensor([6], dtype=torch.int64),
+            oscar_hp_row_ids=torch.tensor([0], dtype=torch.int32),
+            oscar_prefix_page_ids=torch.tensor(
+                [[0, 1, 2, 3]], dtype=torch.int32
+            ),
+            oscar_shared_hit_tokens=torch.tensor([0], dtype=torch.int32),
+            oscar_reset_mask=torch.tensor([True]),
+            oscar_row_generations=torch.tensor([1], dtype=torch.int64),
+        )
+        builder.flush_phase.fill_(7)
+
+        with patch(
+            "vllm.v1.attention.backends.oscar_attn.materialize_oscar_slot_ids"
+        ):
+            captured = builder.build_for_cudagraph_capture(metadata)
+
+        self.assertEqual(builder.flush_phase.tolist(), [7])
+        self.assertEqual(builder.row_generations.tolist(), [-1])
+        self.assertEqual(captured.bulk_flush_plan.recent_extra.tolist(), [0])
+        self.assertFalse(captured.bulk_flush_plan.valid.any())
+
+    def test_bulk_flush_registration_fails_closed(self):
+        quant = torch.empty((2, 16, 8, 72), dtype=torch.uint8)
+        prefix = torch.empty((128, 8, 2, 128), dtype=torch.bfloat16)
+        recent = torch.empty((544, 8, 2, 128), dtype=torch.bfloat16)
+        caches = {"layer.0": [quant, prefix, recent]}
+
+        with self.assertRaisesRegex(ValueError, "unique"):
+            register_oscar_bulk_flush_caches(
+                caches,
+                ["layer.0", "layer.0"],
+                expected_recent_capacity=272,
+                max_num_seqs=2,
+            )
+        with self.assertRaisesRegex(ValueError, "missing"):
+            register_oscar_bulk_flush_caches(
+                caches,
+                ["layer.1"],
+                expected_recent_capacity=272,
+                max_num_seqs=2,
+            )
+        with self.assertRaisesRegex(ValueError, "physical row capacity"):
+            register_oscar_bulk_flush_caches(
+                caches,
+                ["layer.0"],
+                expected_recent_capacity=256,
+                max_num_seqs=2,
+            )
+        qwen_quant = torch.empty((2, 16, 8, 72), dtype=torch.uint8)
+        qwen_prefix = torch.empty((64, 8, 2, 128), dtype=torch.bfloat16)
+        qwen_recent = torch.empty((272, 8, 2, 128), dtype=torch.bfloat16)
+        with self.assertRaisesRegex(ValueError, "uint8"):
+            register_oscar_bulk_flush_caches(
+                {
+                    "layer.0": [
+                        qwen_quant.to(torch.int8),
+                        qwen_prefix,
+                        qwen_recent,
+                    ]
+                },
+                ["layer.0"],
+                expected_recent_capacity=272,
+                max_num_seqs=1,
+            )
+        with self.assertRaisesRegex(ValueError, "shapes"):
+            register_oscar_bulk_flush_caches(
+                {
+                    "layer.0": [
+                        qwen_quant[:, :, :4],
+                        qwen_prefix,
+                        qwen_recent,
+                    ]
+                },
+                ["layer.0"],
+                expected_recent_capacity=272,
+                max_num_seqs=1,
+            )
+        padded_recent = torch.empty(
+            (272, 8, 2, 129), dtype=torch.bfloat16
+        )[..., :128]
+        with self.assertRaisesRegex(ValueError, "combined K/V offset"):
+            register_oscar_bulk_flush_caches(
+                {"layer.0": [qwen_quant, qwen_prefix, padded_recent]},
+                ["layer.0"],
+                expected_recent_capacity=272,
+                max_num_seqs=1,
+            )
+
+    def test_bulk_flush_binding_has_exactly_one_owner(self):
+        layer_names = [f"layer.{index}" for index in range(36)]
+        caches = {
+            name: [
+                torch.empty((2, 16, 8, 72), dtype=torch.uint8),
+                torch.empty((64, 8, 2, 128), dtype=torch.bfloat16),
+                torch.empty((272, 8, 2, 128), dtype=torch.bfloat16),
+            ]
+            for name in layer_names
+        }
+        state = register_oscar_bulk_flush_caches(
+            caches,
+            layer_names,
+            expected_recent_capacity=272,
+            max_num_seqs=1,
+        )
+        context = {name: SimpleNamespace() for name in layer_names}
+
+        pointers_before = {
+            name: tuple(tensor.data_ptr() for tensor in caches[name])
+            for name in layer_names
+        }
+        versions_before = {
+            name: tuple(tensor._version for tensor in caches[name])
+            for name in layer_names
+        }
+        with patch("torch.empty", side_effect=AssertionError("unexpected allocate")):
+            bind_oscar_bulk_flush_state(context, state)
+
+        self.assertTrue(context["layer.0"]._oscar_bulk_flush_owner)
+        self.assertEqual(
+            sum(context[name]._oscar_bulk_flush_owner for name in layer_names), 1
+        )
+        for name in layer_names:
+            self.assertIs(context[name]._oscar_bulk_flush_state, state)
+            self.assertEqual(
+                tuple(tensor.data_ptr() for tensor in caches[name]),
+                pointers_before[name],
+            )
+            self.assertEqual(
+                tuple(tensor._version for tensor in caches[name]),
+                versions_before[name],
+            )
+
+        clear_oscar_bulk_flush_state(context)
+        self.assertEqual(
+            sum(context[name]._oscar_bulk_flush_owner for name in layer_names), 0
+        )
+        self.assertTrue(
+            all(
+                context[name]._oscar_bulk_flush_state is None
+                for name in layer_names
+            )
+        )
+
+    def test_bulk_flush_target_gate_is_shape_exact(self):
+        spec = SimpleNamespace(
+            block_size=16,
+            num_kv_heads=8,
+            head_size=128,
+            head_size_v=128,
+            quant_slot_size=72,
+            group_size=128,
+            prefix_tokens=64,
+            recent_tokens=256,
+            prefix_cache_extra_tokens=0,
+            flush_interval=8,
+            recent_row_capacity=272,
+            hp_dtype=torch.bfloat16,
+        )
+        layers = [f"layer.{index}" for index in range(36)]
+
+        self.assertTrue(is_oscar_bulk_flush_target(spec, layers))
+        for field, value in (
+            ("block_size", 32),
+            ("num_kv_heads", 4),
+            ("head_size", 64),
+            ("quant_slot_size", 80),
+            ("group_size", 64),
+            ("prefix_cache_extra_tokens", 16),
+            ("recent_row_capacity", 256),
+        ):
+            original = getattr(spec, field)
+            setattr(spec, field, value)
+            with self.subTest(field=field):
+                self.assertFalse(is_oscar_bulk_flush_target(spec, layers))
+            setattr(spec, field, original)
+        self.assertFalse(is_oscar_bulk_flush_target(spec, layers[:-1]))
+
+    def test_bulk_flush_scheduler_lifecycle_gate_rejects_unsupported_ops(self):
+        config = SimpleNamespace(
+            scheduler_config=SimpleNamespace(
+                max_num_seqs=1, enable_chunked_prefill=True
+            ),
+            cache_config=SimpleNamespace(enable_prefix_caching=False),
+            speculative_config=None,
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=1, pipeline_parallel_size=1
+            ),
+            kv_transfer_config=SimpleNamespace(kv_connector=None),
+            offload_config=SimpleNamespace(cpu_offload_gb=0),
+        )
+
+        def output(*, preempted=False, resumed=False, request=None):
+            return SimpleNamespace(
+                preempted_req_ids={"r0"} if preempted else set(),
+                scheduled_cached_reqs=SimpleNamespace(
+                    resumed_req_ids={"r0"} if resumed else set()
+                ),
+                scheduled_new_reqs=[] if request is None else [request],
+            )
+
+        validate_oscar_bulk_flush_scheduler_output(config, output(), enabled=True)
+        generations = np.zeros(1, dtype=np.int64)
+        reset, request_generations = update_oscar_bulk_flush_row_generations(
+            generations, ["new-a"], [0], {"new-a"}
+        )
+        self.assertEqual((reset[0], request_generations[0]), (True, 1))
+        reset, request_generations = update_oscar_bulk_flush_row_generations(
+            generations, ["new-a"], [0], set()
+        )
+        self.assertEqual((reset[0], request_generations[0]), (False, 1))
+        reset, request_generations = update_oscar_bulk_flush_row_generations(
+            generations, ["new-b"], [0], {"new-b"}
+        )
+        self.assertEqual((reset[0], request_generations[0]), (True, 2))
+
+        for label, unsafe in (
+            ("preempt", output(preempted=True)),
+            ("resume", output(resumed=True)),
+            (
+                "fanout",
+                output(
+                    request=SimpleNamespace(
+                        sampling_params=SimpleNamespace(n=2),
+                        num_computed_tokens=0,
+                    )
+                )
+            ),
+            (
+                "copy",
+                output(
+                    request=SimpleNamespace(
+                        sampling_params=SimpleNamespace(n=1),
+                        num_computed_tokens=8,
+                    )
+                )
+            ),
+            (
+                "fork",
+                output(
+                    request=SimpleNamespace(
+                        sampling_params=SimpleNamespace(n=1),
+                        num_computed_tokens=16,
+                    )
+                )
+            ),
+        ):
+            with self.subTest(case=label):
+                before = generations.copy()
+                with self.assertRaises(RuntimeError):
+                    validate_oscar_bulk_flush_scheduler_output(
+                        config, unsafe, enabled=True
+                    )
+                np.testing.assert_array_equal(generations, before)
+
+        from vllm.v1.worker.gpu.model_runner import (
+            GPUModelRunner as ModularGPUModelRunner,
+        )
+        from vllm.v1.worker.gpu_model_runner import (
+            GPUModelRunner as LegacyGPUModelRunner,
+        )
+
+        for runner_cls, prepare_name, first_mutation in (
+            (ModularGPUModelRunner, "prepare_inputs", "update_pp_decode_requests"),
+            (LegacyGPUModelRunner, "_prepare_inputs", "execute_model_state"),
+        ):
+            execute_source = inspect.getsource(runner_cls.execute_model)
+            self.assertLess(
+                execute_source.index("validate_oscar_bulk_flush_scheduler_output"),
+                execute_source.index(first_mutation),
+            )
+            prepare_source = inspect.getsource(getattr(runner_cls, prepare_name))
+            self.assertIn(
+                "update_oscar_bulk_flush_row_generations", prepare_source
+            )
+            runner = object.__new__(runner_cls)
+            runner.vllm_config = config
+            runner._oscar_bulk_flush_enabled = True
+            sentinel = object()
+            runner.pre_validation_sentinel = sentinel
+            for label, unsafe in (
+                ("preempt", output(preempted=True)),
+                ("resume", output(resumed=True)),
+                (
+                    "fanout",
+                    output(
+                        request=SimpleNamespace(
+                            sampling_params=SimpleNamespace(n=2),
+                            num_computed_tokens=0,
+                        )
+                    ),
+                ),
+                (
+                    "copy",
+                    output(
+                        request=SimpleNamespace(
+                            sampling_params=SimpleNamespace(n=1),
+                            num_computed_tokens=8,
+                        )
+                    ),
+                ),
+                (
+                    "fork",
+                    output(
+                        request=SimpleNamespace(
+                            sampling_params=SimpleNamespace(n=1),
+                            num_computed_tokens=16,
+                        )
+                    ),
+                ),
+            ):
+                before = {
+                    name: id(value) for name, value in runner.__dict__.items()
+                }
+                with self.subTest(runner=runner_cls.__name__, case=label):
+                    with self.assertRaises(RuntimeError):
+                        runner_cls.execute_model(runner, unsafe)
+                    self.assertEqual(
+                        {
+                            name: id(value)
+                            for name, value in runner.__dict__.items()
+                        },
+                        before,
+                    )
+                    self.assertIs(runner.pre_validation_sentinel, sentinel)
+
+    def test_bulk_flush_shared_hit_lower_bound_masks_plan(self):
+        plan = build_oscar_bulk_flush_plan_cpu(
+            phase=torch.tensor([7], dtype=torch.int32),
+            cached_lens=torch.tensor([337], dtype=torch.int32),
+            hp_row_ids=torch.tensor([1], dtype=torch.int32),
+            shared_hit_tokens=torch.tensor([78], dtype=torch.int32),
+            block_table=torch.arange(32, dtype=torch.int32).view(1, -1),
+            prefix_tokens=64,
+            recent_tokens=256,
+            recent_capacity=272,
+            block_size=16,
+            flush_interval=8,
+        )
+
+        self.assertEqual(
+            plan.positions.tolist(), [[-1, -1, -1, -1, 78, 79, 80, 81]]
+        )
+        self.assertEqual(plan.valid.tolist(), [[False] * 4 + [True] * 4])
+        self.assertEqual(plan.src_recent_slots[0, 4:].tolist(), [286, 287, 288, 289])
+
     def test_execution_mode_support(self):
         self.assertTrue(
             _is_oscar_execution_mode_supported(
@@ -432,6 +1076,8 @@ class TestOscarConfigAndLayout(unittest.TestCase):
             parallel_config=SimpleNamespace(
                 decode_context_parallel_size=1,
                 use_ubatching=False,
+                tensor_parallel_size=1,
+                pipeline_parallel_size=1,
             ),
             speculative_config=None,
         )
@@ -515,10 +1161,7 @@ class TestOscarConfigAndLayout(unittest.TestCase):
         )
         kernel_end = source.index("\n\n@triton.jit", kernel_start)
         kernel_source = source[kernel_start:kernel_end]
-        self.assertTrue(
-            "Physical_slot_ids_ptr" in kernel_source,
-            "grouped-H4 reader must consume preindexed physical slots",
-        )
+        self.assertIn("Physical_slot_ids_ptr", kernel_source)
         self.assertIn("physical_slots * stride_cache_pos", kernel_source)
         self.assertNotIn("Block_table_ptr", kernel_source)
         self.assertNotIn("kv_offs // BLOCK_SIZE", kernel_source)
@@ -543,9 +1186,7 @@ class TestOscarConfigAndLayout(unittest.TestCase):
         self.assertIn("_has_linear_physical_slot_layout(kv_cache)", dispatch_source)
 
         backend_source = (
-            Path(triton_oscar_decode.__file__).parents[1]
-            / "backends"
-            / "oscar_attn.py"
+            Path(triton_oscar_decode.__file__).parents[1] / "backends" / "oscar_attn.py"
         ).read_text()
         build_start = backend_source.index("    def build(")
         build_end = backend_source.index("\n\n\nclass OscarAttentionImpl", build_start)

@@ -32,6 +32,12 @@ class InputBuffers:
         self.oscar_shared_hit_tokens = torch.zeros(
             max_num_reqs, dtype=torch.int32, device=device
         )
+        self.oscar_reset_mask = torch.zeros(
+            max_num_reqs, dtype=torch.bool, device=device
+        )
+        self.oscar_row_generations = torch.zeros(
+            max_num_reqs, dtype=torch.int64, device=device
+        )
         self.set_oscar_prefix_pages_per_request(4)
         # DCP: per-request local seq_lens buffer
         self.dcp_local_seq_lens = torch.zeros(
@@ -99,6 +105,8 @@ class InputBatch:
     oscar_hp_row_ids: torch.Tensor | None = None
     oscar_prefix_page_ids: torch.Tensor | None = None
     oscar_shared_hit_tokens: torch.Tensor | None = None
+    oscar_reset_mask: torch.Tensor | None = None
+    oscar_row_generations: torch.Tensor | None = None
 
     @classmethod
     def make_dummy(
@@ -172,6 +180,8 @@ class InputBatch:
             oscar_hp_row_ids=input_buffers.oscar_hp_row_ids[:num_reqs],
             oscar_prefix_page_ids=input_buffers.oscar_prefix_page_ids[:num_reqs],
             oscar_shared_hit_tokens=input_buffers.oscar_shared_hit_tokens[:num_reqs],
+            oscar_reset_mask=input_buffers.oscar_reset_mask[:num_reqs],
+            oscar_row_generations=input_buffers.oscar_row_generations[:num_reqs],
         )
 
 

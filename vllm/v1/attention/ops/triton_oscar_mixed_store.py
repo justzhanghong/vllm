@@ -37,6 +37,7 @@ def _store_hp_kernel(
     HEAD_DIM: tl.constexpr,
     PREFIX_TOKENS: tl.constexpr,
     RECENT_TOKENS: tl.constexpr,
+    RECENT_CAPACITY: tl.constexpr,
     PREFIX_BLOCK_SIZE: tl.constexpr,
     USE_PREFIX_PAGE_TABLE: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -104,8 +105,8 @@ def _store_hp_kernel(
         mask=d_mask & is_prefix,
     )
 
-    recent_idx = (pos - PREFIX_TOKENS) % RECENT_TOKENS
-    recent_base = (hp_row * RECENT_TOKENS + recent_idx).to(
+    recent_idx = (pos - PREFIX_TOKENS) % RECENT_CAPACITY
+    recent_base = (hp_row * RECENT_CAPACITY + recent_idx).to(
         tl.int64
     ) * stride_recent_slot + head_idx.to(tl.int64) * stride_recent_head
     tl.store(
@@ -148,6 +149,7 @@ def _demote_hp_kernel(
     V_CLIP_INDEX: tl.constexpr,
     PREFIX_TOKENS: tl.constexpr,
     RECENT_TOKENS: tl.constexpr,
+    RECENT_CAPACITY: tl.constexpr,
     SINGLE_TOKEN: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_PACK: tl.constexpr,
@@ -178,8 +180,8 @@ def _demote_hp_kernel(
     block = tl.load(Block_table_ptr + req_idx * stride_bt_b + page_idx).to(tl.int64)
     slot = block * BLOCK_SIZE + page_off
     hp_row = tl.load(HP_rows_ptr + req_idx)
-    recent_idx = (demote_position - PREFIX_TOKENS) % RECENT_TOKENS
-    recent_offset = hp_row * RECENT_TOKENS + recent_idx
+    recent_idx = (demote_position - PREFIX_TOKENS) % RECENT_CAPACITY
+    recent_offset = hp_row * RECENT_CAPACITY + recent_idx
     hp_base = (
         recent_offset * stride_recent_slot + head_idx.to(tl.int64) * stride_recent_head
     )
@@ -249,12 +251,14 @@ def oscar_store_hp(
     prefix_block_size: int = 16,
     prefix_tokens: int,
     recent_tokens: int,
+    recent_capacity: int | None = None,
 ) -> None:
     num_tokens, num_heads, head_dim = key_rot.shape
     if num_tokens == 0:
         return
     block_d = triton.next_power_of_2(head_dim)
     use_prefix_page_table = prefix_page_ids is not None
+    recent_capacity = recent_capacity or recent_tokens
     if prefix_page_ids is None:
         prefix_page_ids = hp_row_ids
     else:
@@ -294,6 +298,7 @@ def oscar_store_hp(
         HEAD_DIM=head_dim,
         PREFIX_TOKENS=prefix_tokens,
         RECENT_TOKENS=recent_tokens,
+        RECENT_CAPACITY=recent_capacity,
         PREFIX_BLOCK_SIZE=prefix_block_size,
         USE_PREFIX_PAGE_TABLE=use_prefix_page_table,
         BLOCK_D=block_d,
@@ -314,6 +319,7 @@ def oscar_demote_hp(
     max_query_len: int = 1,
     prefix_tokens: int,
     recent_tokens: int,
+    recent_capacity: int | None = None,
     key_levels: int,
     value_levels: int,
     key_packed_size: int,
@@ -323,6 +329,7 @@ def oscar_demote_hp(
 ) -> None:
     if max_query_len <= 0:
         return
+    recent_capacity = recent_capacity or recent_tokens
     num_heads = kv_cache.shape[2]
     head_dim = data_bytes * 4
     block_d = triton.next_power_of_2(head_dim)
@@ -362,6 +369,7 @@ def oscar_demote_hp(
         V_CLIP_INDEX=_clip_index(v_clip_ratio, head_dim),
         PREFIX_TOKENS=prefix_tokens,
         RECENT_TOKENS=recent_tokens,
+        RECENT_CAPACITY=recent_capacity,
         SINGLE_TOKEN=single_token,
         BLOCK_D=block_d,
         BLOCK_PACK=block_pack,

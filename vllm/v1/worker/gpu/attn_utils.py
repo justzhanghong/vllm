@@ -14,6 +14,12 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.ops.triton_oscar_bulk_flush import (
+    bind_oscar_bulk_flush_state,
+    is_oscar_bulk_flush_supported,
+    is_oscar_bulk_flush_target,
+    register_oscar_bulk_flush_caches,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
@@ -163,7 +169,7 @@ def _reshape_oscar_kv_cache(
         // kv_cache_spec.block_size
         * kv_cache_spec.block_size
     )
-    recent_slots = max_num_seqs * kv_cache_spec.recent_tokens
+    recent_slots = max_num_seqs * kv_cache_spec.recent_row_capacity
     hp_slot_bytes = kv_cache_spec.hp_page_size_bytes // kv_cache_spec.block_size
     prefix_bytes = prefix_slots * hp_slot_bytes
     recent_bytes = recent_slots * hp_slot_bytes
@@ -277,12 +283,29 @@ def init_kv_cache(
     attn_backends: dict[str, type[AttentionBackend]],
     device: torch.device,
     cache_dtype: str,
+    vllm_config: VllmConfig,
 ) -> dict[str, torch.Tensor]:
     kv_cache_raw_tensors = _allocate_kv_cache(kv_cache_config, device)
     kv_caches = _reshape_kv_cache(
         kv_cache_config, kv_cache_raw_tensors, attn_backends, cache_dtype
     )
     bind_kv_cache(kv_caches, forward_context, runner_kv_caches)
+    if is_oscar_bulk_flush_supported(vllm_config):
+        oscar_groups = [
+            group
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, OscarKVCacheSpec)
+        ]
+        if len(oscar_groups) == 1:
+            group = oscar_groups[0]
+            if is_oscar_bulk_flush_target(group.kv_cache_spec, group.layer_names):
+                state = register_oscar_bulk_flush_caches(
+                    kv_caches,
+                    group.layer_names,
+                    expected_recent_capacity=group.kv_cache_spec.recent_row_capacity,
+                    max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
+                )
+                bind_oscar_bulk_flush_state(forward_context, state)
     return kv_caches
 
 
@@ -315,6 +338,8 @@ def build_attn_metadata(
     oscar_hp_row_ids: torch.Tensor | None = None,
     oscar_prefix_page_ids: torch.Tensor | None = None,
     oscar_shared_hit_tokens: torch.Tensor | None = None,
+    oscar_reset_mask: torch.Tensor | None = None,
+    oscar_row_generations: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
@@ -344,6 +369,8 @@ def build_attn_metadata(
             oscar_hp_row_ids=oscar_hp_row_ids,
             oscar_prefix_page_ids=oscar_prefix_page_ids,
             oscar_shared_hit_tokens=oscar_shared_hit_tokens,
+            oscar_reset_mask=oscar_reset_mask,
+            oscar_row_generations=oscar_row_generations,
         )
         if encoder_seq_lens and i in encoder_seq_lens:
             encoder_seq_lens_gpu, encoder_seq_lens_cpu = encoder_seq_lens[i]

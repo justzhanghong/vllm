@@ -136,6 +136,15 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
+from vllm.v1.attention.ops.triton_oscar_bulk_flush import (
+    bind_oscar_bulk_flush_state,
+    clear_oscar_bulk_flush_state,
+    is_oscar_bulk_flush_supported,
+    is_oscar_bulk_flush_target,
+    register_oscar_bulk_flush_caches,
+    update_oscar_bulk_flush_row_generations,
+    validate_oscar_bulk_flush_scheduler_output,
+)
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -257,6 +266,16 @@ def _env_int(name: str, default: int) -> int:
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
+
+
+def _get_layer_cache_dtype_str(
+    kv_cache_spec: AttentionSpec, cache_dtype: str
+) -> str:
+    if isinstance(kv_cache_spec, OscarKVCacheSpec):
+        return cache_dtype
+    if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE:
+        return "auto"
+    return getattr(kv_cache_spec, "cache_dtype_str", None) or cache_dtype
 
 
 def _pp_boundary_scope(name: str):
@@ -857,6 +876,16 @@ class GPUModelRunner(
         self.oscar_prefix_page_ids = self._make_buffer(
             self.max_num_reqs, 4, dtype=torch.int32
         )
+        self.oscar_reset_mask = self._make_buffer(
+            self.max_num_reqs, dtype=torch.bool
+        )
+        self.oscar_row_generations = self._make_buffer(
+            self.max_num_reqs, dtype=torch.int64
+        )
+        self._oscar_row_generations = np.zeros(
+            self.max_num_reqs, dtype=np.int64
+        )
+        self._oscar_bulk_flush_enabled = False
 
         self.encoder_seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         if self.dcp_world_size > 1:
@@ -2276,7 +2305,20 @@ class GPUModelRunner(
             self.oscar_hp_row_ids.np.fill(-1)
             self.oscar_prefix_page_ids.np.fill(-1)
             self.oscar_shared_hit_tokens.np.fill(0)
-            for req_id, hp_row in scheduler_output.oscar_hp_row_ids.items():
+            self.oscar_reset_mask.np.fill(False)
+            self.oscar_row_generations.np.fill(0)
+            req_ids = list(scheduler_output.oscar_hp_row_ids)
+            hp_rows = list(scheduler_output.oscar_hp_row_ids.values())
+            new_req_ids = {
+                request.req_id for request in scheduler_output.scheduled_new_reqs
+            }
+            reset, generations = update_oscar_bulk_flush_row_generations(
+                self._oscar_row_generations,
+                req_ids,
+                hp_rows,
+                new_req_ids,
+            )
+            for index, (req_id, hp_row) in enumerate(zip(req_ids, hp_rows)):
                 req_index = self.input_batch.req_id_to_index[req_id]
                 self.oscar_hp_row_ids.np[req_index] = hp_row
                 self.oscar_prefix_page_ids.np[req_index] = (
@@ -2285,9 +2327,13 @@ class GPUModelRunner(
                 self.oscar_shared_hit_tokens.np[req_index] = (
                     scheduler_output.oscar_shared_hit_tokens[req_id]
                 )
+                self.oscar_reset_mask.np[req_index] = reset[index]
+                self.oscar_row_generations.np[req_index] = generations[index]
             self.oscar_hp_row_ids.copy_to_gpu()
             self.oscar_prefix_page_ids.copy_to_gpu()
             self.oscar_shared_hit_tokens.copy_to_gpu()
+            self.oscar_reset_mask.copy_to_gpu()
+            self.oscar_row_generations.copy_to_gpu()
 
         # Compute optimistic seq_lens (assumes all draft tokens from previous
         # iteration accepted). Store in optimistic_seq_lens_cpu for use by
@@ -2803,8 +2849,27 @@ class GPUModelRunner(
                 if self.kv_cache_config.oscar_max_num_seqs is not None
                 else None
             ),
+            oscar_reset_mask=(
+                self.oscar_reset_mask.gpu[:num_reqs_padded]
+                if self.kv_cache_config.oscar_max_num_seqs is not None
+                else None
+            ),
+            oscar_row_generations=(
+                self.oscar_row_generations.gpu[:num_reqs_padded]
+                if self.kv_cache_config.oscar_max_num_seqs is not None
+                else None
+            ),
         )
-        if self.cache_config.cache_dtype == "oscar_mla_int2":
+        if len(kv_cache_groups) == 1 and isinstance(
+            kv_cache_groups[0].kv_cache_spec, OscarKVCacheSpec
+        ):
+            minimal_config = get_kv_cache_config_from_groups(
+                self.vllm_config,
+                kv_cache_groups,
+                available_memory=0,
+                oscar_profiling_quant_pages=min_blocks,
+            )
+        elif self.cache_config.cache_dtype == "oscar_mla_int2":
             oscar_spec = next(
                 spec
                 for group in kv_cache_groups
@@ -4830,6 +4895,11 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        validate_oscar_bulk_flush_scheduler_output(
+            self.vllm_config,
+            scheduler_output,
+            enabled=self._oscar_bulk_flush_enabled,
+        )
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -8509,13 +8579,15 @@ class GPUModelRunner(
             # Temporarily override the block count for a minimal profiling cache.
             saved_override = self.cache_config.num_gpu_blocks_override
             self.cache_config.num_gpu_blocks_override = min_blocks
-            minimal_config = get_kv_cache_config_from_groups(
-                self.vllm_config,
-                kv_cache_groups,
-                available_memory=0,
-                suppress_log=True,
-            )
-            self.cache_config.num_gpu_blocks_override = saved_override
+            try:
+                minimal_config = get_kv_cache_config_from_groups(
+                    self.vllm_config,
+                    kv_cache_groups,
+                    available_memory=0,
+                    suppress_log=True,
+                )
+            finally:
+                self.cache_config.num_gpu_blocks_override = saved_override
 
         self.initialize_kv_cache(minimal_config, is_profiling=True)
         self.cache_config.num_gpu_blocks = minimal_config.num_blocks
@@ -8561,6 +8633,10 @@ class GPUModelRunner(
             self.cross_layers_attn_backend = None
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()
+        clear_oscar_bulk_flush_state(
+            self.compilation_config.static_forward_context
+        )
+        self._oscar_bulk_flush_enabled = False
         if hasattr(self, "kv_cache_config"):
             delattr(self, "kv_cache_config")
         self.cache_config.num_gpu_blocks = None
@@ -9373,12 +9449,16 @@ class GPUModelRunner(
                     )
                     kernel_num_blocks = num_blocks * num_blocks_per_kv_block
 
+                    layer_cache_dtype_str = _get_layer_cache_dtype_str(
+                        kv_cache_spec,
+                        self.cache_config.cache_dtype,
+                    )
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
                         kernel_num_blocks,
                         kernel_block_size,
                         kv_cache_spec.num_kv_heads,
                         kv_cache_spec.head_size,
-                        cache_dtype_str=self.cache_config.cache_dtype,
+                        cache_dtype_str=layer_cache_dtype_str,
                     )
                     dtype = kv_cache_spec.dtype
                     try:
@@ -9500,6 +9580,7 @@ class GPUModelRunner(
             corresponding memory buffer for KV cache.
         """
 
+        self._oscar_bulk_flush_enabled = False
         # Try creating KV caches optimized for kv-connector transfers
         cache_dtype = self.cache_config.cache_dtype
         if self.use_uniform_kv_cache(self.attn_groups, cache_dtype):
@@ -9538,6 +9619,31 @@ class GPUModelRunner(
             self.kv_caches,
             num_attn_module,
         )
+        if is_oscar_bulk_flush_supported(self.vllm_config):
+            oscar_groups = [
+                group
+                for group in kv_cache_config.kv_cache_groups
+                if isinstance(group.kv_cache_spec, OscarKVCacheSpec)
+            ]
+            if len(oscar_groups) == 1:
+                group = oscar_groups[0]
+                if is_oscar_bulk_flush_target(
+                    group.kv_cache_spec, group.layer_names
+                ):
+                    state = register_oscar_bulk_flush_caches(
+                        kv_caches,
+                        group.layer_names,
+                        expected_recent_capacity=(
+                            group.kv_cache_spec.recent_row_capacity
+                        ),
+                        max_num_seqs=(
+                            self.vllm_config.scheduler_config.max_num_seqs
+                        ),
+                    )
+                    bind_oscar_bulk_flush_state(
+                        self.compilation_config.static_forward_context, state
+                    )
+                    self._oscar_bulk_flush_enabled = True
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(

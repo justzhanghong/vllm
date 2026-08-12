@@ -52,6 +52,7 @@ def _oscar_materialize_prefill_kv_kernel(
     VALUE_LEVELS: tl.constexpr,
     PREFIX_TOKENS: tl.constexpr,
     RECENT_TOKENS: tl.constexpr,
+    RECENT_CAPACITY: tl.constexpr,
     BLOCK_TOKENS: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -145,7 +146,10 @@ def _oscar_materialize_prefill_kv_kernel(
         other=0.0,
     )
     hp_row = tl.load(HP_rows_ptr + req_idx)
-    recent_idx = hp_row * RECENT_TOKENS + (token_offs - PREFIX_TOKENS) % RECENT_TOKENS
+    recent_idx = (
+        hp_row * RECENT_CAPACITY
+        + (token_offs - PREFIX_TOKENS) % RECENT_CAPACITY
+    )
     recent_base = (
         recent_idx.to(tl.int64) * stride_recent_slot
         + tl.cast(head_idx, tl.int64) * stride_recent_head
@@ -230,10 +234,12 @@ def oscar_materialize_prefill_kv(
     prefix_tokens: int,
     recent_tokens: int,
     max_seq_len: int,
+    recent_capacity: int | None = None,
 ) -> None:
     num_reqs = cached_lens.shape[0]
     head_dim = current_key.shape[-1]
     block_tokens = 8
+    recent_capacity = recent_capacity or recent_tokens
     grid = (
         num_reqs,
         current_key.shape[1],
@@ -283,6 +289,7 @@ def oscar_materialize_prefill_kv(
         VALUE_LEVELS=value_levels,
         PREFIX_TOKENS=prefix_tokens,
         RECENT_TOKENS=recent_tokens,
+        RECENT_CAPACITY=recent_capacity,
         BLOCK_TOKENS=block_tokens,
         BLOCK_D=triton.next_power_of_2(head_dim),
         num_warps=4,
@@ -365,6 +372,7 @@ def _oscar_cached_prefill_kernel(
     ATTN_SCALE: tl.constexpr,
     PREFIX_TOKENS: tl.constexpr,
     RECENT_TOKENS: tl.constexpr,
+    RECENT_CAPACITY: tl.constexpr,
     QUERY_HEADS_PER_PROGRAM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -494,7 +502,10 @@ def _oscar_cached_prefill_kernel(
     for start_n in range(recent_start, cached_len, BLOCK_N):
         n_offs = start_n + tl.arange(0, BLOCK_N)
         n_mask = n_offs < cached_len
-        recent_idx = hp_row * RECENT_TOKENS + (n_offs - PREFIX_TOKENS) % RECENT_TOKENS
+        recent_idx = (
+            hp_row * RECENT_CAPACITY
+            + (n_offs - PREFIX_TOKENS) % RECENT_CAPACITY
+        )
         recent_base = (
             recent_idx.to(tl.int64) * stride_recent_slot
             + tl.cast(kv_head, tl.int64) * stride_recent_head
@@ -593,12 +604,14 @@ def oscar_cached_prefill_attention(
     prefix_tokens: int,
     recent_tokens: int,
     max_query_len: int,
+    recent_capacity: int | None = None,
     v_rotation_t: torch.Tensor | None = None,
     output_dtype: torch.dtype | None = None,
     current_key: torch.Tensor | None = None,
     current_value: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_tokens, num_query_heads, head_dim = q_rot.shape
+    recent_capacity = recent_capacity or recent_tokens
     num_reqs = cached_lens.shape[0]
     num_kv_heads = kv_cache.shape[2]
     block_size = kv_cache.shape[1]
@@ -694,6 +707,7 @@ def oscar_cached_prefill_attention(
         ATTN_SCALE=scale,
         PREFIX_TOKENS=prefix_tokens,
         RECENT_TOKENS=recent_tokens,
+        RECENT_CAPACITY=recent_capacity,
         QUERY_HEADS_PER_PROGRAM=query_heads_per_program,
         BLOCK_M=block_m,
         BLOCK_N=block_n,

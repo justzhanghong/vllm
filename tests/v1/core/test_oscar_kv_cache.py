@@ -8,7 +8,6 @@ import pytest
 import torch
 
 from tests.v1.core.utils import create_requests, create_scheduler
-from vllm.platforms import current_platform
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -24,7 +23,10 @@ from vllm.v1.core.single_type_kv_cache_manager import OscarKVCacheManager
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCacheSpecKind,
+    KVQuantMode,
     OscarKVCacheSpec,
+    get_kv_cache_spec_kind,
 )
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
@@ -63,7 +65,11 @@ def test_oscar_spec_exposes_both_pool_page_sizes() -> None:
 
     assert spec.page_size_bytes == 9216
     assert spec.hp_page_size_bytes == 65536
+    assert spec.recent_tokens == 256
+    assert spec.flush_interval == 8
+    assert spec.recent_row_capacity == 272
     assert spec.max_memory_usage_bytes(config) == 512 * spec.page_size_bytes
+    assert get_kv_cache_spec_kind(spec) == KVCacheSpecKind.OSCAR
 
 
 def test_oscar_spec_merge_rejects_different_geometry() -> None:
@@ -110,7 +116,9 @@ def test_engine_config_uses_spec_quant_slot_size() -> None:
         budget,
     )
 
-    hp_bytes_per_layer = (64 + 256) * spec.num_kv_heads * 2 * spec.head_size * 2
+    hp_bytes_per_layer = (
+        64 + spec.recent_row_capacity
+    ) * spec.num_kv_heads * 2 * spec.head_size * 2
     quant_page_bytes_all_layers = len(layers) * spec.page_size_bytes
     expected_num_blocks = (
         budget - len(layers) * hp_bytes_per_layer
@@ -120,13 +128,73 @@ def test_engine_config_uses_spec_quant_slot_size() -> None:
     assert all(tensor.size == expected_per_layer for tensor in result.kv_cache_tensors)
 
 
+def test_engine_config_supports_minimal_cudagraph_profiling_cache() -> None:
+    spec = qwen3_spec()
+    layers = [f"model.layers.{i}.self_attn.attn" for i in range(36)]
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+    )
+
+    result = get_kv_cache_config_from_groups(
+        config,
+        [KVCacheGroupSpec(layer_names=layers, kv_cache_spec=spec)],
+        available_memory=0,
+        oscar_profiling_quant_pages=2,
+    )
+
+    hp_bytes_per_layer = (
+        64 + spec.recent_row_capacity
+    ) * spec.num_kv_heads * 2 * spec.head_size * 2
+    expected_per_layer = 2 * spec.page_size_bytes + hp_bytes_per_layer
+    assert result.num_blocks == 2
+    assert len(result.kv_cache_tensors) == 36
+    assert all(tensor.size == expected_per_layer for tensor in result.kv_cache_tensors)
+
+
+def test_engine_config_rejects_external_oscar_block_override() -> None:
+    spec = qwen3_spec()
+    layers = [f"model.layers.{i}.self_attn.attn" for i in range(36)]
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(num_gpu_blocks_override=2),
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+    )
+
+    with pytest.raises(ValueError, match="does not support"):
+        get_kv_cache_config_from_groups(
+            config,
+            [KVCacheGroupSpec(layer_names=layers, kv_cache_spec=spec)],
+            available_memory=10 * 1024**3,
+        )
+
+    config.cache_config.num_gpu_blocks_override = None
+    with pytest.raises(ValueError, match="must be positive"):
+        get_kv_cache_config_from_groups(
+            config,
+            [KVCacheGroupSpec(layer_names=layers, kv_cache_spec=spec)],
+            available_memory=0,
+            oscar_profiling_quant_pages=0,
+        )
+
+
+def test_oscar_reshape_uses_explicit_cache_dtype() -> None:
+    from vllm.v1.worker.gpu_model_runner import _get_layer_cache_dtype_str
+
+    assert _get_layer_cache_dtype_str(qwen3_spec(), "oscar_int2") == "oscar_int2"
+    generic = SimpleNamespace(
+        kv_quant_mode=KVQuantMode.NONE,
+        cache_dtype_str=None,
+    )
+    assert _get_layer_cache_dtype_str(generic, "oscar_int2") == "auto"
+
+
 def test_worker_reshape_splits_accounted_backing_into_three_tensors() -> None:
     spec = qwen3_spec()
     num_blocks = 8
     max_num_seqs = 1
     quant_bytes = num_blocks * spec.page_size_bytes
     prefix_bytes = 4 * spec.hp_page_size_bytes
-    recent_bytes = 16 * spec.hp_page_size_bytes
+    recent_bytes = 17 * spec.hp_page_size_bytes
     raw = torch.zeros(quant_bytes + prefix_bytes + recent_bytes, dtype=torch.int8)
 
     quant, prefix, recent = _reshape_oscar_kv_cache(
@@ -140,19 +208,51 @@ def test_worker_reshape_splits_accounted_backing_into_three_tensors() -> None:
 
     assert quant.shape == (8, 16, 8, 72)
     assert prefix.shape == (64, 8, 2, 128)
-    assert recent.shape == (256, 8, 2, 128)
+    assert recent.shape == (272, 8, 2, 128)
     assert quant.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
     assert prefix.storage_offset() * prefix.element_size() == quant_bytes
     assert recent.storage_offset() * recent.element_size() == quant_bytes + prefix_bytes
     assert quant.numel() + prefix.numel() * 2 + recent.numel() * 2 == raw.numel()
 
 
+def test_multirow_recent_physical_stride_preserves_ownership() -> None:
+    spec = qwen3_spec()
+    num_blocks = 8
+    max_num_seqs = 2
+    quant_bytes = num_blocks * spec.page_size_bytes
+    prefix_bytes = max_num_seqs * 4 * spec.hp_page_size_bytes
+    recent_bytes = max_num_seqs * 17 * spec.hp_page_size_bytes
+    raw = torch.zeros(quant_bytes + prefix_bytes + recent_bytes, dtype=torch.int8)
+
+    _, _, recent = _reshape_oscar_kv_cache(
+        raw,
+        spec,
+        (num_blocks, 16, 8, 72),
+        (0, 1, 2, 3),
+        num_blocks,
+        max_num_seqs,
+    )
+    row_capacity = spec.recent_row_capacity
+    row0 = recent[:row_capacity]
+    row1 = recent[row_capacity : 2 * row_capacity]
+    row0[-1].fill_(1)
+    row1[0].fill_(2)
+
+    assert recent.shape[0] == 544
+    assert row0.untyped_storage().data_ptr() == row1.untyped_storage().data_ptr()
+    assert row1.storage_offset() - row0.storage_offset() == (
+        row_capacity * row0.stride(0)
+    )
+    assert torch.all(row0[-1] == 1)
+    assert torch.all(row1[0] == 2)
+
+
 @pytest.mark.parametrize(
     ("max_num_seqs", "prefix_slots", "recent_slots", "quant_slots", "guaranteed"),
     [
-        (1, 64, 256, 515536, 515521),
-        (8, 512, 2048, 499600, 499480),
-        (48, 3072, 12288, 408576, 407856),
+        (1, 64, 272, 515424, 515409),
+        (8, 512, 2176, 498688, 498568),
+        (48, 3072, 13056, 403120, 402400),
     ],
 )
 def test_qwen3_10_gib_plan(
@@ -171,7 +271,7 @@ def test_qwen3_10_gib_plan(
     assert plan.recent_slots == recent_slots
     assert plan.quant_slots == quant_slots
     assert plan.guaranteed_quant_slots == guaranteed
-    expected_unused = {1: 77824, 8: 225280, 48: 262144}[max_num_seqs]
+    expected_unused = {1: 40960, 8: 262144, 48: 151552}[max_num_seqs]
     assert plan.unused_bytes == expected_unused
     assert plan.allocated_bytes + plan.unused_bytes == plan.total_memory_bytes
     assert plan.allocator_waste_fraction < 0.02
@@ -181,7 +281,7 @@ def test_single_request_capacity_target() -> None:
     plan = plan_oscar_kv_cache(qwen3_geometry(), 10 * 1024**3, 1)
 
     assert plan.bf16_slots == 72816
-    assert plan.physical_capacity_ratio == pytest.approx(7.079982421)
+    assert plan.physical_capacity_ratio == pytest.approx(7.078444298)
     assert plan.guaranteed_capacity_ratio >= 6.2
 
 
@@ -235,7 +335,7 @@ def test_request_start_rolls_back_on_recent_exhaustion() -> None:
 
     allocator.assert_consistent()
     assert len(allocator.prefix_pool.allocated_pages) == 4
-    assert len(allocator.recent_pool.allocated_pages) == 16
+    assert len(allocator.recent_pool.allocated_pages) == 17
 
 
 def test_hp_rows_define_stable_contiguous_request_ranges() -> None:
@@ -247,19 +347,19 @@ def test_hp_rows_define_stable_contiguous_request_ranges() -> None:
     assert (r0.hp_row, r0.prefix_pages, r0.recent_pages) == (
         0,
         (0, 1, 2, 3),
-        tuple(range(16)),
+        tuple(range(17)),
     )
     assert (r1.hp_row, r1.prefix_pages, r1.recent_pages) == (
         1,
         (4, 5, 6, 7),
-        tuple(range(16, 32)),
+        tuple(range(17, 34)),
     )
 
     allocator.finish_request("r0")
     r2 = allocator.start_request("r2")
     assert r2.hp_row == 0
     assert r2.prefix_pages == (0, 1, 2, 3)
-    assert r2.recent_pages == tuple(range(16))
+    assert r2.recent_pages == tuple(range(17))
     allocator.assert_consistent()
 
 
@@ -273,6 +373,7 @@ def test_oscar_manager_owns_and_reuses_hp_rows_with_quant_blocks() -> None:
         block_pool=block_pool,
         enable_caching=False,
         kv_cache_group_id=0,
+        scheduler_block_size=spec.block_size,
         max_num_seqs=2,
     )
 
@@ -299,6 +400,7 @@ def test_oscar_prefix_hit_stops_before_request_owned_recent() -> None:
         block_pool=block_pool,
         enable_caching=True,
         kv_cache_group_id=0,
+        scheduler_block_size=spec.block_size,
         max_num_seqs=1,
     )
     source, branch = create_requests(
@@ -350,6 +452,7 @@ def test_oscar_prefix_hit_waits_for_materialization_barrier() -> None:
         block_pool=block_pool,
         enable_caching=True,
         kv_cache_group_id=0,
+        scheduler_block_size=spec.block_size,
         max_num_seqs=1,
     )
     source, branch = create_requests(
@@ -396,6 +499,7 @@ def test_oscar_prefix_pages_follow_quant_block_lru_eviction() -> None:
         block_pool=block_pool,
         enable_caching=True,
         kv_cache_group_id=0,
+        scheduler_block_size=spec.block_size,
         max_num_seqs=1,
     )
     old, new = create_requests(
@@ -432,6 +536,7 @@ def test_oscar_prefix_eviction_discards_pending_readiness() -> None:
         block_pool=block_pool,
         enable_caching=True,
         kv_cache_group_id=0,
+        scheduler_block_size=spec.block_size,
         max_num_seqs=1,
     )
     old, new = create_requests(
@@ -466,6 +571,7 @@ def test_oscar_prefix_hit_shares_pages_but_recomputes_recent() -> None:
         block_pool=block_pool,
         enable_caching=True,
         kv_cache_group_id=0,
+        scheduler_block_size=spec.block_size,
         max_num_seqs=2,
     )
     source, branch = create_requests(
@@ -490,7 +596,7 @@ def test_oscar_prefix_hit_shares_pages_but_recomputes_recent() -> None:
     )[0]
     assert len(hit) == 16
 
-    manager.allocate_new_computed_blocks("branch", hit, 256, 0)
+    manager.add_local_computed_blocks("branch", hit, 256, 0)
     manager.allocate_new_blocks("branch", 512, 512)
     assert manager.get_shared_hit_tokens("branch") == 256
     assert manager.get_prefix_page_ids("branch") == manager.get_prefix_page_ids(
@@ -517,6 +623,7 @@ def test_oscar_extra_prefix_pages_delay_lru_eviction_and_reset() -> None:
         block_pool=block_pool,
         enable_caching=True,
         kv_cache_group_id=0,
+        scheduler_block_size=spec.block_size,
         max_num_seqs=1,
     )
     old, new = create_requests(
@@ -544,8 +651,7 @@ def test_oscar_extra_prefix_pages_delay_lru_eviction_and_reset() -> None:
     manager.assert_prefix_pages_consistent()
 
 
-def test_scheduler_preemption_releases_and_reuses_oscar_hp_rows(monkeypatch) -> None:
-    monkeypatch.setattr(type(current_platform), "device_type", "cpu")
+def test_scheduler_preemption_releases_and_reuses_oscar_hp_rows() -> None:
     spec = qwen3_spec()
     scheduler = create_scheduler(
         max_num_seqs=2,
@@ -563,6 +669,8 @@ def test_scheduler_preemption_releases_and_reuses_oscar_hp_rows(monkeypatch) -> 
     scheduler.kv_cache_manager = KVCacheManager(
         kv_cache_config=kv_cache_config,
         max_model_len=100,
+        max_num_batched_tokens=100,
+        scheduler_block_size=spec.block_size,
         hash_block_size=spec.block_size,
         enable_caching=False,
         log_stats=True,
@@ -739,5 +847,7 @@ def test_randomized_page_accounting_matches_reference() -> None:
         )
         assert len(allocator.quant_pool.allocated_pages) == expected_quant_pages, step
         assert len(allocator.prefix_pool.allocated_pages) == len(reference) * 4, step
-        assert len(allocator.recent_pool.allocated_pages) == len(reference) * 16, step
+        assert len(allocator.recent_pool.allocated_pages) == len(reference) * 17, (
+            step
+        )
         allocator.assert_consistent()

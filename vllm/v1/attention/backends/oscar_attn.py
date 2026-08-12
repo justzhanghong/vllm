@@ -42,6 +42,13 @@ from vllm.v1.attention.backends.fa_utils import (
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
+from vllm.v1.attention.ops.triton_oscar_bulk_flush import (
+    OscarBulkFlushPlan,
+    is_oscar_bulk_flush_supported,
+    is_oscar_bulk_flush_target,
+    oscar_bulk_flush,
+    prepare_oscar_bulk_flush_plan,
+)
 from vllm.v1.attention.ops.triton_oscar_decode import (
     materialize_oscar_slot_ids,
     oscar_decode_attention,
@@ -165,6 +172,8 @@ class OscarMetadata(AttentionMetadata):
     num_decode_tokens: int = 0
     query_start_loc_cpu: torch.Tensor | None = None
     seq_lens_cpu: torch.Tensor | None = None
+    bulk_flush_plan: OscarBulkFlushPlan | None = None
+    bulk_flush_enabled: bool = False
 
 
 class OscarMetadataBuilder(AttentionMetadataBuilder[OscarMetadata]):
@@ -205,6 +214,37 @@ class OscarMetadataBuilder(AttentionMetadataBuilder[OscarMetadata]):
             device=device,
         )
         self._block_size = kv_cache_spec.block_size
+        self._bulk_flush_enabled = is_oscar_bulk_flush_supported(
+            vllm_config
+        ) and is_oscar_bulk_flush_target(kv_cache_spec, layer_names)
+        self._flush_interval = getattr(kv_cache_spec, "flush_interval", 8)
+        self._prefix_tokens = getattr(kv_cache_spec, "prefix_tokens", 64)
+        self._recent_tokens = getattr(kv_cache_spec, "recent_tokens", 256)
+        self._recent_capacity = getattr(
+            kv_cache_spec,
+            "recent_row_capacity",
+            self._recent_tokens,
+        )
+        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        self.flush_phase = torch.zeros(max_num_seqs, dtype=torch.int32, device=device)
+        self.row_generations = torch.full(
+            (max_num_seqs,), -1, dtype=torch.int64, device=device
+        )
+        self.recent_extra = torch.zeros(
+            max_num_seqs, dtype=torch.int32, device=device
+        )
+        plan_shape = (max_num_seqs, self._flush_interval)
+        self.flush_positions = torch.full(
+            plan_shape, -1, dtype=torch.int32, device=device
+        )
+        self.flush_src_slots = torch.full(
+            plan_shape, -1, dtype=torch.int64, device=device
+        )
+        self.flush_dst_slots = torch.full(
+            plan_shape, -1, dtype=torch.int64, device=device
+        )
+        self.flush_valid = torch.zeros(plan_shape, dtype=torch.bool, device=device)
+        self._building_for_capture = False
         self.physical_slot_ids = torch.full(
             (
                 vllm_config.scheduler_config.max_num_seqs,
@@ -234,7 +274,11 @@ class OscarMetadataBuilder(AttentionMetadataBuilder[OscarMetadata]):
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> OscarMetadata:
-        m = self.build(0, common_attn_metadata)
+        self._building_for_capture = True
+        try:
+            m = self.build(0, common_attn_metadata)
+        finally:
+            self._building_for_capture = False
         if common_attn_metadata.max_query_len <= 1:
             m.seq_lens.fill_(1)
         return m
@@ -281,6 +325,47 @@ class OscarMetadataBuilder(AttentionMetadataBuilder[OscarMetadata]):
                 physical_slot_ids,
                 self._block_size,
             )
+        bulk_flush_plan = None
+        if self._bulk_flush_enabled and num_decodes:
+            if self._building_for_capture:
+                self.recent_extra[:num_decodes].zero_()
+                self.flush_positions[:num_decodes].fill_(-1)
+                self.flush_src_slots[:num_decodes].fill_(-1)
+                self.flush_dst_slots[:num_decodes].fill_(-1)
+                self.flush_valid[:num_decodes].zero_()
+                bulk_flush_plan = OscarBulkFlushPlan(
+                    next_phase=self.recent_extra[:num_decodes],
+                    recent_extra=self.recent_extra[:num_decodes],
+                    positions=self.flush_positions[:num_decodes],
+                    src_recent_slots=self.flush_src_slots[:num_decodes],
+                    dst_slots=self.flush_dst_slots[:num_decodes],
+                    valid=self.flush_valid[:num_decodes],
+                )
+            else:
+                if cam.oscar_reset_mask is None or cam.oscar_row_generations is None:
+                    raise RuntimeError(
+                        "OSCAR bulk flush requires reset mask and row generations"
+                    )
+                bulk_flush_plan = prepare_oscar_bulk_flush_plan(
+                    phase=self.flush_phase,
+                    row_generations=self.row_generations,
+                    reset_mask=cam.oscar_reset_mask[:num_decodes],
+                    request_generations=cam.oscar_row_generations[:num_decodes],
+                    cached_lens=self.cached_lens[:num_decodes],
+                    hp_row_ids=cam.oscar_hp_row_ids[:num_decodes],
+                    shared_hit_tokens=cam.oscar_shared_hit_tokens[:num_decodes],
+                    block_table=cam.block_table_tensor[:num_decodes],
+                    recent_extra=self.recent_extra,
+                    positions=self.flush_positions,
+                    src_recent_slots=self.flush_src_slots,
+                    dst_slots=self.flush_dst_slots,
+                    valid=self.flush_valid,
+                    prefix_tokens=self._prefix_tokens,
+                    recent_tokens=self._recent_tokens,
+                    recent_capacity=self._recent_capacity,
+                    block_size=self._block_size,
+                    flush_interval=self._flush_interval,
+                )
         return OscarMetadata(
             seq_lens=cam.seq_lens,
             slot_mapping=cam.slot_mapping,
@@ -301,6 +386,8 @@ class OscarMetadataBuilder(AttentionMetadataBuilder[OscarMetadata]):
             num_decode_tokens=num_decode_tokens,
             query_start_loc_cpu=cam.query_start_loc_cpu,
             seq_lens_cpu=cam.seq_lens_cpu_upper_bound,
+            bulk_flush_plan=bulk_flush_plan,
+            bulk_flush_enabled=self._bulk_flush_enabled,
         )
 
 
@@ -334,6 +421,7 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
         self.max_num_kv_splits = (
             vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
         )
+        self._max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         self._materialize_max_tokens = _materialize_token_capacity(
             vllm_config,
             self.num_kv_heads,
@@ -408,24 +496,45 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
         else:
             v_rot = rotated_value
 
-        oscar_store(
-            k_rot,
-            v_rot,
-            quant_cache,
-            attn_metadata.slot_mapping[:num_tokens],
-            key_levels=self.cfg.key_levels,
-            value_levels=self.cfg.value_levels,
-            key_packed_size=self.cfg.key_packed_size,
-            data_bytes=self.cfg.key_data_bytes,
-            k_clip_ratio=self.cfg.k_clip_ratio,
-            v_clip_ratio=self.cfg.v_clip_ratio,
-            token_to_req_indices=attn_metadata.token_to_req_indices,
-            query_start_loc=attn_metadata.query_start_loc,
-            seq_lens=attn_metadata.seq_lens,
-            prefix_tokens=self.cfg.prefix_tokens,
-            recent_tokens=self.cfg.recent_tokens,
+        bulk_flush = (
+            attn_metadata.bulk_flush_enabled
+            and demote_recent
+            and attn_metadata.bulk_flush_plan is not None
         )
-        if demote_recent:
+        if bulk_flush:
+            state = getattr(layer, "_oscar_bulk_flush_state", None)
+            if state is None or attn_metadata.bulk_flush_plan is None:
+                raise RuntimeError("OSCAR bulk flush cache state is not registered")
+            if getattr(layer, "_oscar_bulk_flush_owner", False):
+                oscar_bulk_flush(
+                    state,
+                    attn_metadata.bulk_flush_plan,
+                    key_levels=self.cfg.key_levels,
+                    value_levels=self.cfg.value_levels,
+                    key_packed_size=self.cfg.key_packed_size,
+                    data_bytes=self.cfg.key_data_bytes,
+                    k_clip_ratio=self.cfg.k_clip_ratio,
+                    v_clip_ratio=self.cfg.v_clip_ratio,
+                )
+        else:
+            oscar_store(
+                k_rot,
+                v_rot,
+                quant_cache,
+                attn_metadata.slot_mapping[:num_tokens],
+                key_levels=self.cfg.key_levels,
+                value_levels=self.cfg.value_levels,
+                key_packed_size=self.cfg.key_packed_size,
+                data_bytes=self.cfg.key_data_bytes,
+                k_clip_ratio=self.cfg.k_clip_ratio,
+                v_clip_ratio=self.cfg.v_clip_ratio,
+                token_to_req_indices=attn_metadata.token_to_req_indices,
+                query_start_loc=attn_metadata.query_start_loc,
+                seq_lens=attn_metadata.seq_lens,
+                prefix_tokens=self.cfg.prefix_tokens,
+                recent_tokens=self.cfg.recent_tokens,
+            )
+        if demote_recent and not bulk_flush:
             oscar_demote_hp(
                 recent_cache,
                 quant_cache,
@@ -437,6 +546,7 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
                 max_query_len=attn_metadata.max_query_len,
                 prefix_tokens=self.cfg.prefix_tokens,
                 recent_tokens=self.cfg.recent_tokens,
+                recent_capacity=recent_cache.shape[0] // self._max_num_seqs,
                 key_levels=self.cfg.key_levels,
                 value_levels=self.cfg.value_levels,
                 key_packed_size=self.cfg.key_packed_size,
@@ -458,6 +568,7 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
             prefix_block_size=quant_cache.shape[1],
             prefix_tokens=self.cfg.prefix_tokens,
             recent_tokens=self.cfg.recent_tokens,
+            recent_capacity=recent_cache.shape[0] // self._max_num_seqs,
         )
         logger.info_once(
             "OSCAR Triton KV write active: prefix=%d BF16, recent=%d BF16, "
@@ -575,6 +686,8 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
                 max_query_len=1,
                 max_seq_len=attn_metadata.max_seq_len,
                 is_prefill=False,
+                bulk_flush_plan=attn_metadata.bulk_flush_plan,
+                bulk_flush_enabled=attn_metadata.bulk_flush_enabled,
             )
             self._update_mixed_cache(
                 layer,
@@ -818,6 +931,7 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
             value_data_bytes=self.cfg.value_data_bytes,
             prefix_tokens=self.cfg.prefix_tokens,
             recent_tokens=self.cfg.recent_tokens,
+            recent_capacity=recent_cache.shape[0] // self._max_num_seqs,
             max_query_len=attn_metadata.max_query_len,
             v_rotation_t=None if v_rotation_absorbed else layer._oscar_RvT,
             output_dtype=query.dtype if v_rotation_absorbed else None,
@@ -899,6 +1013,7 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
             value_data_bytes=self.cfg.value_data_bytes,
             prefix_tokens=self.cfg.prefix_tokens,
             recent_tokens=self.cfg.recent_tokens,
+            recent_capacity=recent_cache.shape[0] // self._max_num_seqs,
             max_seq_len=attn_metadata.max_seq_len,
         )
         q_rotation = getattr(layer, "_oscar_Rk_fast", None)
@@ -1003,6 +1118,12 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
             physical_slot_ids=attn_metadata.physical_slot_ids,
             prefix_tokens=self.cfg.prefix_tokens,
             recent_tokens=self.cfg.recent_tokens,
+            recent_capacity=recent_cache.shape[0] // self._max_num_seqs,
+            recent_extra=(
+                attn_metadata.bulk_flush_plan.recent_extra
+                if attn_metadata.bulk_flush_plan is not None
+                else None
+            ),
             v_rotation_t=layer._oscar_RvT,
         )
         assert isinstance(out_rot, torch.Tensor)

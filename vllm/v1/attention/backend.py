@@ -382,6 +382,8 @@ class CommonAttentionMetadata:
     oscar_hp_row_ids: torch.Tensor | None = None
     oscar_prefix_page_ids: torch.Tensor | None = None
     oscar_shared_hit_tokens: torch.Tensor | None = None
+    oscar_reset_mask: torch.Tensor | None = None
+    oscar_row_generations: torch.Tensor | None = None
 
     causal: bool = True
 
@@ -496,6 +498,8 @@ class CommonAttentionMetadata:
             oscar_hp_row_ids=maybe_slice_reqs(self.oscar_hp_row_ids),
             oscar_prefix_page_ids=maybe_slice_reqs(self.oscar_prefix_page_ids),
             oscar_shared_hit_tokens=maybe_slice_reqs(self.oscar_shared_hit_tokens),
+            oscar_reset_mask=maybe_slice_reqs(self.oscar_reset_mask),
+            oscar_row_generations=maybe_slice_reqs(self.oscar_row_generations),
         )
 
 

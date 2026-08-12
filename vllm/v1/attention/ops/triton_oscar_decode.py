@@ -98,6 +98,7 @@ def _oscar_decode_stage1(
     Prefix_pages_ptr,  # [B, prefix_pages] int32
     Query_to_req_ptr,  # [B] int32 when multiple queries share a request
     Shared_hit_lens_ptr,  # [requests] int32 initial locally shared hit length
+    Recent_extra_ptr,  # [requests] int32 pending BF16 tokens beyond logical recent
     Block_table_ptr,  # [B, max_num_blocks] int32
     Seq_lens_ptr,  # [B] int32
     Mid_o_ptr,  # [B, Hq, NUM_KV_SPLITS, D+1] fp32
@@ -133,6 +134,7 @@ def _oscar_decode_stage1(
     USE_PREFIX_PAGE_TABLE: tl.constexpr,
     PREFIX_TOKENS: tl.constexpr,
     RECENT_TOKENS: tl.constexpr,
+    RECENT_CAPACITY: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_KV: tl.constexpr,
 ):
@@ -146,6 +148,9 @@ def _oscar_decode_stage1(
     hp_row = 0
     if MIXED_KV:
         hp_row = tl.load(HP_rows_ptr + req_idx)
+        recent_extra = tl.load(Recent_extra_ptr + req_idx)
+    else:
+        recent_extra = 0
 
     split_len = tl.cdiv(seq_len, NUM_KV_SPLITS)
     split_start = split_len * sid
@@ -192,7 +197,8 @@ def _oscar_decode_stage1(
         if MIXED_KV:
             shared_hit_len = tl.load(Shared_hit_lens_ptr + req_idx)
             recent_start = tl.maximum(
-                tl.maximum(PREFIX_TOKENS, shared_hit_len), seq_len - RECENT_TOKENS
+                tl.maximum(PREFIX_TOKENS, shared_hit_len),
+                seq_len - RECENT_TOKENS - recent_extra,
             )
             is_hp = kv_mask & ((kv_offs < PREFIX_TOKENS) | (kv_offs >= recent_start))
         else:
@@ -237,7 +243,8 @@ def _oscar_decode_stage1(
                 other=0,
             ).to(tl.float32)
             recent_idx = (
-                hp_row * RECENT_TOKENS + (kv_offs - PREFIX_TOKENS) % RECENT_TOKENS
+                hp_row * RECENT_CAPACITY
+                + (kv_offs - PREFIX_TOKENS) % RECENT_CAPACITY
             )
             recent_base = (
                 recent_idx.to(tl.int64) * stride_recent_slot
@@ -331,6 +338,7 @@ def _oscar_decode_stage1_grouped_h4(
     Prefix_pages_ptr,
     Query_to_req_ptr,
     Shared_hit_lens_ptr,
+    Recent_extra_ptr,
     Block_table_ptr,
     Seq_lens_ptr,
     Mid_o_ptr,
@@ -366,6 +374,7 @@ def _oscar_decode_stage1_grouped_h4(
     USE_PREFIX_PAGE_TABLE: tl.constexpr,
     PREFIX_TOKENS: tl.constexpr,
     RECENT_TOKENS: tl.constexpr,
+    RECENT_CAPACITY: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_KV: tl.constexpr,
 ):
@@ -379,6 +388,9 @@ def _oscar_decode_stage1_grouped_h4(
     hp_row = 0
     if MIXED_KV:
         hp_row = tl.load(HP_rows_ptr + req_idx)
+        recent_extra = tl.load(Recent_extra_ptr + req_idx)
+    else:
+        recent_extra = 0
 
     split_len = tl.cdiv(seq_len, NUM_KV_SPLITS)
     split_start = split_len * sid
@@ -441,7 +453,8 @@ def _oscar_decode_stage1_grouped_h4(
         if MIXED_KV:
             shared_hit_len = tl.load(Shared_hit_lens_ptr + req_idx)
             recent_start = tl.maximum(
-                tl.maximum(PREFIX_TOKENS, shared_hit_len), seq_len - RECENT_TOKENS
+                tl.maximum(PREFIX_TOKENS, shared_hit_len),
+                seq_len - RECENT_TOKENS - recent_extra,
             )
             is_hp = kv_mask & ((kv_offs < PREFIX_TOKENS) | (kv_offs >= recent_start))
         else:
@@ -486,7 +499,8 @@ def _oscar_decode_stage1_grouped_h4(
                 other=0,
             ).to(tl.float32)
             recent_idx = (
-                hp_row * RECENT_TOKENS + (kv_offs - PREFIX_TOKENS) % RECENT_TOKENS
+                hp_row * RECENT_CAPACITY
+                + (kv_offs - PREFIX_TOKENS) % RECENT_CAPACITY
             )
             recent_base = (
                 recent_idx.to(tl.int64) * stride_recent_slot
@@ -610,6 +624,7 @@ def _oscar_decode_stage1_grouped_h4_qk(
     Prefix_pages_ptr,
     Query_to_req_ptr,
     Shared_hit_lens_ptr,
+    Recent_extra_ptr,
     Block_table_ptr,
     Seq_lens_ptr,
     Score_ptr,
@@ -639,6 +654,7 @@ def _oscar_decode_stage1_grouped_h4_qk(
     USE_PREFIX_PAGE_TABLE: tl.constexpr,
     PREFIX_TOKENS: tl.constexpr,
     RECENT_TOKENS: tl.constexpr,
+    RECENT_CAPACITY: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_KV: tl.constexpr,
 ):
@@ -653,6 +669,9 @@ def _oscar_decode_stage1_grouped_h4_qk(
     hp_row = 0
     if MIXED_KV:
         hp_row = tl.load(HP_rows_ptr + req_idx)
+        recent_extra = tl.load(Recent_extra_ptr + req_idx)
+    else:
+        recent_extra = 0
 
     split_len = tl.cdiv(seq_len, NUM_KV_SPLITS)
     split_start = split_len * sid
@@ -702,7 +721,8 @@ def _oscar_decode_stage1_grouped_h4_qk(
         if MIXED_KV:
             shared_hit_len = tl.load(Shared_hit_lens_ptr + req_idx)
             recent_start = tl.maximum(
-                tl.maximum(PREFIX_TOKENS, shared_hit_len), seq_len - RECENT_TOKENS
+                tl.maximum(PREFIX_TOKENS, shared_hit_len),
+                seq_len - RECENT_TOKENS - recent_extra,
             )
             is_hp = kv_mask & ((kv_offs < PREFIX_TOKENS) | (kv_offs >= recent_start))
         else:
@@ -747,7 +767,8 @@ def _oscar_decode_stage1_grouped_h4_qk(
                 other=0,
             ).to(tl.float32)
             recent_idx = (
-                hp_row * RECENT_TOKENS + (kv_offs - PREFIX_TOKENS) % RECENT_TOKENS
+                hp_row * RECENT_CAPACITY
+                + (kv_offs - PREFIX_TOKENS) % RECENT_CAPACITY
             )
             recent_base = (
                 recent_idx.to(tl.int64) * stride_recent_slot
@@ -830,6 +851,7 @@ def _oscar_decode_stage1_grouped_h4_v(
     Prefix_pages_ptr,
     Query_to_req_ptr,
     Shared_hit_lens_ptr,
+    Recent_extra_ptr,
     Block_table_ptr,
     Seq_lens_ptr,
     Score_ptr,
@@ -863,6 +885,7 @@ def _oscar_decode_stage1_grouped_h4_v(
     USE_PREFIX_PAGE_TABLE: tl.constexpr,
     PREFIX_TOKENS: tl.constexpr,
     RECENT_TOKENS: tl.constexpr,
+    RECENT_CAPACITY: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_KV: tl.constexpr,
 ):
@@ -877,6 +900,9 @@ def _oscar_decode_stage1_grouped_h4_v(
     hp_row = 0
     if MIXED_KV:
         hp_row = tl.load(HP_rows_ptr + req_idx)
+        recent_extra = tl.load(Recent_extra_ptr + req_idx)
+    else:
+        recent_extra = 0
 
     split_len = tl.cdiv(seq_len, NUM_KV_SPLITS)
     split_start = split_len * sid
@@ -923,7 +949,8 @@ def _oscar_decode_stage1_grouped_h4_v(
         if MIXED_KV:
             shared_hit_len = tl.load(Shared_hit_lens_ptr + req_idx)
             recent_start = tl.maximum(
-                tl.maximum(PREFIX_TOKENS, shared_hit_len), seq_len - RECENT_TOKENS
+                tl.maximum(PREFIX_TOKENS, shared_hit_len),
+                seq_len - RECENT_TOKENS - recent_extra,
             )
             is_hp = kv_mask & ((kv_offs < PREFIX_TOKENS) | (kv_offs >= recent_start))
         else:
@@ -1009,7 +1036,8 @@ def _oscar_decode_stage1_grouped_h4_v(
                 + tl.cast(kv_head, tl.int64) * stride_prefix_head
             )
             recent_idx = (
-                hp_row * RECENT_TOKENS + (kv_offs - PREFIX_TOKENS) % RECENT_TOKENS
+                hp_row * RECENT_CAPACITY
+                + (kv_offs - PREFIX_TOKENS) % RECENT_CAPACITY
             )
             recent_base = (
                 recent_idx.to(tl.int64) * stride_recent_slot
@@ -1088,6 +1116,7 @@ def _oscar_decode_quant_stage1_grouped_h4(
     KV_meta_ptr,
     Query_to_req_ptr,
     Shared_hit_lens_ptr,
+    Recent_extra_ptr,
     Physical_slot_ids_ptr,
     Seq_lens_ptr,
     Mid_o_ptr,
@@ -1126,12 +1155,13 @@ def _oscar_decode_quant_stage1_grouped_h4(
     quant_end = seq_len
     if MIXED_KV:
         shared_hit_len = tl.load(Shared_hit_lens_ptr + req_idx)
+        recent_extra = tl.load(Recent_extra_ptr + req_idx)
         quant_start = tl.minimum(PREFIX_TOKENS, seq_len)
         quant_end = tl.minimum(
             seq_len,
             tl.maximum(
                 tl.maximum(PREFIX_TOKENS, shared_hit_len),
-                seq_len - RECENT_TOKENS,
+                seq_len - RECENT_TOKENS - recent_extra,
             ),
         )
     quant_len = tl.maximum(quant_end - quant_start, 0)
@@ -1283,6 +1313,7 @@ def _oscar_decode_hp_stage1(
     Prefix_pages_ptr,
     Query_to_req_ptr,
     Shared_hit_lens_ptr,
+    Recent_extra_ptr,
     Seq_lens_ptr,
     Mid_o_ptr,
     stride_qb,
@@ -1306,6 +1337,7 @@ def _oscar_decode_hp_stage1(
     USE_PREFIX_PAGE_TABLE: tl.constexpr,
     PREFIX_TOKENS: tl.constexpr,
     RECENT_TOKENS: tl.constexpr,
+    RECENT_CAPACITY: tl.constexpr,
     NUM_HP_SPLITS: tl.constexpr,
     HP_PARTIAL_START: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -1348,10 +1380,14 @@ def _oscar_decode_hp_stage1(
     seq_len = tl.load(Seq_lens_ptr + bid)
     hp_row = tl.load(HP_rows_ptr + req_idx)
     shared_hit_len = tl.load(Shared_hit_lens_ptr + req_idx)
+    recent_extra = tl.load(Recent_extra_ptr + req_idx)
     prefix_len = tl.minimum(PREFIX_TOKENS, seq_len)
     recent_start = tl.minimum(
         seq_len,
-        tl.maximum(tl.maximum(PREFIX_TOKENS, shared_hit_len), seq_len - RECENT_TOKENS),
+        tl.maximum(
+            tl.maximum(PREFIX_TOKENS, shared_hit_len),
+            seq_len - RECENT_TOKENS - recent_extra,
+        ),
     )
     hp_len = prefix_len + seq_len - recent_start
     split_len = tl.cdiv(tl.cdiv(hp_len, NUM_HP_SPLITS), BLOCK_N) * BLOCK_N
@@ -1394,7 +1430,8 @@ def _oscar_decode_hp_stage1(
             other=0.0,
         )
         recent_idx = (
-            hp_row * RECENT_TOKENS + (logical_pos - PREFIX_TOKENS) % RECENT_TOKENS
+            hp_row * RECENT_CAPACITY
+            + (logical_pos - PREFIX_TOKENS) % RECENT_CAPACITY
         )
         recent_base = (
             recent_idx.to(tl.int64) * stride_recent_slot
@@ -1704,6 +1741,8 @@ def oscar_decode_attention(
     prefix_page_ids: torch.Tensor | None = None,
     prefix_tokens: int | None = None,
     recent_tokens: int | None = None,
+    recent_capacity: int | None = None,
+    recent_extra: torch.Tensor | None = None,
     v_rotation_t: torch.Tensor | None = None,
     query_to_req_indices: torch.Tensor | None = None,
     shared_hit_tokens: torch.Tensor | None = None,
@@ -1762,6 +1801,7 @@ def oscar_decode_attention(
         hp_row_ids = seq_lens
     prefix_tokens = prefix_tokens or 0
     recent_tokens = recent_tokens or 1
+    recent_capacity = recent_capacity or recent_tokens
     if prefix_page_ids is None:
         prefix_page_ids = hp_row_ids
     elif prefix_page_ids.ndim != 2:
@@ -1774,6 +1814,10 @@ def oscar_decode_attention(
         shared_hit_tokens = torch.zeros_like(hp_row_ids)
     elif shared_hit_tokens.ndim != 1:
         raise ValueError("OSCAR shared hit lengths must be a 1D tensor")
+    if recent_extra is None:
+        recent_extra = torch.zeros_like(hp_row_ids)
+    elif recent_extra.ndim != 1:
+        raise ValueError("OSCAR recent extra lengths must be a 1D tensor")
     if grouped_h4:
         assert physical_slot_ids is not None
         if physical_slot_ids.ndim != 2:
@@ -1809,6 +1853,7 @@ def oscar_decode_attention(
             kv_cache.view(torch.bfloat16),
             query_to_req_indices,
             shared_hit_tokens,
+            recent_extra,
             physical_slot_ids,
             seq_lens,
             mid_o,
@@ -1844,6 +1889,7 @@ def oscar_decode_attention(
             prefix_page_ids,
             query_to_req_indices,
             shared_hit_tokens,
+            recent_extra,
             seq_lens,
             mid_o,
             q_rot.stride(0),
@@ -1867,6 +1913,7 @@ def oscar_decode_attention(
             USE_PREFIX_PAGE_TABLE=use_prefix_page_table,
             PREFIX_TOKENS=prefix_tokens,
             RECENT_TOKENS=recent_tokens,
+            RECENT_CAPACITY=recent_capacity,
             NUM_HP_SPLITS=NUM_HP_SPLITS,
             HP_PARTIAL_START=NUM_KV_SPLITS,
             BLOCK_D=BLOCK_D,
@@ -1887,6 +1934,7 @@ def oscar_decode_attention(
             prefix_page_ids,
             query_to_req_indices,
             shared_hit_tokens,
+            recent_extra,
             block_table,
             seq_lens,
             mid_o,
@@ -1922,6 +1970,7 @@ def oscar_decode_attention(
             USE_PREFIX_PAGE_TABLE=use_prefix_page_table,
             PREFIX_TOKENS=prefix_tokens,
             RECENT_TOKENS=recent_tokens,
+            RECENT_CAPACITY=recent_capacity,
             BLOCK_D=BLOCK_D,
             BLOCK_KV=64,
             num_warps=2,

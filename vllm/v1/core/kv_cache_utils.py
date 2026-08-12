@@ -1124,6 +1124,8 @@ def get_kv_cache_config_from_groups(
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
     suppress_log: bool = False,
+    *,
+    oscar_profiling_quant_pages: int | None = None,
 ) -> KVCacheConfig:
     """
     Generate the KV cache configuration from the KV cache groups and spec
@@ -1191,23 +1193,53 @@ def get_kv_cache_config_from_groups(
             block_size=spec.block_size,
             prefix_tokens=spec.prefix_tokens,
             recent_tokens=spec.recent_tokens,
+            flush_interval=spec.flush_interval,
             hp_element_size=get_dtype_size(spec.hp_dtype),
         )
         oscar_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        plan = plan_oscar_kv_cache(
-            geometry,
-            available_memory,
-            oscar_max_num_seqs,
-            spec.prefix_cache_extra_tokens,
-        )
-        per_layer_size = plan.allocated_bytes // geometry.num_layers
-        assert per_layer_size * geometry.num_layers == plan.allocated_bytes
-        num_blocks = plan.quant_pages
+        if oscar_profiling_quant_pages is None:
+            plan = plan_oscar_kv_cache(
+                geometry,
+                available_memory,
+                oscar_max_num_seqs,
+                spec.prefix_cache_extra_tokens,
+            )
+            per_layer_size = plan.allocated_bytes // geometry.num_layers
+            assert per_layer_size * geometry.num_layers == plan.allocated_bytes
+            num_blocks = plan.quant_pages
+        else:
+            if available_memory != 0:
+                raise ValueError(
+                    "OSCAR profiling cache requires zero available memory"
+                )
+            if oscar_profiling_quant_pages <= 0:
+                raise ValueError(
+                    "OSCAR profiling quant page count must be positive"
+                )
+            prefix_pages = oscar_max_num_seqs * (
+                spec.prefix_tokens // spec.block_size
+            ) + cdiv(spec.prefix_cache_extra_tokens, spec.block_size)
+            recent_pages = oscar_max_num_seqs * (
+                spec.recent_row_capacity // spec.block_size
+            )
+            num_blocks = oscar_profiling_quant_pages
+            per_layer_size = (
+                num_blocks * spec.page_size_bytes
+                + (prefix_pages + recent_pages) * spec.hp_page_size_bytes
+            )
         kv_cache_tensors = [
             KVCacheTensor(size=per_layer_size, shared_by=[layer_name])
             for layer_name in group.layer_names
         ]
-        if not suppress_log:
+        if oscar_profiling_quant_pages is not None:
+            logger.info(
+                "OSCAR CUDA Graph profiling cache: INT2 history=%d tokens, "
+                "BF16 prefix=%d tokens, BF16 recent=%d tokens",
+                num_blocks * spec.block_size,
+                prefix_pages * spec.block_size,
+                recent_pages * spec.block_size,
+            )
+        elif not suppress_log:
             logger.info(
                 "OSCAR KV pools: INT2 history=%d tokens (%s GiB), BF16 "
                 "prefix=%d tokens (%s GiB), BF16 recent=%d tokens (%s GiB), "

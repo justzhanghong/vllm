@@ -24,6 +24,7 @@ class OscarKVCacheGeometry:
     block_size: int = 16
     prefix_tokens: int = 64
     recent_tokens: int = 256
+    flush_interval: int = 8
     key_bits: int = 2
     value_bits: int = 2
     hp_element_size: int = 2
@@ -38,6 +39,7 @@ class OscarKVCacheGeometry:
             "group_size": self.group_size,
             "block_size": self.block_size,
             "hp_element_size": self.hp_element_size,
+            "flush_interval": self.flush_interval,
         }
         invalid = [name for name, value in positive.items() if value <= 0]
         if invalid:
@@ -67,6 +69,13 @@ class OscarKVCacheGeometry:
     @property
     def hp_page_bytes(self) -> int:
         return self.block_size * self.hp_token_bytes
+
+    @property
+    def recent_row_capacity(self) -> int:
+        """Physical BF16 row capacity; logical recent remains unchanged."""
+        return cdiv(
+            self.recent_tokens + self.flush_interval - 1, self.block_size
+        ) * self.block_size
 
 
 @dataclass(frozen=True)
@@ -149,7 +158,7 @@ def plan_oscar_kv_cache(
     prefix_pages = (
         max_num_seqs * (geometry.prefix_tokens // block_size) + extra_prefix_pages
     )
-    recent_pages = max_num_seqs * (geometry.recent_tokens // block_size)
+    recent_pages = max_num_seqs * (geometry.recent_row_capacity // block_size)
     hp_bytes = (prefix_pages + recent_pages) * geometry.hp_page_bytes
     if hp_bytes >= total_memory_bytes:
         raise OscarKVCacheCapacityError(
@@ -294,7 +303,7 @@ class OscarKVPageAllocator:
             raise RuntimeError(f"duplicate OSCAR request: {request_id}")
         geometry = self.plan.geometry
         prefix_count = geometry.prefix_tokens // geometry.block_size
-        recent_count = geometry.recent_tokens // geometry.block_size
+        recent_count = geometry.recent_row_capacity // geometry.block_size
         hp_row = self.hp_rows.allocate(request_id)
         prefix_start = hp_row * prefix_count
         recent_start = hp_row * recent_count
