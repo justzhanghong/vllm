@@ -50,6 +50,7 @@ from vllm.v1.attention.ops.triton_oscar_bulk_flush import (
     prepare_oscar_bulk_flush_plan,
 )
 from vllm.v1.attention.ops.triton_oscar_decode import (
+    is_oscar_grouped_h4_eligible,
     materialize_oscar_slot_ids,
     oscar_decode_attention,
 )
@@ -1099,7 +1100,26 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
     def _decode_attention(self, query, kv_cache, attn_metadata, layer):
         k_data, v_data, k_meta, v_meta, prefix_cache, recent_cache = kv_cache
         # Rotate the query into the same space as the rotated stored keys.
-        q_rot = torch.matmul(query.float(), layer._oscar_Rk)
+        q_rotation = layer._oscar_Rk_fast
+        grouped_h4 = (
+            is_oscar_grouped_h4_eligible(
+                query,
+                k_data,
+                v_data,
+                k_meta,
+                v_meta,
+                attn_metadata.physical_slot_ids,
+            )
+            and q_rotation.shape == (128, 128)
+            and q_rotation.dtype == torch.bfloat16
+            and q_rotation.dtype == query.dtype
+            and q_rotation.device == query.device
+            and q_rotation.is_contiguous()
+        )
+        if grouped_h4:
+            q_rot = torch.matmul(query, q_rotation)
+        else:
+            q_rot = torch.matmul(query.float(), layer._oscar_Rk)
         logger.info_once(
             "OSCAR Triton mixed attention read active: fused BF16/INT2 "
             "read, dequantization, online softmax, and V inverse rotation"

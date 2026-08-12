@@ -1696,6 +1696,26 @@ def _has_linear_physical_slot_layout(
     return has_linear_oscar_arena_layout(k_data, v_data, k_meta, v_meta)
 
 
+def is_oscar_grouped_h4_eligible(
+    q_rot: torch.Tensor,
+    k_data: torch.Tensor,
+    v_data: torch.Tensor,
+    k_meta: torch.Tensor,
+    v_meta: torch.Tensor,
+    physical_slot_ids: torch.Tensor | None,
+) -> bool:
+    """Return whether decode can use the BF16 Grouped-H4 path."""
+    Hq, D = q_rot.shape[1], q_rot.shape[2]
+    Hk = k_data.shape[2]
+    return (
+        _use_grouped_h4_stage1(Hq, Hk, D)
+        and physical_slot_ids is not None
+        and _has_linear_physical_slot_layout(k_data, v_data, k_meta, v_meta)
+        and q_rot.dtype == torch.bfloat16
+        and q_rot.is_contiguous()
+    )
+
+
 def _grouped_h4_partial_counts(
     num_quant_splits: int, mixed_kv: bool
 ) -> tuple[int, int]:
@@ -1869,7 +1889,10 @@ def oscar_decode_attention(
                 "OSCAR physical slot buffer does not cover the block table"
             )
 
-    q_rot = q_rot.contiguous().float()
+    if grouped_h4 and q_rot.dtype == torch.bfloat16:
+        q_rot = q_rot.contiguous()
+    else:
+        q_rot = q_rot.contiguous().float()
 
     if (
         mid_o_buf is not None

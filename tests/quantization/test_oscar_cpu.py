@@ -1193,6 +1193,7 @@ class TestOscarConfigAndLayout(unittest.TestCase):
         from vllm.v1.attention.ops.triton_oscar_decode import (
             _has_linear_physical_slot_layout,
             _use_grouped_h4_stage1,
+            is_oscar_grouped_h4_eligible,
         )
 
         self.assertTrue(_use_grouped_h4_stage1(32, 8, 128))
@@ -1211,6 +1212,66 @@ class TestOscarConfigAndLayout(unittest.TestCase):
                 data[:, ::2], data[:, ::2], meta[:, ::2], meta[:, ::2]
             )
         )
+
+        physical_slots = torch.empty(1, 16, dtype=torch.int64)
+        bf16_query = torch.empty(1, 32, 128, dtype=torch.bfloat16)
+        self.assertTrue(
+            is_oscar_grouped_h4_eligible(
+                bf16_query, data, data, meta, meta, physical_slots
+            )
+        )
+        for query, slots in (
+            (bf16_query.float(), physical_slots),
+            (
+                torch.empty(1, 128, 32, dtype=torch.bfloat16).transpose(1, 2),
+                physical_slots,
+            ),
+            (bf16_query, None),
+        ):
+            with self.subTest(
+                dtype=query.dtype, contiguous=query.is_contiguous()
+            ):
+                self.assertFalse(
+                    is_oscar_grouped_h4_eligible(
+                        query, data, data, meta, meta, slots
+                    )
+                )
+
+    def test_grouped_h4_uses_bf16_query_rotation_only(self):
+        from vllm.v1.attention.backends.oscar_attn import OscarAttentionImpl
+        from vllm.v1.attention.ops.triton_oscar_decode import (
+            _oscar_decode_quant_stage1_grouped_h4,
+            oscar_decode_attention,
+        )
+
+        backend_source = inspect.getsource(OscarAttentionImpl._decode_attention)
+        self.assertIn("q_rotation = layer._oscar_Rk_fast", backend_source)
+        self.assertIn("is_oscar_grouped_h4_eligible(", backend_source)
+        self.assertIn("q_rot = torch.matmul(query, q_rotation)", backend_source)
+        self.assertIn(
+            "q_rot = torch.matmul(query.float(), layer._oscar_Rk)", backend_source
+        )
+        self.assertNotIn("use_grouped_h4=grouped_h4", backend_source)
+
+        dispatch_source = inspect.getsource(oscar_decode_attention)
+        self.assertIn(
+            "if grouped_h4 and q_rot.dtype == torch.bfloat16:\n"
+            "        q_rot = q_rot.contiguous()\n"
+            "    else:\n"
+            "        q_rot = q_rot.contiguous().float()",
+            dispatch_source,
+        )
+        self.assertIn(
+            "grouped_h4_supported and physical_slot_ids is not None",
+            dispatch_source,
+        )
+
+        kernel_source = inspect.getsource(_oscar_decode_quant_stage1_grouped_h4)
+        self.assertIn("q0 = tl.load(", kernel_source)
+        self.assertIn("q1 = tl.load(", kernel_source)
+        self.assertIn("q2 = tl.load(", kernel_source)
+        self.assertIn("q3 = tl.load(", kernel_source)
+        self.assertNotIn("q_main = tl.load(", kernel_source)
 
     def test_d128_quarter_layout_and_d64_legacy_layout_are_explicit(self):
         from vllm.v1.attention.ops.triton_oscar_store import (
