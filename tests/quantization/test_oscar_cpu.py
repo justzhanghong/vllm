@@ -1407,10 +1407,158 @@ class TestOscarConfigAndLayout(unittest.TestCase):
 
         dispatch_source = source[source.index("def oscar_decode_attention(") :]
         self.assertIn(
-            "if grouped_h4:\n        _oscar_finite_lse_stage2[grid2](",
+            "elif grouped_h4:\n        _oscar_finite_lse_stage2[grid2](",
             dispatch_source,
         )
         self.assertIn("else:\n        _fwd_kernel_stage2[grid2](", dispatch_source)
+
+    def test_fused_finite_lse_inverse_v_bf16_contract(self):
+        from vllm.v1.attention.backends.oscar_attn import OscarAttentionImpl
+        from vllm.v1.attention.ops import triton_oscar_decode
+        from vllm.v1.attention.ops.triton_oscar_decode import (
+            _use_bf16_inverse_v_output_alias,
+            _use_fused_inverse_v_bf16_output,
+        )
+
+        output = torch.empty(1, 32, 128, dtype=torch.bfloat16)
+        rotation = torch.empty(128, 128, dtype=torch.bfloat16)
+        mid_o = torch.empty(1, 32, 20, 129, dtype=torch.float32)
+        lse = torch.empty(1, 32, dtype=torch.float32)
+        positive = (True, 128, 20, rotation, output, mid_o, lse, 1, 32)
+        self.assertTrue(_use_fused_inverse_v_bf16_output(*positive))
+        alias_positive = (128, rotation, output, 1, 32)
+        self.assertTrue(_use_bf16_inverse_v_output_alias(*alias_positive))
+        for invalid_rotation in (
+            None,
+            rotation.float(),
+            torch.empty(128, 128, dtype=torch.bfloat16).t(),
+            torch.empty(64, 128, dtype=torch.bfloat16),
+        ):
+            with self.subTest(invalid_rotation=invalid_rotation):
+                self.assertFalse(
+                    _use_bf16_inverse_v_output_alias(
+                        128, invalid_rotation, output, 1, 32
+                    )
+                )
+        self.assertFalse(
+            _use_bf16_inverse_v_output_alias(
+                128,
+                SimpleNamespace(
+                    dtype=torch.bfloat16,
+                    shape=(128, 128),
+                    device="cuda:1",
+                    is_contiguous=lambda: True,
+                ),
+                SimpleNamespace(
+                    dtype=torch.bfloat16,
+                    shape=(1, 32, 128),
+                    device="cuda:0",
+                    is_contiguous=lambda: True,
+                ),
+                1,
+                32,
+            )
+        )
+        self.assertFalse(
+            _use_fused_inverse_v_bf16_output(
+                True, 128, 19, rotation, output, mid_o, lse, 1, 32
+            )
+        )
+        for partials in (13, 33):
+            with self.subTest(partials=partials):
+                self.assertFalse(
+                    _use_fused_inverse_v_bf16_output(
+                        True,
+                        128,
+                        partials,
+                        rotation,
+                        output,
+                        mid_o,
+                        lse,
+                        1,
+                        32,
+                    )
+                )
+        self.assertFalse(
+            _use_fused_inverse_v_bf16_output(
+                True, 128, 20, rotation.float(), output, mid_o, lse, 1, 32
+            )
+        )
+        self.assertFalse(
+            _use_fused_inverse_v_bf16_output(
+                True, 128, 20, rotation, output.float(), mid_o, lse, 1, 32
+            )
+        )
+        self.assertFalse(
+            _use_fused_inverse_v_bf16_output(
+                True,
+                128,
+                20,
+                rotation,
+                torch.empty(1, 128, 32, dtype=torch.bfloat16).transpose(1, 2),
+                mid_o,
+                lse,
+                1,
+                32,
+            )
+        )
+
+        source = Path(triton_oscar_decode.__file__).read_text()
+        kernel_start = source.index(
+            "def _oscar_finite_lse_inverse_v_bf16_stage2("
+        )
+        kernel_end = source.index("\n\n@triton.jit", kernel_start)
+        kernel_source = source[kernel_start:kernel_end]
+        for marker in (
+            "for partial_idx in range(0, NUM_PARTIALS):",
+            "is_finite =",
+            "old_scale = tl.exp2(",
+            "partial_scale = tl.exp2(",
+            "row = out.to(tl.bfloat16)",
+            "result = tl.sum(",
+            "tl.store(LSE_ptr",
+        ):
+            self.assertIn(marker, kernel_source)
+
+        dispatch_source = inspect.getsource(
+            triton_oscar_decode.oscar_decode_attention
+        )
+        self.assertIn(
+            "if use_fused_inverse_v:\n"
+            "        _oscar_finite_lse_inverse_v_bf16_stage2[grid2](",
+            dispatch_source,
+        )
+        self.assertIn("NUM_PARTIALS=NUM_TOTAL_SPLITS", dispatch_source)
+        self.assertIn(
+            "if v_rotation_t is not None and not use_fused_inverse_v:",
+            dispatch_source,
+        )
+        self.assertIn("if return_lse:", dispatch_source)
+        self.assertIn("return output, lse", dispatch_source)
+
+        decode_source = inspect.getsource(OscarAttentionImpl._decode_attention)
+        self.assertIn("v_rotation_t = layer._oscar_RvT", decode_source)
+        self.assertIn(
+            "fast_v_rotation_t = getattr(layer, \"_oscar_RvT_fast\", None)",
+            decode_source,
+        )
+        self.assertIn("_use_bf16_inverse_v_output_alias(", decode_source)
+        self.assertIn("output_buf=decode_output_buf", decode_source)
+        self.assertNotIn("get_simultaneous(", decode_source)
+        forward_source = inspect.getsource(OscarAttentionImpl.forward)
+        pure_decode = forward_source[
+            forward_source.index("if not attn_metadata.is_prefill:") :
+            forward_source.index("elif num_decodes == 0:")
+        ]
+        self.assertIn("output_slice", pure_decode)
+        self.assertIn("output_buf=decode_output_buf", pure_decode)
+        self.assertIn("attn_out is decode_output_buf", pure_decode)
+        self.assertNotIn("data_ptr()", pure_decode)
+        mixed_decode = forward_source[
+            forward_source.index("attn_out[:num_decode_tokens]") :
+            forward_source.index("prefill_seq_lens =")
+        ]
+        self.assertNotIn("output_buf=", mixed_decode)
 
 
 class TestOscarRotationLoading(unittest.TestCase):

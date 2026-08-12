@@ -25,6 +25,10 @@ from vllm.v1.attention.ops.oscar_cache_contract import (
 from vllm.v1.attention.ops.triton_decode_attention import _fwd_kernel_stage2
 
 _GROUPED_H4_PREINDEXED_QUANT_SPLITS = 12
+_GROUPED_H4_HP_SPLITS = 8
+_GROUPED_H4_MIXED_TOTAL_SPLITS = (
+    _GROUPED_H4_PREINDEXED_QUANT_SPLITS + _GROUPED_H4_HP_SPLITS
+)
 
 
 @triton.jit
@@ -1560,6 +1564,77 @@ def _oscar_finite_lse_stage2(
 
 
 @triton.jit
+def _oscar_finite_lse_inverse_v_bf16_stage2(
+    Mid_O,
+    Rotation_t_ptr,
+    Output_ptr,
+    LSE_ptr,
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
+    stride_rotation_row,
+    stride_rotation_col,
+    stride_obs,
+    stride_oh,
+    stride_lse_bs,
+    NUM_PARTIALS: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    Lv: tl.constexpr,
+):
+    """Merge finite-LSE partials and inverse-rotate into BF16 output."""
+    cur_batch = tl.program_id(0)
+    cur_head = tl.program_id(1)
+    offs_d = tl.arange(0, BLOCK_DV)
+    mask_d = offs_d < Lv
+
+    e_sum = 0.0
+    e_max = -float("inf")
+    acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
+    mid_base = cur_batch * stride_mid_ob + cur_head * stride_mid_oh
+
+    for partial_idx in range(0, NUM_PARTIALS):
+        partial_base = mid_base + partial_idx * stride_mid_os
+        tlogic = tl.load(Mid_O + partial_base + Lv)
+        is_finite = (tlogic > -float("inf")) & (tlogic < float("inf"))
+        if is_finite:
+            partial = tl.load(
+                Mid_O + partial_base + offs_d,
+                mask=mask_d,
+                other=0.0,
+            )
+            next_max = tl.maximum(tlogic, e_max)
+            old_scale = tl.exp2((e_max - next_max) * 1.4426950408889634)
+            partial_scale = tl.exp2((tlogic - next_max) * 1.4426950408889634)
+            acc = acc * old_scale + partial * partial_scale
+            e_sum = e_sum * old_scale + partial_scale
+            e_max = next_max
+
+    safe_e_sum = tl.where(e_sum > 0.0, e_sum, 1.0)
+    out = tl.where(e_sum > 0.0, acc / safe_e_sum, 0.0)
+    row = out.to(tl.bfloat16)
+    rotation = tl.load(
+        Rotation_t_ptr
+        + offs_d[:, None] * stride_rotation_row
+        + offs_d[None, :] * stride_rotation_col,
+        mask=mask_d[:, None] & mask_d[None, :],
+        other=0.0,
+    ).to(tl.bfloat16)
+    result = tl.sum(row[:, None].to(tl.float32) * rotation, axis=0)
+    tl.store(
+        Output_ptr
+        + cur_batch * stride_obs
+        + cur_head * stride_oh
+        + offs_d,
+        result,
+        mask=mask_d,
+    )
+    lse_out = tl.where(
+        e_sum > 0.0, e_max + tl.log(safe_e_sum), -float("inf")
+    )
+    tl.store(LSE_ptr + cur_batch * stride_lse_bs + cur_head, lse_out)
+
+
+@triton.jit
 def _oscar_full_dequant_kv(
     K_data_ptr,
     V_data_ptr,
@@ -1720,8 +1795,64 @@ def _grouped_h4_partial_counts(
     num_quant_splits: int, mixed_kv: bool
 ) -> tuple[int, int]:
     """Return BF16 HP and unified (quant + BF16 HP) partial counts."""
-    num_hp_splits = 8 if mixed_kv else 1
+    num_hp_splits = _GROUPED_H4_HP_SPLITS if mixed_kv else 1
     return num_hp_splits, num_quant_splits + num_hp_splits
+
+
+def _use_bf16_inverse_v_output_alias(
+    head_dim: int,
+    v_rotation_t: torch.Tensor | None,
+    output_buf: torch.Tensor | None,
+    batch_size: int,
+    num_query_heads: int,
+) -> bool:
+    return bool(
+        head_dim == 128
+        and v_rotation_t is not None
+        and v_rotation_t.dtype == torch.bfloat16
+        and tuple(v_rotation_t.shape) == (head_dim, head_dim)
+        and v_rotation_t.is_contiguous()
+        and output_buf is not None
+        and output_buf.dtype == torch.bfloat16
+        and tuple(output_buf.shape) == (batch_size, num_query_heads, head_dim)
+        and output_buf.is_contiguous()
+        and v_rotation_t.device == output_buf.device
+    )
+
+
+def _use_fused_inverse_v_bf16_output(
+    grouped_h4: bool,
+    head_dim: int,
+    num_total_splits: int,
+    v_rotation_t: torch.Tensor | None,
+    output_buf: torch.Tensor | None,
+    mid_o_buf: torch.Tensor | None,
+    lse_buf: torch.Tensor | None,
+    batch_size: int,
+    num_query_heads: int,
+) -> bool:
+    return bool(
+        grouped_h4
+        and num_total_splits == _GROUPED_H4_MIXED_TOTAL_SPLITS
+        and _use_bf16_inverse_v_output_alias(
+            head_dim,
+            v_rotation_t,
+            output_buf,
+            batch_size,
+            num_query_heads,
+        )
+        and mid_o_buf is not None
+        and mid_o_buf.dtype == torch.float32
+        and tuple(mid_o_buf.shape)
+        == (batch_size, num_query_heads, num_total_splits, head_dim + 1)
+        and mid_o_buf.is_contiguous()
+        and lse_buf is not None
+        and lse_buf.dtype == torch.float32
+        and tuple(lse_buf.shape) == (batch_size, num_query_heads)
+        and lse_buf.is_contiguous()
+        and mid_o_buf.device == output_buf.device
+        and lse_buf.device == output_buf.device
+    )
 
 
 @triton.jit
@@ -2043,18 +2174,62 @@ def oscar_decode_attention(
             num_stages=2,
         )
 
-    out_dtype = torch.float32
-    if output_buf is not None and output_buf.shape[0] >= B:
-        output = output_buf[:B, :Hq, :D]
-    else:
-        output = torch.empty(B, Hq, D, dtype=out_dtype, device=device)
+    candidate_output = None
+    if (
+        output_buf is not None
+        and output_buf.ndim == 3
+        and output_buf.shape[0] >= B
+        and output_buf.shape[1] >= Hq
+        and output_buf.shape[2] >= D
+    ):
+        candidate_output = (
+            output_buf
+            if tuple(output_buf.shape) == (B, Hq, D)
+            else output_buf[:B, :Hq, :D]
+        )
     if lse_buf is not None and lse_buf.shape[0] >= B:
         lse = lse_buf[:B, :Hq]
     else:
         lse = torch.empty(B, Hq, dtype=torch.float32, device=device)
+    use_fused_inverse_v = _use_fused_inverse_v_bf16_output(
+        grouped_h4,
+        D,
+        NUM_TOTAL_SPLITS,
+        v_rotation_t,
+        candidate_output,
+        mid_o,
+        lse,
+        B,
+        Hq,
+    )
+    if use_fused_inverse_v:
+        assert candidate_output is not None
+        output = candidate_output
+    else:
+        output = torch.empty(B, Hq, D, dtype=torch.float32, device=device)
 
     grid2 = (B, Hq)
-    if grouped_h4:
+    if use_fused_inverse_v:
+        _oscar_finite_lse_inverse_v_bf16_stage2[grid2](
+            mid_o,
+            v_rotation_t,
+            output,
+            lse,
+            mid_o.stride(0),
+            mid_o.stride(1),
+            mid_o.stride(2),
+            v_rotation_t.stride(0),
+            v_rotation_t.stride(1),
+            output.stride(0),
+            output.stride(1),
+            lse.stride(0),
+            NUM_PARTIALS=NUM_TOTAL_SPLITS,
+            BLOCK_DV=BLOCK_D,
+            Lv=D,
+            num_warps=4,
+            num_stages=2,
+        )
+    elif grouped_h4:
         _oscar_finite_lse_stage2[grid2](
             mid_o,
             output,
@@ -2090,7 +2265,7 @@ def oscar_decode_attention(
             num_warps=4,
             num_stages=2,
         )
-    if v_rotation_t is not None:
+    if v_rotation_t is not None and not use_fused_inverse_v:
         rotated_output = torch.empty_like(output)
         _inverse_v_rotation_kernel[(B, Hq)](
             output,

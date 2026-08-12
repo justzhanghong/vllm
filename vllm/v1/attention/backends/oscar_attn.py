@@ -50,6 +50,7 @@ from vllm.v1.attention.ops.triton_oscar_bulk_flush import (
     prepare_oscar_bulk_flush_plan,
 )
 from vllm.v1.attention.ops.triton_oscar_decode import (
+    _use_bf16_inverse_v_output_alias,
     is_oscar_grouped_h4_eligible,
     materialize_oscar_slot_ids,
     oscar_decode_attention,
@@ -145,7 +146,7 @@ class OscarAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
-        return kv_cache_dtype == "oscar_int2"
+        return kv_cache_dtype is not None and kv_cache_dtype.startswith("oscar_")
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
@@ -621,7 +622,30 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
                 attn_metadata,
                 demote_recent=True,
             )
-            attn_out = self._decode_attention(q, kv_cache, attn_metadata, layer)
+            output_slice = output[:N]
+            expected_shape = (N, self.num_heads, self.head_size)
+            decode_output_buf = None
+            if output_slice.is_contiguous() and (
+                (output_slice.ndim == 3 and output_slice.shape == expected_shape)
+                or (
+                    output_slice.ndim == 2
+                    and output_slice.shape
+                    == (N, self.num_heads * self.head_size)
+                )
+            ):
+                decode_output_buf = output_slice.view(expected_shape)
+            attn_out = self._decode_attention(
+                q,
+                kv_cache,
+                attn_metadata,
+                layer,
+                output_buf=decode_output_buf,
+            )
+            if (
+                decode_output_buf is not None
+                and attn_out is decode_output_buf
+            ):
+                return output
         elif num_decodes == 0:
             k = key[:N].view(N, self.num_kv_heads, self.head_size)
             v = value[:N].view(N, self.num_kv_heads, self.head_size)
@@ -630,12 +654,11 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
             v_rotation_absorbed = self._v_rotation_absorbed(layer)
             k_rot = v_rot = None
             if has_cached_context and (materialize_tokens or v_rotation_absorbed):
-                prefill_oscar_layer: Any = layer
-                k_rotation = prefill_oscar_layer._oscar_Rk
-                v_rotation = prefill_oscar_layer._oscar_Rv
-                k_rot = torch.matmul(k.float(), k_rotation)
+                k_rot = torch.matmul(k.float(), layer._oscar_Rk)
                 v_rot = (
-                    v if v_rotation_absorbed else torch.matmul(v.float(), v_rotation)
+                    v
+                    if v_rotation_absorbed
+                    else torch.matmul(v.float(), layer._oscar_Rv)
                 )
             attn_out = self._prefill_attention(
                 q,
@@ -751,14 +774,11 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
             v_rotation_absorbed = self._v_rotation_absorbed(layer)
             k_rot = v_rot = None
             if has_cached_context and (materialize_tokens or v_rotation_absorbed):
-                oscar_layer: Any = layer
-                k_rotation = oscar_layer._oscar_Rk
-                v_rotation = oscar_layer._oscar_Rv
-                k_rot = torch.matmul(k[num_decode_tokens:].float(), k_rotation)
+                k_rot = torch.matmul(k[num_decode_tokens:].float(), layer._oscar_Rk)
                 v_rot = (
                     v[num_decode_tokens:]
                     if v_rotation_absorbed
-                    else torch.matmul(v[num_decode_tokens:].float(), v_rotation)
+                    else torch.matmul(v[num_decode_tokens:].float(), layer._oscar_Rv)
                 )
             attn_out[num_decode_tokens:] = self._prefill_attention(
                 q[num_decode_tokens:],
@@ -1097,7 +1117,9 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
             )
         return out[0].transpose(0, 1)
 
-    def _decode_attention(self, query, kv_cache, attn_metadata, layer):
+    def _decode_attention(
+        self, query, kv_cache, attn_metadata, layer, output_buf=None
+    ):
         k_data, v_data, k_meta, v_meta, prefix_cache, recent_cache = kv_cache
         # Rotate the query into the same space as the rotated stored keys.
         q_rotation = layer._oscar_Rk_fast
@@ -1120,6 +1142,18 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
             q_rot = torch.matmul(query, q_rotation)
         else:
             q_rot = torch.matmul(query.float(), layer._oscar_Rk)
+        decode_output_buf = None
+        v_rotation_t = layer._oscar_RvT
+        fast_v_rotation_t = getattr(layer, "_oscar_RvT_fast", None)
+        if grouped_h4 and _use_bf16_inverse_v_output_alias(
+            self.head_size,
+            fast_v_rotation_t,
+            output_buf,
+            query.shape[0],
+            self.num_heads,
+        ):
+            decode_output_buf = output_buf
+            v_rotation_t = fast_v_rotation_t
         logger.info_once(
             "OSCAR Triton mixed attention read active: fused BF16/INT2 "
             "read, dequantization, online softmax, and V inverse rotation"
@@ -1138,6 +1172,7 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
             key_data_bytes=self.cfg.key_data_bytes,
             key_packed_size=self.cfg.key_packed_size,
             value_data_bytes=self.cfg.value_data_bytes,
+            output_buf=decode_output_buf,
             max_num_kv_splits=self.max_num_kv_splits,
             prefix_cache=prefix_cache,
             recent_cache=recent_cache,
@@ -1153,7 +1188,8 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
                 if attn_metadata.bulk_flush_plan is not None
                 else None
             ),
-            v_rotation_t=layer._oscar_RvT,
+            v_rotation_t=v_rotation_t,
         )
-        assert isinstance(out_rot, torch.Tensor)
+        if out_rot is decode_output_buf:
+            return out_rot
         return out_rot.to(query.dtype)
