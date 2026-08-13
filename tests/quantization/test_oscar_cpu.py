@@ -1483,14 +1483,16 @@ class TestOscarConfigAndLayout(unittest.TestCase):
         self.assertIn("materialize_oscar_slot_ids(", build_source)
         self.assertNotIn("synchronize", build_source)
 
-    def test_grouped_h4_hp_stage1_uses_dot_and_eight_splits(self):
+    def test_grouped_h4_same_stage_preserves_quant_and_hp_contracts(self):
         from vllm.v1.attention.ops import triton_oscar_decode
 
         source = Path(triton_oscar_decode.__file__).read_text()
         kernel_start = source.index("def _oscar_decode_hp_stage1(")
         kernel_end = source.index("\n\n@triton.jit", kernel_start)
         kernel_source = source[kernel_start:kernel_end]
-        self.assertIn("sid = tl.program_id(2)", kernel_source)
+        self.assertIn(
+            "sid = tl.program_id(2) - HP_PARTIAL_START", kernel_source
+        )
         self.assertIn("heads = head0 + tl.arange(0, BLOCK_H)", kernel_source)
         self.assertIn("head_mask = heads < head0 + KV_GROUP_SIZE", kernel_source)
         self.assertIn(
@@ -1507,16 +1509,21 @@ class TestOscarConfigAndLayout(unittest.TestCase):
 
         dispatch_source = source[source.index("def oscar_decode_attention(") :]
         self.assertIn(
-            "_oscar_decode_quant_stage1_grouped_h4[(B, Hk, NUM_KV_SPLITS)](",
+            "_oscar_decode_grouped_h4_stage1[(B, Hk, NUM_TOTAL_SPLITS)](",
             dispatch_source,
         )
+        self.assertNotIn("_oscar_decode_quant_stage1_grouped_h4[", dispatch_source)
+        self.assertNotIn("_oscar_decode_hp_stage1[", dispatch_source)
+        self.assertIn("NUM_QUANT_SPLITS=NUM_KV_SPLITS", dispatch_source)
+        self.assertIn("NUM_HP_SPLITS=NUM_HP_SPLITS", dispatch_source)
         self.assertIn(
-            "_oscar_decode_hp_stage1[(B, Hk, NUM_HP_SPLITS)](",
+            "recent_extra,\n            physical_slot_ids,\n            seq_lens,",
             dispatch_source,
         )
         self.assertIn("HP_PARTIAL_START=NUM_KV_SPLITS", dispatch_source)
-        self.assertIn("BLOCK_N=32", dispatch_source)
-        self.assertIn("BLOCK_H=16", dispatch_source)
+        self.assertIn("QUANT_BLOCK_N=128", dispatch_source)
+        self.assertIn("HP_BLOCK_N=32", dispatch_source)
+        self.assertIn("HP_BLOCK_H=16", dispatch_source)
         self.assertIn(
             "_grouped_h4_partial_counts(NUM_KV_SPLITS, mixed_kv)",
             dispatch_source,
