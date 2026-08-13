@@ -14,6 +14,7 @@ the returned output, which lives in rotated-V space.
 """
 
 import math
+import sys
 
 import torch
 
@@ -1128,8 +1129,8 @@ def _oscar_decode_quant_stage1_grouped_h4(
     Q_rot_ptr,
     K_data_ptr,
     V_data_ptr,
-    K_meta_ptr,
-    V_meta_ptr,
+    K_meta_pair_ptr,
+    V_meta_pair_ptr,
     Query_to_req_ptr,
     Shared_hit_lens_ptr,
     Recent_extra_ptr,
@@ -1140,8 +1141,8 @@ def _oscar_decode_quant_stage1_grouped_h4(
     stride_qh,
     stride_data_pos,
     stride_data_head,
-    stride_meta_pos,
-    stride_meta_head,
+    stride_meta_pair_pos,
+    stride_meta_pair_head,
     stride_slots_b,
     stride_mid_b,
     stride_mid_h,
@@ -1226,8 +1227,8 @@ def _oscar_decode_quant_stage1_grouped_h4(
                 + tl.cast(kv_head, tl.int64) * stride_data_head
             )
             meta_bases = (
-                physical_slots * stride_meta_pos
-                + tl.cast(kv_head, tl.int64) * stride_meta_head
+                physical_slots * stride_meta_pair_pos
+                + tl.cast(kv_head, tl.int64) * stride_meta_pair_head
             )
 
             k_packed = tl.load(
@@ -1235,31 +1236,35 @@ def _oscar_decode_quant_stage1_grouped_h4(
                 mask=kv_mask[None, :],
                 other=0,
             )
-            k_scale = tl.load(
-                K_meta_ptr + meta_bases,
+            k_meta_pair = tl.load(
+                K_meta_pair_ptr + meta_bases,
                 mask=kv_mask,
-                other=1.0,
-            ).to(tl.bfloat16)
-            k_zero = tl.load(
-                K_meta_ptr + meta_bases + 1,
-                mask=kv_mask,
-                other=0.0,
-            ).to(tl.bfloat16)
+                other=0x00003F80,
+            )
             v_packed = tl.load(
                 V_data_ptr + data_bases[:, None] + offs_quarter[None, :],
                 mask=kv_mask[:, None],
                 other=0,
             )
-            v_scale = tl.load(
-                V_meta_ptr + meta_bases,
+            v_meta_pair = tl.load(
+                V_meta_pair_ptr + meta_bases,
                 mask=kv_mask,
-                other=1.0,
-            ).to(tl.bfloat16)
-            v_zero = tl.load(
-                V_meta_ptr + meta_bases + 1,
-                mask=kv_mask,
-                other=0.0,
-            ).to(tl.bfloat16)
+                other=0x00003F80,
+            )
+            k_meta_bits = k_meta_pair.to(tl.uint32, bitcast=True)
+            k_scale = (k_meta_bits & 0xFFFF).to(tl.uint16).to(
+                tl.bfloat16, bitcast=True
+            )
+            k_zero = ((k_meta_bits >> 16) & 0xFFFF).to(tl.uint16).to(
+                tl.bfloat16, bitcast=True
+            )
+            v_meta_bits = v_meta_pair.to(tl.uint32, bitcast=True)
+            v_scale = (v_meta_bits & 0xFFFF).to(tl.uint16).to(
+                tl.bfloat16, bitcast=True
+            )
+            v_zero = ((v_meta_bits >> 16) & 0xFFFF).to(tl.uint16).to(
+                tl.bfloat16, bitcast=True
+            )
             k0 = (
                 (k_packed & (KEY_LEVELS - 1)).to(tl.bfloat16) - k_zero[None, :]
             ) * k_scale[None, :]
@@ -1768,7 +1773,20 @@ def _has_linear_physical_slot_layout(
     k_meta: torch.Tensor,
     v_meta: torch.Tensor,
 ) -> bool:
-    return has_linear_oscar_arena_layout(k_data, v_data, k_meta, v_meta)
+    metadata_pair_views_supported = sys.byteorder == "little" and all(
+        tensor.dtype == torch.bfloat16
+        and tensor.ndim == 4
+        and tensor.shape[-1] == 2
+        and tensor.stride(-1) == 1
+        and tensor.storage_offset() % 2 == 0
+        and tensor.data_ptr() % 4 == 0
+        and all(stride % 2 == 0 for stride in tensor.stride()[:-1])
+        for tensor in (k_meta, v_meta)
+    )
+    return bool(
+        metadata_pair_views_supported
+        and has_linear_oscar_arena_layout(k_data, v_data, k_meta, v_meta)
+    )
 
 
 def is_oscar_grouped_h4_eligible(
@@ -2037,12 +2055,14 @@ def oscar_decode_attention(
         )
 
     if grouped_h4:
+        k_meta_pairs = k_meta.view(torch.int32).squeeze(-1)
+        v_meta_pairs = v_meta.view(torch.int32).squeeze(-1)
         _oscar_decode_quant_stage1_grouped_h4[(B, Hk, NUM_KV_SPLITS)](
             q_rot,
             k_data,
             v_data,
-            k_meta,
-            v_meta,
+            k_meta_pairs,
+            v_meta_pairs,
             query_to_req_indices,
             shared_hit_tokens,
             recent_extra,
@@ -2053,8 +2073,8 @@ def oscar_decode_attention(
             q_rot.stride(1),
             k_data.stride(1),
             k_data.stride(2),
-            k_meta.stride(1),
-            k_meta.stride(2),
+            k_meta_pairs.stride(1),
+            k_meta_pairs.stride(2),
             physical_slot_ids.stride(0),
             mid_o.stride(0),
             mid_o.stride(1),

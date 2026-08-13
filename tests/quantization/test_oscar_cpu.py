@@ -3,6 +3,7 @@
 
 import inspect
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -1190,6 +1191,7 @@ class TestOscarConfigAndLayout(unittest.TestCase):
         self.assertEqual(calls, [(workspace_spec, workspace_spec)])
 
     def test_grouped_h4_decode_stage1_dispatch_is_narrow(self):
+        from vllm.v1.attention.ops import triton_oscar_decode
         from vllm.v1.attention.ops.triton_oscar_decode import (
             _has_linear_physical_slot_layout,
             _use_grouped_h4_stage1,
@@ -1212,12 +1214,36 @@ class TestOscarConfigAndLayout(unittest.TestCase):
                 data[:, ::2], data[:, ::2], meta[:, ::2], meta[:, ::2]
             )
         )
+        misaligned_meta = torch.empty(
+            meta.numel() + 1, dtype=torch.bfloat16
+        )[1:].view_as(meta)
+        self.assertEqual(misaligned_meta.storage_offset(), 1)
+        self.assertEqual(misaligned_meta.data_ptr() % 4, 2)
+        self.assertFalse(
+            _has_linear_physical_slot_layout(
+                data, data, misaligned_meta, misaligned_meta
+            )
+        )
+        with patch.object(triton_oscar_decode.sys, "byteorder", "big"):
+            self.assertFalse(
+                _has_linear_physical_slot_layout(data, data, meta, meta)
+            )
 
         physical_slots = torch.empty(1, 16, dtype=torch.int64)
         bf16_query = torch.empty(1, 32, 128, dtype=torch.bfloat16)
         self.assertTrue(
             is_oscar_grouped_h4_eligible(
                 bf16_query, data, data, meta, meta, physical_slots
+            )
+        )
+        self.assertFalse(
+            is_oscar_grouped_h4_eligible(
+                bf16_query,
+                data,
+                data,
+                misaligned_meta,
+                misaligned_meta,
+                physical_slots,
             )
         )
         for query, slots in (
@@ -1280,28 +1306,113 @@ class TestOscarConfigAndLayout(unittest.TestCase):
 
         kernel_source = inspect.getsource(_oscar_decode_quant_stage1_grouped_h4)
         k_load = kernel_source.index("k_packed = tl.load(")
-        k_zero = kernel_source.index("k_zero = tl.load(")
+        k_meta = kernel_source.index("k_meta_pair = tl.load(")
         v_load = kernel_source.index("v_packed = tl.load(")
-        v_scale = kernel_source.index("v_scale = tl.load(")
-        v_zero = kernel_source.index("v_zero = tl.load(")
+        v_meta = kernel_source.index("v_meta_pair = tl.load(")
+        k_unpack = kernel_source.index("k_meta_bits = ")
         k_dequant = kernel_source.index("k0 = (")
         qk = kernel_source.index("scores = tl.dot(query, keys)")
         v_dequant = kernel_source.index("v0 = (")
 
         self.assertTrue(
             k_load
-            < k_zero
+            < k_meta
             < v_load
-            < v_scale
-            < v_zero
+            < v_meta
+            < k_unpack
             < k_dequant
             < qk
             < v_dequant
         )
         self.assertEqual(kernel_source.count("v_packed = tl.load("), 1)
-        self.assertEqual(kernel_source.count("v_scale = tl.load("), 1)
-        self.assertEqual(kernel_source.count("v_zero = tl.load("), 1)
+        self.assertEqual(kernel_source.count("k_meta_pair = tl.load("), 1)
+        self.assertEqual(kernel_source.count("v_meta_pair = tl.load("), 1)
         self.assertNotIn("tl.debug_barrier", kernel_source)
+
+    def test_grouped_h4_metadata_pairs_are_zero_copy_and_bit_exact(self):
+        self.assertEqual(sys.byteorder, "little")
+        metadata = torch.tensor(
+            [
+                1.0,
+                0.0,
+                -2.5,
+                -0.0,
+                0.125,
+                3.0,
+                8.0,
+                -4.0,
+            ],
+            dtype=torch.bfloat16,
+        ).reshape(1, 2, 2, 2)
+        metadata_pairs = metadata.view(torch.int32).squeeze(-1)
+
+        self.assertEqual(metadata_pairs.data_ptr(), metadata.data_ptr())
+        self.assertEqual(tuple(metadata_pairs.shape), (1, 2, 2))
+        self.assertEqual(tuple(metadata.stride()), (8, 4, 2, 1))
+        self.assertEqual(tuple(metadata_pairs.stride()), (4, 2, 1))
+        pair_bits = metadata_pairs.to(torch.int64) & 0xFFFFFFFF
+        original_bits = metadata.view(torch.int16).to(torch.int64) & 0xFFFF
+        torch.testing.assert_close(
+            pair_bits & 0xFFFF,
+            original_bits[..., 0],
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            (pair_bits >> 16) & 0xFFFF,
+            original_bits[..., 1],
+            atol=0,
+            rtol=0,
+        )
+        self.assertEqual(0x00003F80 & 0xFFFF, 0x3F80)
+        self.assertEqual((0x00003F80 >> 16) & 0xFFFF, 0)
+
+        for physical_slot, head in ((0, 0), (1, 1)):
+            pair_offset = (
+                physical_slot * metadata_pairs.stride(1)
+                + head * metadata_pairs.stride(2)
+            )
+            scalar_offset = (
+                physical_slot * metadata.stride(1) + head * metadata.stride(2)
+            )
+            self.assertEqual(pair_offset * 2, scalar_offset)
+            self.assertEqual(
+                pair_bits.reshape(-1)[pair_offset] & 0xFFFF,
+                original_bits.reshape(-1)[scalar_offset],
+            )
+            self.assertEqual(
+                (pair_bits.reshape(-1)[pair_offset] >> 16) & 0xFFFF,
+                original_bits.reshape(-1)[scalar_offset + 1],
+            )
+
+    def test_grouped_h4_uses_one_int32_metadata_pair_load_per_arena(self):
+        from vllm.v1.attention.ops.triton_oscar_decode import (
+            _oscar_decode_quant_stage1_grouped_h4,
+            oscar_decode_attention,
+        )
+
+        kernel_source = inspect.getsource(_oscar_decode_quant_stage1_grouped_h4)
+        self.assertIn("K_meta_pair_ptr + meta_bases", kernel_source)
+        self.assertIn("V_meta_pair_ptr + meta_bases", kernel_source)
+        self.assertEqual(kernel_source.count("other=0x00003F80"), 2)
+        self.assertEqual(kernel_source.count("meta_pair = tl.load("), 2)
+        self.assertNotIn("K_meta_pair_ptr + meta_bases + 1", kernel_source)
+        self.assertNotIn("V_meta_pair_ptr + meta_bases + 1", kernel_source)
+        self.assertEqual(kernel_source.count("to(tl.uint32, bitcast=True)"), 2)
+        self.assertEqual(kernel_source.count("& 0xFFFF"), 4)
+        self.assertEqual(kernel_source.count(">> 16"), 2)
+
+        dispatch_source = inspect.getsource(oscar_decode_attention)
+        self.assertIn(
+            "k_meta_pairs = k_meta.view(torch.int32).squeeze(-1)",
+            dispatch_source,
+        )
+        self.assertIn(
+            "v_meta_pairs = v_meta.view(torch.int32).squeeze(-1)",
+            dispatch_source,
+        )
+        self.assertIn("k_meta_pairs.stride(1)", dispatch_source)
+        self.assertIn("k_meta_pairs.stride(2)", dispatch_source)
 
     def test_d128_quarter_layout_and_d64_legacy_layout_are_explicit(self):
         from vllm.v1.attention.ops.triton_oscar_store import (
