@@ -443,7 +443,28 @@ class InductorStandaloneAdaptor(CompilerInterface):
         else:
             fake_mode_ctx = contextlib.nullcontext()
 
-        with pregrad_ctx, fake_mode_ctx:
+        uses_higher_order_cond = any(
+            node.op == "call_function" and node.target is torch.ops.higher_order.cond
+            for module in graph.modules()
+            if isinstance(module, fx.GraphModule)
+            for node in module.graph.nodes
+        )
+        if uses_higher_order_cond:
+            # PyTorch does not cache higher_order.cond unless the caller supplies
+            # an explicit cache key for the operator implementation.
+            cacheable_functions = dict(
+                torch._inductor.config.unsafe_marked_cacheable_functions
+            )
+            cacheable_functions.setdefault(
+                "torch.ops.higher_order.cond", str(torch.__version__)
+            )
+            higher_order_cond_cache_ctx: Any = torch._inductor.config.patch(
+                unsafe_marked_cacheable_functions=cacheable_functions
+            )
+        else:
+            higher_order_cond_cache_ctx = contextlib.nullcontext()
+
+        with pregrad_ctx, fake_mode_ctx, higher_order_cond_cache_ctx:
             compiled_graph = standalone_compile(graph, example_inputs, **compile_kwargs)
 
         if use_aot:

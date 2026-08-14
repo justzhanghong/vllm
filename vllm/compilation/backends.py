@@ -543,10 +543,47 @@ def _decompose_size_nodes(graph: fx.GraphModule) -> None:
         graph.graph.erase_node(node)
 
 
+def _sink_symbool_cond_predicates(graph: fx.GraphModule) -> None:
+    """Keep symbolic predicates in the partition containing their cond.
+
+    Inductor accepts SymInt graph inputs but not SymBool values represented by
+    SymPy relations. Dynamo may emit a shape predicate before a splitting op
+    before one or more later ``higher_order.cond`` nodes. Move a single-use
+    predicate, or clone a shared predicate for each consumer, to avoid threading
+    a SymBool across splits without materializing a tensor predicate.
+    """
+    changed = False
+    for cond_node in list(graph.graph.nodes):
+        if not (
+            cond_node.op == "call_function"
+            and cond_node.target is torch.ops.higher_order.cond
+        ):
+            continue
+
+        predicate = cond_node.args[0]
+        if not isinstance(predicate, fx.Node) or predicate.op == "placeholder":
+            continue
+        if not isinstance(predicate.meta.get("example_value"), torch.SymBool):
+            continue
+
+        if set(predicate.users) == {cond_node}:
+            cond_node.prepend(predicate)
+        else:
+            with graph.graph.inserting_before(cond_node):
+                local_predicate = graph.graph.node_copy(predicate, lambda node: node)
+            cond_node.replace_input_with(predicate, local_predicate)
+        changed = True
+
+    if changed:
+        graph.graph.lint()
+        graph.recompile()
+
+
 def split_graph(
     graph: fx.GraphModule, splitting_ops: list[str]
 ) -> tuple[fx.GraphModule, list[SplitItem]]:
     _decompose_size_nodes(graph)
+    _sink_symbool_cond_predicates(graph)
 
     # split graph by ops
     subgraph_id = 0

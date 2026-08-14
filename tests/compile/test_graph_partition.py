@@ -23,6 +23,113 @@ from . import silly_attention  # noqa: F401
 DEVICE_TYPE = current_platform.device_type
 
 
+def test_symbool_cond_predicate_does_not_cross_split_boundary():
+    """Keep a dynamic cond predicate in the subgraph that consumes it."""
+    captured_graph = None
+
+    def capturing_backend(gm: fx.GraphModule, example_inputs: list) -> fx.GraphModule:
+        nonlocal captured_graph
+        captured_graph = gm
+        return gm
+
+    def true_fn(x: torch.Tensor) -> torch.Tensor:
+        return x + 1
+
+    def false_fn(x: torch.Tensor) -> torch.Tensor:
+        return x - 1
+
+    def model_fn(x: torch.Tensor) -> torch.Tensor:
+        predicate = x.shape[0] == 1
+        x = torch.ops.aten.sigmoid.default(x)
+        return torch.cond(predicate, true_fn, false_fn, (x,))
+
+    x = torch.randn(2, 8)
+    torch._dynamo.mark_dynamic(x, 0)
+    torch.compile(model_fn, backend=capturing_backend, fullgraph=True)(x)
+
+    assert captured_graph is not None
+    _, split_items = split_graph(captured_graph, ["aten::sigmoid"])
+    cond_nodes = [
+        node
+        for item in split_items
+        for node in item.graph.graph.nodes
+        if node.op == "call_function" and node.target is torch.ops.higher_order.cond
+    ]
+
+    assert len(cond_nodes) == 1
+    predicate = cond_nodes[0].args[0]
+    assert isinstance(predicate, fx.Node)
+    assert predicate.op != "placeholder", (
+        "A SymBool predicate crossing the split becomes a sympy Equality input, "
+        "which Inductor cannot compile."
+    )
+
+
+def test_shared_symbool_cond_predicate_does_not_cross_split_boundaries():
+    """Clone a shared dynamic predicate into each cond partition."""
+    captured_graph = None
+
+    def capturing_backend(gm: fx.GraphModule, example_inputs: list) -> fx.GraphModule:
+        nonlocal captured_graph
+        captured_graph = gm
+        return gm
+
+    def true_fn(x: torch.Tensor) -> torch.Tensor:
+        return x + 1
+
+    def false_fn(x: torch.Tensor) -> torch.Tensor:
+        return x - 1
+
+    def model_fn(x: torch.Tensor) -> torch.Tensor:
+        predicate = x.shape[0] == 1
+        x = torch.ops.aten.sigmoid.default(x)
+        x = torch.cond(predicate, true_fn, false_fn, (x,))
+        x = torch.ops.aten.relu.default(x)
+        return torch.cond(predicate, true_fn, false_fn, (x,))
+
+    x = torch.randn(2, 8)
+    torch._dynamo.mark_dynamic(x, 0)
+    torch.compile(model_fn, backend=capturing_backend, fullgraph=True)(x)
+
+    assert captured_graph is not None
+    original_cond_nodes = [
+        node
+        for node in captured_graph.graph.nodes
+        if node.op == "call_function" and node.target is torch.ops.higher_order.cond
+    ]
+    assert len(original_cond_nodes) == 2
+    shared_predicate = original_cond_nodes[0].args[0]
+    assert original_cond_nodes[1].args[0] is shared_predicate
+    assert isinstance(shared_predicate.meta.get("example_value"), torch.SymBool)
+
+    split_gm, split_items = split_graph(captured_graph, ["aten::sigmoid", "aten::relu"])
+    cond_items = [
+        (item, node)
+        for item in split_items
+        for node in item.graph.graph.nodes
+        if node.op == "call_function" and node.target is torch.ops.higher_order.cond
+    ]
+
+    assert len(cond_items) == 2
+    assert len({item.graph_id for item, _ in cond_items}) == 2
+    predicates = [node.args[0] for _, node in cond_items]
+    assert all(isinstance(predicate, fx.Node) for predicate in predicates)
+    assert all(predicate.op != "placeholder" for predicate in predicates), (
+        "A shared SymBool predicate crossing a split becomes a sympy Equality "
+        "input, which Inductor cannot compile."
+    )
+    for item, _ in cond_items:
+        assert not any(
+            node.op == "placeholder"
+            and isinstance(node.meta.get("example_value"), torch.SymBool)
+            for node in item.graph.graph.nodes
+        )
+
+    for rows in (1, 2):
+        new_x = torch.randn(rows, 8)
+        assert torch.allclose(split_gm(rows, new_x)[0], model_fn(new_x))
+
+
 def test_getitem_moved_to_producer_subgraph():
     """
     Test that getitem operations are moved to the same subgraph as their input,

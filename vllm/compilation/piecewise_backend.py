@@ -29,8 +29,6 @@ def get_fake_args_from_graph(graph: fx.GraphModule) -> list[Any]:
     for node in graph.graph.nodes:
         if node.op == "placeholder":
             fake_args.append(node.meta["example_value"])
-        else:
-            break
     return fake_args
 
 
@@ -57,7 +55,7 @@ def create_concrete_args(graph: fx.GraphModule, size: int) -> list[Any]:
     with fake_mode:
         for node in graph.graph.nodes:
             if node.op != "placeholder":
-                break
+                continue
             val = node.meta["example_value"]
             if isinstance(val, torch.SymInt):
                 args.append(concretize(val))
