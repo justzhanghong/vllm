@@ -56,7 +56,9 @@ from vllm.v1.attention.ops.triton_oscar_decode import (
     oscar_decode_attention,
 )
 from vllm.v1.attention.ops.triton_oscar_mixed_store import (
+    is_oscar_fused_qk_rotation_hp_store_eligible,
     oscar_demote_hp,
+    oscar_fused_qk_rotation_hp_store,
     oscar_store_hp,
 )
 from vllm.v1.attention.ops.triton_oscar_prefill import (
@@ -472,28 +474,16 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
         attn_metadata: OscarMetadata,
         *,
         demote_recent: bool,
+        fused_query: torch.Tensor | None = None,
         rotated_key: torch.Tensor | None = None,
         rotated_value: torch.Tensor | None = None,
-    ) -> None:
+    ) -> torch.Tensor | None:
         k_data, v_data, k_meta, v_meta, prefix_cache, recent_cache = kv_cache
         num_tokens = attn_metadata.num_actual_tokens
         if num_tokens <= 0:
-            return
+            return None
         k = key[:num_tokens].view(num_tokens, self.num_kv_heads, self.head_size)
         v = value[:num_tokens].view(num_tokens, self.num_kv_heads, self.head_size)
-        if rotated_key is None:
-            k_rot = torch.matmul(k.float(), layer._oscar_Rk)
-        else:
-            k_rot = rotated_key
-        if rotated_value is None:
-            v_rot = (
-                v
-                if self._v_rotation_absorbed(layer)
-                else torch.matmul(v.float(), layer._oscar_Rv)
-            )
-        else:
-            v_rot = rotated_value
-
         bulk_flush = (
             attn_metadata.bulk_flush_enabled
             and demote_recent
@@ -514,7 +504,43 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
                     k_clip_ratio=self.cfg.k_clip_ratio,
                     v_clip_ratio=self.cfg.v_clip_ratio,
                 )
+
+        if fused_query is not None:
+            if not bulk_flush:
+                raise RuntimeError("OSCAR fused rotation/store requires bulk flush")
+            return oscar_fused_qk_rotation_hp_store(
+                fused_query,
+                k,
+                v,
+                layer._oscar_Rk,
+                layer._oscar_Rk_fast,
+                prefix_cache,
+                recent_cache,
+                token_to_req_indices=attn_metadata.token_to_req_indices,
+                query_start_loc=attn_metadata.query_start_loc,
+                seq_lens=attn_metadata.seq_lens,
+                hp_row_ids=attn_metadata.hp_row_ids,
+                prefix_page_ids=attn_metadata.prefix_page_ids,
+                prefix_block_size=k_data.shape[1],
+                prefix_tokens=self.cfg.prefix_tokens,
+                recent_tokens=self.cfg.recent_tokens,
+                recent_capacity=recent_cache.shape[0] // self._max_num_seqs,
+            )
+
+        if rotated_key is None:
+            k_rot = torch.matmul(k.float(), layer._oscar_Rk)
         else:
+            k_rot = rotated_key
+        if rotated_value is None:
+            v_rot = (
+                v
+                if self._v_rotation_absorbed(layer)
+                else torch.matmul(v.float(), layer._oscar_Rv)
+            )
+        else:
+            v_rot = rotated_value
+
+        if not bulk_flush:
             oscar_store(
                 k_rot,
                 v_rot,
@@ -580,6 +606,7 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
             self.cfg.k_clip_ratio,
             self.cfg.v_clip_ratio,
         )
+        return None
 
     def forward(
         self,
@@ -614,13 +641,19 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
         num_decode_tokens = attn_metadata.num_decode_tokens
 
         if not attn_metadata.is_prefill:
-            self._update_mixed_cache(
+            k = key[:N].view(N, self.num_kv_heads, self.head_size)
+            v = value[:N].view(N, self.num_kv_heads, self.head_size)
+            fused_prep = self._can_use_fused_qk_rotation_hp_store(
+                q, k, v, kv_cache, attn_metadata, layer
+            )
+            rotated_query = self._update_mixed_cache(
                 layer,
                 key,
                 value,
                 kv_cache,
                 attn_metadata,
                 demote_recent=True,
+                fused_query=q if fused_prep else None,
             )
             output_slice = output[:N]
             expected_shape = (N, self.num_heads, self.head_size)
@@ -640,6 +673,7 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
                 attn_metadata,
                 layer,
                 output_buf=decode_output_buf,
+                rotated_query=rotated_query,
             )
             if (
                 decode_output_buf is not None
@@ -1117,8 +1151,54 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
             )
         return out[0].transpose(0, 1)
 
+    def _can_use_fused_qk_rotation_hp_store(
+        self, query, key, value, kv_cache, attn_metadata, layer
+    ) -> bool:
+        k_data, v_data, k_meta, v_meta, prefix_cache, recent_cache = kv_cache
+        if (
+            attn_metadata.is_prefill
+            or attn_metadata.num_actual_tokens != 1
+            or not attn_metadata.bulk_flush_enabled
+            or attn_metadata.bulk_flush_plan is None
+            or not self.cfg.absorb_v_rotation
+            or not bool(getattr(layer, "oscar_v_rotation_absorbed", False))
+            or not is_oscar_grouped_h4_eligible(
+                query,
+                k_data,
+                v_data,
+                k_meta,
+                v_meta,
+                attn_metadata.physical_slot_ids,
+            )
+        ):
+            return False
+        return is_oscar_fused_qk_rotation_hp_store_eligible(
+            query,
+            key,
+            value,
+            layer._oscar_Rk,
+            layer._oscar_Rk_fast,
+            prefix_cache,
+            recent_cache,
+            token_to_req_indices=attn_metadata.token_to_req_indices,
+            query_start_loc=attn_metadata.query_start_loc,
+            seq_lens=attn_metadata.seq_lens,
+            hp_row_ids=attn_metadata.hp_row_ids,
+            prefix_page_ids=attn_metadata.prefix_page_ids,
+            prefix_block_size=k_data.shape[1],
+            prefix_tokens=self.cfg.prefix_tokens,
+            recent_tokens=self.cfg.recent_tokens,
+            recent_capacity=recent_cache.shape[0] // self._max_num_seqs,
+        )
+
     def _decode_attention(
-        self, query, kv_cache, attn_metadata, layer, output_buf=None
+        self,
+        query,
+        kv_cache,
+        attn_metadata,
+        layer,
+        output_buf=None,
+        rotated_query=None,
     ):
         k_data, v_data, k_meta, v_meta, prefix_cache, recent_cache = kv_cache
         # Rotate the query into the same space as the rotated stored keys.
@@ -1138,7 +1218,9 @@ class OscarAttentionImpl(AttentionImpl["OscarMetadata"]):
             and q_rotation.device == query.device
             and q_rotation.is_contiguous()
         )
-        if grouped_h4:
+        if rotated_query is not None:
+            q_rot = rotated_query
+        elif grouped_h4:
             q_rot = torch.matmul(query, q_rotation)
         else:
             q_rot = torch.matmul(query.float(), layer._oscar_Rk)

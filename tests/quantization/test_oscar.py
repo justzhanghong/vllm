@@ -165,6 +165,75 @@ def test_mixed_kernels_reject_wrong_prefix_page_width():
         )
 
 
+@pytest.mark.parametrize(
+    ("seq_len", "hp_row", "prefix_pages"),
+    [
+        (1, 0, (0, 1, 2, 3)),
+        (65, 0, (0, 1, 2, 3)),
+        (337, 0, (0, 1, 2, 3)),
+        (17, 0, (4, 6, 5, 7)),
+        (337, -1, (0, 1, 2, 3)),
+    ],
+)
+def test_fused_qk_rotation_hp_store_matches_existing_path(
+    seq_len, hp_row, prefix_pages
+):
+    from vllm.v1.attention.ops.triton_oscar_mixed_store import (
+        is_oscar_fused_qk_rotation_hp_store_eligible,
+        oscar_fused_qk_rotation_hp_store,
+        oscar_store_hp,
+    )
+
+    device = "cuda"
+    torch.manual_seed(7)
+    qkv = torch.randn((1, 48, 128), dtype=torch.bfloat16, device=device)
+    query, key, value = qkv.split((32, 8, 8), dim=1)
+    k_rotation = torch.randn((128, 128), dtype=torch.float32, device=device)
+    q_rotation = k_rotation.to(torch.bfloat16)
+    prefix_ref = torch.zeros((128, 8, 2, 128), dtype=torch.bfloat16, device=device)
+    prefix_fused = prefix_ref.clone()
+    recent_ref = torch.zeros((272, 8, 2, 128), dtype=torch.bfloat16, device=device)
+    recent_fused = recent_ref.clone()
+    kwargs = dict(
+        token_to_req_indices=torch.zeros(1, dtype=torch.int32, device=device),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32, device=device),
+        seq_lens=torch.tensor([seq_len], dtype=torch.int32, device=device),
+        hp_row_ids=torch.tensor([hp_row], dtype=torch.int32, device=device),
+        prefix_page_ids=torch.tensor([prefix_pages], dtype=torch.int32, device=device),
+        prefix_block_size=16,
+        prefix_tokens=64,
+        recent_tokens=256,
+        recent_capacity=272,
+    )
+    assert is_oscar_fused_qk_rotation_hp_store_eligible(
+        query,
+        key,
+        value,
+        k_rotation,
+        q_rotation,
+        prefix_fused,
+        recent_fused,
+        **kwargs,
+    )
+    q_ref = torch.matmul(query, q_rotation)
+    key_ref = torch.matmul(key.float(), k_rotation)
+    oscar_store_hp(key_ref, value, prefix_ref, recent_ref, **kwargs)
+    q_fused = oscar_fused_qk_rotation_hp_store(
+        query,
+        key,
+        value,
+        k_rotation,
+        q_rotation,
+        prefix_fused,
+        recent_fused,
+        **kwargs,
+    )
+
+    torch.testing.assert_close(q_fused, q_ref)
+    torch.testing.assert_close(prefix_fused, prefix_ref)
+    torch.testing.assert_close(recent_fused, recent_ref)
+
+
 def _make_cache(num_blocks, block_size, num_kv_heads, slot_size, device):
     return torch.zeros(
         num_blocks,

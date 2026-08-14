@@ -1299,6 +1299,57 @@ class TestOscarConfigAndLayout(unittest.TestCase):
         self.assertIn("q3 = tl.load(", kernel_source)
         self.assertNotIn("q_main = tl.load(", kernel_source)
 
+    def test_fused_qk_rotation_hp_store_route_is_narrow(self):
+        from vllm.v1.attention.backends.oscar_attn import OscarAttentionImpl
+        from vllm.v1.attention.ops.triton_oscar_mixed_store import (
+            _fused_qk_rotation_hp_store_kernel,
+            is_oscar_fused_qk_rotation_hp_store_eligible,
+            oscar_fused_qk_rotation_hp_store,
+        )
+
+        qkv = torch.empty((1, 48, 128), dtype=torch.bfloat16)
+        query, key, value = qkv.split((32, 8, 8), dim=1)
+        self.assertEqual(query.stride(), (6144, 128, 1))
+        self.assertEqual(key.stride(), (6144, 128, 1))
+        rotation = torch.empty((128, 128), dtype=torch.float32)
+        prefix = torch.empty((64, 8, 2, 128), dtype=torch.bfloat16)
+        recent = torch.empty((272, 8, 2, 128), dtype=torch.bfloat16)
+        kwargs = dict(
+            token_to_req_indices=torch.zeros(1, dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+            seq_lens=torch.ones(1, dtype=torch.int32),
+            hp_row_ids=torch.zeros(1, dtype=torch.int32),
+            prefix_page_ids=torch.arange(4, dtype=torch.int32).view(1, 4),
+            prefix_block_size=16,
+            prefix_tokens=64,
+            recent_tokens=256,
+            recent_capacity=272,
+        )
+        eligible = is_oscar_fused_qk_rotation_hp_store_eligible
+        args = (query, key, value, rotation, rotation.bfloat16(), prefix, recent)
+        self.assertTrue(eligible(*args, **kwargs))
+        self.assertFalse(eligible(query.float(), *args[1:], **kwargs))
+
+        wrapper = inspect.getsource(oscar_fused_qk_rotation_hp_store)
+        self.assertIn("_fused_qk_rotation_hp_store_kernel[(num_tokens, 8)]", wrapper)
+        kernel = inspect.getsource(_fused_qk_rotation_hp_store_kernel.fn)
+        self.assertIn('input_precision="ieee"', kernel)
+        self.assertIn("query_rot = tl.dot(query, q_rotation)", kernel)
+        self.assertNotIn("atomic", kernel)
+
+        update = inspect.getsource(OscarAttentionImpl._update_mixed_cache)
+        self.assertLess(
+            update.index("oscar_bulk_flush("),
+            update.index("if fused_query is not None:"),
+        )
+        forward = inspect.getsource(OscarAttentionImpl.forward)
+        self.assertIn("fused_query=q if fused_prep else None", forward)
+        self.assertIn("rotated_query=rotated_query", forward)
+        decode = inspect.getsource(OscarAttentionImpl._decode_attention)
+        self.assertIn("q_rot = rotated_query", decode)
+        self.assertIn("q_rot = torch.matmul(query, q_rotation)", decode)
+        self.assertIn("q_rot = torch.matmul(query.float(), layer._oscar_Rk)", decode)
+
     def test_grouped_h4_prefetches_v_once_before_k_dequant_and_qk(self):
         from vllm.v1.attention.ops.triton_oscar_decode import (
             _oscar_decode_quant_stage1_grouped_h4,

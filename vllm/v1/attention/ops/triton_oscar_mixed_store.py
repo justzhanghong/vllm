@@ -125,6 +125,150 @@ def _store_hp_kernel(
 
 
 @triton.jit
+def _fused_qk_rotation_hp_store_kernel(
+    Query_ptr,
+    Key_ptr,
+    Value_ptr,
+    K_rotation_ptr,
+    Q_rotation_ptr,
+    Q_rot_ptr,
+    Prefix_ptr,
+    Recent_ptr,
+    Token_req_ptr,
+    Query_start_ptr,
+    Seq_lens_ptr,
+    HP_rows_ptr,
+    Prefix_pages_ptr,
+    num_tokens,
+    stride_query_token: tl.constexpr,
+    stride_query_head: tl.constexpr,
+    stride_key_token: tl.constexpr,
+    stride_key_head: tl.constexpr,
+    stride_value_token: tl.constexpr,
+    stride_value_head: tl.constexpr,
+    stride_k_rotation_row: tl.constexpr,
+    stride_q_rotation_row: tl.constexpr,
+    stride_q_rot_token: tl.constexpr,
+    stride_q_rot_head: tl.constexpr,
+    stride_prefix_slot: tl.constexpr,
+    stride_prefix_head: tl.constexpr,
+    stride_prefix_kv: tl.constexpr,
+    stride_recent_slot: tl.constexpr,
+    stride_recent_head: tl.constexpr,
+    stride_recent_kv: tl.constexpr,
+    stride_prefix_pages_req: tl.constexpr,
+    PREFIX_TOKENS: tl.constexpr,
+    RECENT_TOKENS: tl.constexpr,
+    RECENT_CAPACITY: tl.constexpr,
+    PREFIX_BLOCK_SIZE: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    column_tile = tl.program_id(1)
+    if token_idx >= num_tokens:
+        return
+
+    input_offs = tl.arange(0, 128)
+    output_offs = column_tile * 16 + tl.arange(0, 16)
+    query_heads = tl.arange(0, 32)
+    kv_heads = tl.arange(0, 16)
+    kv_head_mask = kv_heads < 8
+
+    query_base = token_idx.to(tl.int64) * stride_query_token
+    query = tl.load(
+        Query_ptr
+        + query_base
+        + query_heads[:, None].to(tl.int64) * stride_query_head
+        + input_offs[None, :]
+    ).to(tl.bfloat16)
+    q_rotation = tl.load(
+        Q_rotation_ptr
+        + input_offs[:, None].to(tl.int64) * stride_q_rotation_row
+        + output_offs[None, :]
+    ).to(tl.bfloat16)
+    query_rot = tl.dot(query, q_rotation)
+    query_rot_base = token_idx.to(tl.int64) * stride_q_rot_token
+    tl.store(
+        Q_rot_ptr
+        + query_rot_base
+        + query_heads[:, None].to(tl.int64) * stride_q_rot_head
+        + output_offs[None, :],
+        query_rot.to(tl.bfloat16),
+    )
+
+    key_base = token_idx.to(tl.int64) * stride_key_token
+    key = tl.load(
+        Key_ptr
+        + key_base
+        + kv_heads[:, None].to(tl.int64) * stride_key_head
+        + input_offs[None, :],
+        mask=kv_head_mask[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    k_rotation = tl.load(
+        K_rotation_ptr
+        + input_offs[:, None].to(tl.int64) * stride_k_rotation_row
+        + output_offs[None, :]
+    ).to(tl.float32)
+    key_rot = tl.dot(key, k_rotation, input_precision="ieee")
+    value_base = token_idx.to(tl.int64) * stride_value_token
+    value = tl.load(
+        Value_ptr
+        + value_base
+        + kv_heads[:, None].to(tl.int64) * stride_value_head
+        + output_offs[None, :],
+        mask=kv_head_mask[:, None],
+        other=0.0,
+    ).to(tl.bfloat16)
+
+    req_idx = tl.load(Token_req_ptr + token_idx)
+    query_start = tl.load(Query_start_ptr + req_idx)
+    query_end = tl.load(Query_start_ptr + req_idx + 1)
+    final_seq_len = tl.load(Seq_lens_ptr + req_idx)
+    hp_row = tl.load(HP_rows_ptr + req_idx)
+    if hp_row < 0:
+        return
+    pos = final_seq_len - (query_end - query_start) + token_idx - query_start
+    recent_start = tl.maximum(PREFIX_TOKENS, final_seq_len - RECENT_TOKENS)
+    is_prefix = pos < PREFIX_TOKENS
+    is_recent = pos >= recent_start
+    if not (is_prefix or is_recent):
+        return
+
+    prefix_page = tl.load(
+        Prefix_pages_ptr + req_idx * stride_prefix_pages_req + pos // PREFIX_BLOCK_SIZE,
+        mask=is_prefix,
+        other=0,
+    )
+    prefix_idx = prefix_page * PREFIX_BLOCK_SIZE + pos % PREFIX_BLOCK_SIZE
+    prefix_base = (
+        prefix_idx.to(tl.int64) * stride_prefix_slot
+        + kv_heads[:, None].to(tl.int64) * stride_prefix_head
+        + output_offs[None, :]
+    )
+    prefix_mask = kv_head_mask[:, None] & is_prefix
+    tl.store(Prefix_ptr + prefix_base, key_rot.to(tl.bfloat16), mask=prefix_mask)
+    tl.store(
+        Prefix_ptr + prefix_base + stride_prefix_kv,
+        value,
+        mask=prefix_mask,
+    )
+
+    recent_idx = (pos - PREFIX_TOKENS) % RECENT_CAPACITY
+    recent_base = (
+        (hp_row * RECENT_CAPACITY + recent_idx).to(tl.int64) * stride_recent_slot
+        + kv_heads[:, None].to(tl.int64) * stride_recent_head
+        + output_offs[None, :]
+    )
+    recent_mask = kv_head_mask[:, None] & is_recent & ~is_prefix
+    tl.store(Recent_ptr + recent_base, key_rot.to(tl.bfloat16), mask=recent_mask)
+    tl.store(
+        Recent_ptr + recent_base + stride_recent_kv,
+        value,
+        mask=recent_mask,
+    )
+
+
+@triton.jit
 def _demote_hp_kernel(
     Recent_ptr,
     K_data_ptr,
@@ -247,6 +391,163 @@ def _clip_index(ratio: float, head_dim: int) -> int:
     if ratio <= 0.0:
         return -1
     return min(int(ratio * head_dim), head_dim - 1)
+
+
+def is_oscar_fused_qk_rotation_hp_store_eligible(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_rotation: torch.Tensor,
+    q_rotation: torch.Tensor,
+    prefix_cache: torch.Tensor,
+    recent_cache: torch.Tensor,
+    *,
+    token_to_req_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    hp_row_ids: torch.Tensor,
+    prefix_page_ids: torch.Tensor,
+    prefix_block_size: int,
+    prefix_tokens: int,
+    recent_tokens: int,
+    recent_capacity: int,
+) -> bool:
+    """Fail closed unless the C110 pure-decode specialization is exact."""
+    tensors = (
+        query,
+        key,
+        value,
+        k_rotation,
+        q_rotation,
+        prefix_cache,
+        recent_cache,
+        token_to_req_indices,
+        query_start_loc,
+        seq_lens,
+        hp_row_ids,
+        prefix_page_ids,
+    )
+    integer_metadata = (
+        token_to_req_indices,
+        query_start_loc,
+        seq_lens,
+        hp_row_ids,
+        prefix_page_ids,
+    )
+    return bool(
+        query.shape == (1, 32, 128)
+        and key.shape == (1, 8, 128)
+        and value.shape == key.shape
+        and query.dtype == key.dtype == value.dtype == torch.bfloat16
+        and query.stride()[1:] == (128, 1)
+        and key.stride()[1:] == (128, 1)
+        and value.stride()[1:] == (128, 1)
+        and k_rotation.shape == (128, 128)
+        and k_rotation.dtype == torch.float32
+        and k_rotation.is_contiguous()
+        and q_rotation.shape == (128, 128)
+        and q_rotation.dtype == torch.bfloat16
+        and q_rotation.is_contiguous()
+        and prefix_cache.shape[1:] == (8, 2, 128)
+        and recent_cache.shape == (recent_capacity, 8, 2, 128)
+        and prefix_cache.dtype == recent_cache.dtype == torch.bfloat16
+        and prefix_cache.is_contiguous()
+        and recent_cache.is_contiguous()
+        and token_to_req_indices.shape == (1,)
+        and query_start_loc.shape == (2,)
+        and seq_lens.shape == (1,)
+        and hp_row_ids.shape == (1,)
+        and prefix_page_ids.shape == (1, 4)
+        and all(tensor.dtype == torch.int32 for tensor in integer_metadata)
+        and all(tensor.device == query.device for tensor in tensors)
+        and prefix_block_size == 16
+        and prefix_tokens == 64
+        and recent_tokens == 256
+        and recent_capacity == 272
+        and prefix_cache.shape[0] >= prefix_tokens
+    )
+
+
+def oscar_fused_qk_rotation_hp_store(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_rotation: torch.Tensor,
+    q_rotation: torch.Tensor,
+    prefix_cache: torch.Tensor,
+    recent_cache: torch.Tensor,
+    *,
+    token_to_req_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    hp_row_ids: torch.Tensor,
+    prefix_page_ids: torch.Tensor,
+    prefix_block_size: int,
+    prefix_tokens: int,
+    recent_tokens: int,
+    recent_capacity: int,
+) -> torch.Tensor:
+    if not is_oscar_fused_qk_rotation_hp_store_eligible(
+        query,
+        key,
+        value,
+        k_rotation,
+        q_rotation,
+        prefix_cache,
+        recent_cache,
+        token_to_req_indices=token_to_req_indices,
+        query_start_loc=query_start_loc,
+        seq_lens=seq_lens,
+        hp_row_ids=hp_row_ids,
+        prefix_page_ids=prefix_page_ids,
+        prefix_block_size=prefix_block_size,
+        prefix_tokens=prefix_tokens,
+        recent_tokens=recent_tokens,
+        recent_capacity=recent_capacity,
+    ):
+        raise ValueError("unsupported OSCAR fused Q/K rotation HP-store layout")
+    q_rot = torch.empty_like(query)
+    num_tokens = query.shape[0]
+    _fused_qk_rotation_hp_store_kernel[(num_tokens, 8)](
+        query,
+        key,
+        value,
+        k_rotation,
+        q_rotation,
+        q_rot,
+        prefix_cache,
+        recent_cache,
+        token_to_req_indices,
+        query_start_loc,
+        seq_lens,
+        hp_row_ids,
+        prefix_page_ids,
+        num_tokens,
+        stride_query_token=query.stride(0),
+        stride_query_head=query.stride(1),
+        stride_key_token=key.stride(0),
+        stride_key_head=key.stride(1),
+        stride_value_token=value.stride(0),
+        stride_value_head=value.stride(1),
+        stride_k_rotation_row=k_rotation.stride(0),
+        stride_q_rotation_row=q_rotation.stride(0),
+        stride_q_rot_token=q_rot.stride(0),
+        stride_q_rot_head=q_rot.stride(1),
+        stride_prefix_slot=prefix_cache.stride(0),
+        stride_prefix_head=prefix_cache.stride(1),
+        stride_prefix_kv=prefix_cache.stride(2),
+        stride_recent_slot=recent_cache.stride(0),
+        stride_recent_head=recent_cache.stride(1),
+        stride_recent_kv=recent_cache.stride(2),
+        stride_prefix_pages_req=prefix_page_ids.stride(0),
+        PREFIX_TOKENS=prefix_tokens,
+        RECENT_TOKENS=recent_tokens,
+        RECENT_CAPACITY=recent_capacity,
+        PREFIX_BLOCK_SIZE=prefix_block_size,
+        num_warps=4,
+        num_stages=1,
+    )
+    return q_rot
 
 
 def oscar_store_hp(
