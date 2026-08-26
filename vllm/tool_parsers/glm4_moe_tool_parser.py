@@ -74,8 +74,10 @@ class Glm4MoeModelToolParser(ToolParser):
         self.func_detail_regex = re.compile(
             r"<tool_call>([^\n]*)\n(.*)</tool_call>", re.DOTALL
         )
+        # 6th hotfix: tolerate a missing opening <arg_value> tag.
         self.func_arg_regex = re.compile(
-            r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL
+            r"<arg_key>(.*?)</arg_key>\s*(?:<arg_value>)?(.*?)</arg_value>",
+            re.DOTALL,
         )
 
         if not self.model_tokenizer:
@@ -124,6 +126,48 @@ class Glm4MoeModelToolParser(ToolParser):
         return json.dumps(s, ensure_ascii=False)[1:-1]
 
     @staticmethod
+    def _schema_is_string_like(schema: Any) -> bool:
+        """Return True for JSON-schema shapes that represent string values.
+
+        Claude Code built-in tools often describe enum-like string fields as
+        ``enum``/``anyOf``/nullable variants instead of a plain
+        ``{"type":"string"}``.  The streaming parser must recognize those
+        as strings before it emits partial JSON.  Otherwise it streams an
+        unquoted partial value (for example ``{"status": in_progress``); when
+        the complete value is later converted to valid JSON, the append-only
+        diff cannot insert the missing opening quote and Claude receives a
+        malformed tool input such as ``{"status": in_progresss"}``.
+        """
+        if not isinstance(schema, dict):
+            return False
+
+        schema_type = schema.get("type")
+        if schema_type == "string":
+            return True
+        if isinstance(schema_type, list) and "string" in schema_type:
+            return True
+
+        enum_values = schema.get("enum")
+        if isinstance(enum_values, list) and any(
+            isinstance(v, str) for v in enum_values
+        ):
+            if all(isinstance(v, str) or v is None for v in enum_values):
+                return True
+
+        if isinstance(schema.get("const"), str):
+            return True
+
+        for key in ("anyOf", "oneOf", "allOf"):
+            variants = schema.get(key)
+            if isinstance(variants, list) and any(
+                Glm4MoeModelToolParser._schema_is_string_like(v)
+                for v in variants
+            ):
+                return True
+
+        return False
+
+    @staticmethod
     def _is_string_type(
         tool_name: str,
         arg_name: str,
@@ -136,12 +180,11 @@ class Glm4MoeModelToolParser(ToolParser):
                 continue
             if tool.function.parameters is None:
                 return False
-            arg_type = (
+            arg_schema = (
                 tool.function.parameters.get("properties", {})
                 .get(arg_name, {})
-                .get("type", None)
             )
-            return arg_type == "string"
+            return Glm4MoeModelToolParser._schema_is_string_like(arg_schema)
         logger.debug("No tool named '%s'.", tool_name)
         return False
 
@@ -457,8 +500,23 @@ class Glm4MoeModelToolParser(ToolParser):
         for i, (inner_text, is_complete) in enumerate(regions):
             self._ensure_tool_state_for(i)
 
-            # Extract tool name
+            # Extract tool name.  GLM-4.7/5.x may emit a zero-argument
+            # call as exactly ``<tool_call>TaskList</tool_call>``.  The
+            # historical streaming parser waited for a newline or <arg_key>
+            # delimiter before considering the function name complete, so a
+            # complete no-arg call produced finish_reason=tool_calls with no
+            # tool_call delta.  Claude Code treats that as a malformed tool
+            # call.  If the region is already complete and contains only the
+            # tool name, accept the stripped region as the function name.
             tool_name = self._extract_tool_name_from_region(inner_text)
+            if not tool_name and is_complete:
+                candidate_tool_name = inner_text.strip()
+                if (
+                    candidate_tool_name
+                    and self.arg_key_start not in candidate_tool_name
+                    and "\n" not in candidate_tool_name
+                ):
+                    tool_name = candidate_tool_name
             if not tool_name:
                 break
 

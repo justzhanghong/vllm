@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ast
+import dataclasses
 import os
 import time
 from importlib.util import find_spec
@@ -221,6 +222,14 @@ class SpecDecodeBaseProposer:
             with_numpy=True,
         )
 
+        # The local SpeculativeConfig exposes probabilistic drafting through
+        # rejection_sample_method.  In that mode retain q(x) for each draft
+        # token so the verifier can use the lossless min(1, p(x) / q(x)) test.
+        self._enable_probabilistic_draft_probs = (
+            self.speculative_config.rejection_sample_method == "probabilistic"
+        )
+        self._last_draft_probs: torch.Tensor | None = None
+
         self._slot_mapping_buffer = torch.zeros(
             self.max_positions,
             dtype=torch.int64,
@@ -406,6 +415,47 @@ class SpecDecodeBaseProposer:
             return self.model.get_top_tokens(hidden_states)
         return self.model.compute_logits(hidden_states).argmax(dim=-1)
 
+    def _sample_from_logits(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if not self._enable_probabilistic_draft_probs:
+            return logits.argmax(dim=-1), None
+        if sampling_metadata.all_greedy:
+            return logits.argmax(dim=-1), None
+
+        # Parallel drafting has K request-major rows per request while the
+        # sampling metadata is per request. MTP is sequential, but preserving
+        # this upstream behavior keeps the helper correct for both layouts.
+        temperature = sampling_metadata.temperature
+        if temperature is not None and temperature.shape[0] != logits.shape[0]:
+            assert logits.shape[0] % temperature.shape[0] == 0
+            factor = logits.shape[0] // temperature.shape[0]
+            sampling_metadata = dataclasses.replace(
+                sampling_metadata,
+                temperature=temperature.repeat_interleave(factor, dim=0),
+            )
+
+        return compute_probs_and_sample_next_token(logits, sampling_metadata)
+
+    def _sample_draft_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if (
+            not self._enable_probabilistic_draft_probs
+            or sampling_metadata.all_greedy
+        ):
+            return self._greedy_sample(hidden_states), None
+        logits = self.model.compute_logits(hidden_states)
+        return self._sample_from_logits(logits, sampling_metadata)
+
+    def take_last_draft_probs(self) -> torch.Tensor | None:
+        """Transfer ownership of probabilities from the latest proposal."""
+        return self._last_draft_probs
+
     def propose(
         self,
         # [num_tokens]
@@ -425,6 +475,7 @@ class SpecDecodeBaseProposer:
         | list[dict[str, torch.Tensor]]
         | None = None,
     ) -> torch.Tensor:
+        self._last_draft_probs = None
         batch_size = common_attn_metadata.batch_size()
         mtp_propose_debug = (
             self.method == "mtp"
@@ -577,7 +628,12 @@ class SpecDecodeBaseProposer:
                 last_hidden_states, hidden_states = ret_hidden_states
         if self._share_mtp_indices and hasattr(self.model.model,
                                                "set_skip_topk"):
+            # Compact sparse-index rows before later MTP steps reuse them.
             self.model.model.set_skip_topk(True)
+            if hasattr(self.model.model, "compact_topk_indices"):
+                self.model.model.compact_topk_indices(
+                    token_indices_to_sample
+                )
         log_mtp_proposer_event(
             "model_forward_first_pass_done",
             phase_start,
@@ -596,13 +652,19 @@ class SpecDecodeBaseProposer:
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
             phase_start = time.perf_counter()
-            log_mtp_proposer_event("greedy_sample_enter")
-            draft_token_ids = self._greedy_sample(sample_hidden_states)
+            log_mtp_proposer_event("draft_sample_enter")
+            draft_token_ids, draft_probs = self._sample_draft_tokens(
+                sample_hidden_states, sampling_metadata
+            )
             log_mtp_proposer_event(
-                "greedy_sample_done",
+                "draft_sample_done",
                 phase_start,
                 draft_token_shape=_tensor_shape(draft_token_ids),
             )
+            if draft_probs is not None:
+                self._last_draft_probs = draft_probs.view(
+                    batch_size, self.num_speculative_tokens, -1
+                ).contiguous()
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         if self.uses_mrope:
@@ -625,7 +687,10 @@ class SpecDecodeBaseProposer:
             # [batch_size, num_tree_tokens]
             return torch.cat(draft_token_ids_list, dim=1)
 
-        draft_token_ids = self._greedy_sample(sample_hidden_states)
+        draft_token_ids, draft_probs = self._sample_draft_tokens(
+            sample_hidden_states, sampling_metadata
+        )
+        draft_probs_list = None if draft_probs is None else [draft_probs]
 
         if self.allowed_attn_types is not None:
             for group_md in per_group_attn_metadata:
@@ -759,11 +824,20 @@ class SpecDecodeBaseProposer:
                     last_hidden_states, hidden_states = ret_hidden_states
 
             hidden_states = hidden_states[:batch_size]
-            draft_token_ids = self._greedy_sample(last_hidden_states[:batch_size])
+            draft_token_ids, draft_probs = self._sample_draft_tokens(
+                last_hidden_states[:batch_size], sampling_metadata
+            )
+            if draft_probs is not None:
+                assert draft_probs_list is not None
+                draft_probs_list.append(draft_probs)
             draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+        if draft_probs_list is not None:
+            self._last_draft_probs = torch.stack(
+                draft_probs_list, dim=1
+            ).contiguous()
         return draft_token_ids
 
     def set_inputs_first_pass(
@@ -946,6 +1020,13 @@ class SpecDecodeBaseProposer:
         return per_group_attn_metadata, per_layer_attn_metadata
 
     def model_returns_tuple(self) -> bool:
+        if self.method == "mtp":
+            # GLM-5.2's speculative setup rewrites the draft architecture to
+            # DeepSeekMTPModel.  That model returns (pre_norm, post_norm),
+            # while other MTP variants retain their legacy single-tensor ABI.
+            return "DeepSeekMTPModel" in (
+                self.draft_model_config.hf_config.architectures or []
+            )
         return self.method not in ("mtp", "draft_model", "dflash")
 
     def prepare_next_token_ids_cpu(

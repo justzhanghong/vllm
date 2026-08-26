@@ -153,7 +153,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         previous_hidden_states: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_index: int = 0,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         assert inputs_embeds is not None
         _mtp_layer_debug_log(
             "predictor_layer_enter",
@@ -196,13 +196,17 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
             residual_shape=tuple(residual.shape),
         )
         hidden_states = residual + hidden_states
+        # Logits consume the pre-final-norm state, whereas the next MTP draft
+        # step must recycle the corresponding SharedHead final-norm state.
+        # Keep both tensors so proposer.py can preserve that distinction.
+        post_norm_hidden_states = self.shared_head(hidden_states)
         _mtp_layer_debug_log(
             "predictor_layer_return",
             self.prefix,
             positions,
             output_shape=tuple(hidden_states.shape),
         )
-        return hidden_states
+        return hidden_states, post_norm_hidden_states
 
 
 class DeepSeekMultiTokenPredictor(nn.Module):
@@ -248,6 +252,33 @@ class DeepSeekMultiTokenPredictor(nn.Module):
             if mla_attn is not None and hasattr(mla_attn, "skip_topk"):
                 mla_attn.skip_topk = skip
 
+    def compact_topk_indices(
+        self, token_indices_to_sample: torch.Tensor
+    ) -> None:
+        """Compact shared sparse-index rows after the first MTP pass.
+
+        The first pass has one row per target query token, while later MTP
+        passes have one row per request.  IndexShare therefore must gather the
+        per-request sampling rows to the front of every MTP layer's indexer
+        buffer before ``skip_topk`` is enabled.  This is the local GLM sparse
+        indexer equivalent of upstream vLLM PR #47238.
+        """
+        indices = token_indices_to_sample.to(dtype=torch.long)
+        num_rows = int(indices.numel())
+        if num_rows == 0:
+            return
+        for layer_key, layer in self.layers.items():
+            mtp_block = getattr(layer, "mtp_block", None)
+            self_attn = getattr(mtp_block, "self_attn", None)
+            mla_attn = getattr(self_attn, "mla_attn", None)
+            indexer = getattr(mla_attn, "indexer", None)
+            buffer = getattr(indexer, "topk_indices_buffer", None)
+            if buffer is not None:
+                # Advanced indexing materializes the RHS, so overlapping source
+                # and destination rows cannot overwrite rows still to be read.
+                selected = buffer.index_select(0, indices)
+                buffer[:num_rows] = selected
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -258,7 +289,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         previous_hidden_states: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         current_step_idx = spec_step_idx % self.num_mtp_layers
@@ -335,7 +366,7 @@ class DeepSeekMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states = self.model(
             input_ids, positions, hidden_states, inputs_embeds, spec_step_idx
         )

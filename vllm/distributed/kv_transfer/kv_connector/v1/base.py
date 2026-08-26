@@ -481,6 +481,15 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    @property
+    def is_disagg_prefill_transfer(self) -> bool:
+        """Whether connector matched tokens are disaggregated P/D transfer.
+
+        Tokens reported by get_num_new_matched_tokens() for such connectors
+        should not be exposed as user-visible prefix-cache hits.
+        """
+        return False
+
     @abstractmethod
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int

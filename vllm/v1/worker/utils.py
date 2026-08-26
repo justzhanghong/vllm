@@ -88,10 +88,19 @@ class KVBlockZeroer:
     def __init__(self, device: torch.device, pin_memory: bool):
         self.device = device
         self.pin_memory = pin_memory
-        self._meta: tuple[torch.Tensor, int, int, int] | None = None
-        self._id_cap: int = 0
-        self._ids_pinned: torch.Tensor | None = None
-        self._ids_gpu: torch.Tensor | None = None
+        # Session-mixup fix (2026-08-14): _meta is now a LIST of per-page-size
+        # metas, not a single tuple. Upstream assumed every attention layer has
+        # the same page_size_el (assert page_size_el == cur_page_el). GLM-5.2 is
+        # MLA: its KV cache has non-uniform page sizes across layers (e.g. 2112
+        # vs 18432 elements per block), so the single-meta assumption crashes at
+        # init. We group segments by page_size_el and zero each group with its
+        # own Triton launch. Each element is (seg_addrs, page_size_el, blk_size,
+        # n_segs) — the same tuple shape as upstream, just one per distinct page
+        # size instead of one global.
+        self._meta: list[tuple[torch.Tensor, int, int, int]] | None = None
+        # Do not reuse host/device ID staging buffers across asynchronous
+        # batches. A second call can otherwise overwrite the pinned source
+        # before the first nonblocking H2D copy consumes it (#48085).
 
     def init_meta(
         self,
@@ -115,8 +124,11 @@ class KVBlockZeroer:
         Only AttentionSpec layers are processed; Mamba layers are skipped.
         """
         seen_ptrs: set[int] = set()
-        seg_addrs: list[int] = []
-        page_size_el: int | None = None
+        # Session-mixup fix (2026-08-14): seg_addrs grouped by page_size_el so
+        # non-uniform MLA page sizes (2112 vs 18432) no longer trip the global
+        # uniform-page-size assert. Key = page_size_el (elements per block),
+        # value = list of absolute byte addresses of each segment's start.
+        seg_addrs_by_page: dict[int, list[int]] = defaultdict(list)
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
@@ -149,12 +161,6 @@ class KVBlockZeroer:
                 assert cur_bytes % 4 == 0
                 kernel_block_el = cur_bytes // 4
                 cur_page_el = kernel_block_el * ratio
-                if page_size_el is None:
-                    page_size_el = cur_page_el
-                else:
-                    assert page_size_el == cur_page_el, (
-                        f"Non-uniform page sizes: {page_size_el} vs {cur_page_el}"
-                    )
 
                 block_stride_bytes = cur_bytes
                 outer_dims = [
@@ -165,56 +171,53 @@ class KVBlockZeroer:
                 outer_strides = [kv.stride(d) * el for d in outer_dims]
                 for outer in iprod(*(range(kv.shape[d]) for d in outer_dims)):
                     off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
-                    seg_addrs.append(dp + off_bytes)
+                    seg_addrs_by_page[cur_page_el].append(dp + off_bytes)
 
-        if not seg_addrs or page_size_el is None:
+        if not seg_addrs_by_page:
             self._meta = None
             return
 
-        blk_size = min(largest_power_of_2_divisor(page_size_el), 1024)
-        self._id_cap = 8192
-        self._ids_pinned = torch.empty(
-            self._id_cap,
-            dtype=torch.int64,
-            pin_memory=self.pin_memory,
-        )
-        self._ids_gpu = torch.empty(self._id_cap, dtype=torch.int64, device=self.device)
-        self._meta = (
-            torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
-            page_size_el,
-            blk_size,
-            len(seg_addrs),
-        )
+        # One meta per distinct page_size_el. Each gets its own blk_size (a
+        # power-of-2 divisor of its page size) and its own Triton launch in
+        # zero_block_ids, so non-uniform page sizes zero correctly.
+        self._meta = [
+            (
+                torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
+                page_size_el,
+                min(largest_power_of_2_divisor(page_size_el), 1024),
+                len(seg_addrs),
+            )
+            for page_size_el, seg_addrs in seg_addrs_by_page.items()
+        ]
 
     def zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
         if not block_ids or self._meta is None:
             return
-        seg_addrs, page_size_el, blk_size, n_segs = self._meta
         n_blocks = len(block_ids)
-        if n_blocks > self._id_cap:
-            self._id_cap = n_blocks * 2
-            self._ids_pinned = torch.empty(
-                self._id_cap,
-                dtype=torch.int64,
-                pin_memory=self.pin_memory,
-            )
-            self._ids_gpu = torch.empty(
-                self._id_cap, dtype=torch.int64, device=self.device
-            )
-        assert self._ids_pinned is not None and self._ids_gpu is not None
-        self._ids_pinned[:n_blocks].numpy()[:] = block_ids
-        idx = self._ids_gpu[:n_blocks]
-        idx.copy_(self._ids_pinned[:n_blocks], non_blocking=True)
-        grid = (n_blocks * n_segs * (page_size_el // blk_size),)
-        _zero_kv_blocks_kernel[grid](
-            seg_addrs,
-            idx,
-            n_blocks,
-            N_SEGS=n_segs,
-            PAGE_SIZE_EL=page_size_el,
-            BLOCK_SIZE=blk_size,
+        # Each in-flight copy needs independent pinned storage. PyTorch's pinned
+        # allocator defers reuse until this nonblocking H2D transfer completes.
+        # This is the local equivalent of upstream async_tensor_h2d (#48085).
+        ids_pinned = torch.tensor(
+            block_ids,
+            dtype=torch.int64,
+            pin_memory=self.pin_memory,
+            device="cpu",
         )
+        idx = ids_pinned.to(device=self.device, non_blocking=True)
+        # Session-mixup fix (2026-08-14): one Triton launch per distinct page
+        # size. Each launch zeroes only the segments of that page size, using
+        # the matching PAGE_SIZE_EL/BLOCK_SIZE constants.
+        for seg_addrs, page_size_el, blk_size, n_segs in self._meta:
+            grid = (n_blocks * n_segs * (page_size_el // blk_size),)
+            _zero_kv_blocks_kernel[grid](
+                seg_addrs,
+                idx,
+                n_blocks,
+                N_SEGS=n_segs,
+                PAGE_SIZE_EL=page_size_el,
+                BLOCK_SIZE=blk_size,
+            )
 
 
 @dataclass

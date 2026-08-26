@@ -84,6 +84,13 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
             == "true"
         )
 
+    @property
+    def is_disagg_prefill_transfer(self) -> bool:
+        # NIXL in this deployment is used for disaggregated prefill/decode KV
+        # transfer.  These transferred tokens are not reusable prefix-cache hits
+        # and must be excluded from API cached_tokens/cache_read_input_tokens.
+        return True
+
     def __init__(
         self,
         vllm_config: VllmConfig,

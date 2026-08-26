@@ -248,7 +248,9 @@ class PrefillStats:
         num_computed_tokens: Tokens to be prefilled locally (actual compute work).
         num_cached_tokens: Tokens to be prefilled without actual compute work.
         num_local_cached_tokens: Tokens to be prefilled from local prefix cache.
-        num_external_cached_tokens: Tokens to be prefilled from external KV transfer.
+        num_external_cached_tokens: Tokens to be prefilled from external KV cache.
+        num_disagg_transfer_tokens: Tokens transferred from disaggregated P/D
+            prefill, excluded from user-visible cache hit accounting.
     """
 
     num_prompt_tokens: int = 0
@@ -256,21 +258,27 @@ class PrefillStats:
     num_cached_tokens: int = 0
     num_local_cached_tokens: int = 0
     num_external_cached_tokens: int = 0
+    num_disagg_transfer_tokens: int = 0
 
     def set(
         self,
         num_prompt_tokens: int,
         num_local_cached_tokens: int,
         num_external_cached_tokens: int,
+        num_disagg_transfer_tokens: int = 0,
     ):
         num_cached_tokens = num_local_cached_tokens + num_external_cached_tokens
         assert num_cached_tokens <= num_prompt_tokens
+        assert num_cached_tokens + num_disagg_transfer_tokens <= num_prompt_tokens
 
         self.num_prompt_tokens = num_prompt_tokens
-        self.num_computed_tokens = num_prompt_tokens - num_cached_tokens
+        self.num_computed_tokens = (
+            num_prompt_tokens - num_cached_tokens - num_disagg_transfer_tokens
+        )
         self.num_cached_tokens = num_cached_tokens
         self.num_local_cached_tokens = num_local_cached_tokens
         self.num_external_cached_tokens = num_external_cached_tokens
+        self.num_disagg_transfer_tokens = num_disagg_transfer_tokens
 
 
 @dataclass
@@ -286,18 +294,20 @@ class PromptTokenStats:
 
     Invariants:
         computed + local_cache_hit + external_kv_transfer = total
-        local_cache_hit + external_kv_transfer = cached_tokens
+        local_cache_hit + (external_kv_transfer - disagg_transfer) = cached_tokens
     """
 
     ALL_SOURCES: tuple[str, ...] = (
         "local_compute",
         "local_cache_hit",
         "external_kv_transfer",
+        "disagg_transfer",
     )
 
     computed: int = 0
     local_cache_hit: int = 0
     external_kv_transfer: int = 0
+    disagg_transfer: int = 0
     cached_tokens: int = 0
     total: int = 0
 
@@ -308,7 +318,11 @@ class PromptTokenStats:
         self.total += prefill_stats.num_prompt_tokens
 
         self.local_cache_hit += prefill_stats.num_local_cached_tokens
-        self.external_kv_transfer += prefill_stats.num_external_cached_tokens
+        self.external_kv_transfer += (
+            prefill_stats.num_external_cached_tokens
+            + prefill_stats.num_disagg_transfer_tokens
+        )
+        self.disagg_transfer += prefill_stats.num_disagg_transfer_tokens
 
     def get_by_source(self, source: str) -> int:
         """Get token count by source label."""
@@ -316,6 +330,7 @@ class PromptTokenStats:
             "local_compute": self.computed,
             "local_cache_hit": self.local_cache_hit,
             "external_kv_transfer": self.external_kv_transfer,
+            "disagg_transfer": self.disagg_transfer,
         }
         if source not in source_map:
             raise ValueError(f"Unknown source: {source}")

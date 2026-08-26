@@ -65,7 +65,7 @@ def _build_anthropic_usage(
     cached = _get_cached_tokens(usage)
     if cached is not None:
         return AnthropicUsage(
-            input_tokens=prompt_tokens - cached,
+            input_tokens=max(0, prompt_tokens - cached),
             output_tokens=output_tokens,
             cache_creation_input_tokens=0,
             cache_read_input_tokens=cached,
@@ -76,6 +76,35 @@ def _build_anthropic_usage(
         cache_creation_input_tokens=0,
         cache_read_input_tokens=0,
     )
+
+
+def _normalize_tool_input(value: Any) -> Any:
+    """Normalize tool-call arguments for Anthropic tool_use blocks.
+
+    Some model/parser paths can produce a JSON string or a wrapper such as
+    {"__unparsedToolInput": "{...}"}.  Anthropic clients expect input to
+    be an object matching the schema; forwarding the wrapper causes Claude Code
+    to report Invalid tool parameters.
+    """
+    for _ in range(3):
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+                continue
+            except Exception:
+                return {"value": value}
+        if isinstance(value, dict) and set(value.keys()) == {"__unparsedToolInput"}:
+            value = value.get("__unparsedToolInput")
+            continue
+        return value
+    return value
+
+
+def _safe_tool_arguments_to_input(arguments: Any) -> dict[str, Any]:
+    value = _normalize_tool_input(arguments)
+    if isinstance(value, dict):
+        return value
+    return {"value": value}
 
 
 def wrap_data_with_event(data: str, event: str):
@@ -199,8 +228,41 @@ class AnthropicServingMessages(OpenAIServingChat):
             else:
                 cls._convert_message_content(msg, openai_msg, openai_messages)
 
+            if msg.role == "system":
+                if "content" in openai_msg:
+                    logger.info(
+                        "PROXY_ANTHROPIC_SYSTEM_NORMALIZED "
+                        "source=decode moved_system_messages=1"
+                    )
+                    openai_messages.append(
+                        {
+                            "role": "system",
+                            "content": cls._system_role_content_to_text(
+                                openai_msg["content"]
+                            ),
+                        }
+                    )
+                continue
+
             if not (msg.role == "user" and "content" not in openai_msg):
                 openai_messages.append(openai_msg)
+
+    @staticmethod
+    def _system_role_content_to_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "text":
+                        parts.append(str(item.get("text") or ""))
+                    else:
+                        parts.append(json.dumps(item, ensure_ascii=False))
+                else:
+                    parts.append(str(item))
+            return "\n".join(part for part in parts if part)
+        return str(content)
 
     @classmethod
     def _convert_message_content(
@@ -366,6 +428,7 @@ class AnthropicServingMessages(OpenAIServingChat):
             top_k=anthropic_request.top_k,
             kv_transfer_params=anthropic_request.kv_transfer_params,
             chat_template_kwargs=anthropic_request.chat_template_kwargs,
+            cache_salt=anthropic_request.cache_salt,
         )
 
     @classmethod
@@ -454,6 +517,7 @@ class AnthropicServingMessages(OpenAIServingChat):
         chat_req = self._convert_anthropic_to_openai_request(request)
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("Convert to OpenAI request %s", chat_req.model_dump_json())
+
         generator = await self.create_chat_completion(chat_req, raw_request)
 
         if isinstance(generator, ErrorResponse):
@@ -480,12 +544,17 @@ class AnthropicServingMessages(OpenAIServingChat):
             kv_transfer_params=generator.kv_transfer_params,
         )
         choice = generator.choices[0]
-        if choice.finish_reason == "stop":
+        has_tool_calls = bool(choice.message.tool_calls)
+        if has_tool_calls or choice.finish_reason == "tool_calls":
+            # Some GLM tool-call paths terminate on the XML tool-call stop token
+            # and surface OpenAI finish_reason="stop" even though tool_calls are
+            # present.  Anthropic/Claude clients need stop_reason="tool_use" for
+            # any response containing tool_use blocks.
+            result.stop_reason = "tool_use"
+        elif choice.finish_reason == "stop":
             result.stop_reason = "end_turn"
         elif choice.finish_reason == "length":
             result.stop_reason = "max_tokens"
-        elif choice.finish_reason == "tool_calls":
-            result.stop_reason = "tool_use"
 
         content: list[AnthropicContentBlock] = []
         if choice.message.reasoning:
@@ -509,7 +578,7 @@ class AnthropicServingMessages(OpenAIServingChat):
                 type="tool_use",
                 id=tool_call.id,
                 name=tool_call.function.name,
-                input=json.loads(tool_call.function.arguments),
+                input=_safe_tool_arguments_to_input(tool_call.function.arguments),
             )
             content += [anthropic_tool_call]
 
@@ -558,6 +627,7 @@ class AnthropicServingMessages(OpenAIServingChat):
             first_item = True
             finish_reason = None
             state = _ActiveBlockState()
+            saw_tool_use_block = False
             # Map from tool call index to tool_use_id
             tool_index_to_id: dict[int, str] = {}
 
@@ -591,7 +661,25 @@ class AnthropicServingMessages(OpenAIServingChat):
                 state.content_block_index += 1
                 return events
 
+
+            def normalize_partial_tool_json_delta(delta: str) -> str:
+                # Keep valid incremental JSON deltas unchanged.  If a complete
+                # wrapper object/string is emitted, unwrap it so Anthropic client
+                # does not see __unparsedToolInput as the actual tool input.
+                if not delta or "__unparsedToolInput" not in delta:
+                    return delta
+                try:
+                    val = _normalize_tool_input(delta)
+                    if isinstance(val, dict) and "__unparsedToolInput" not in val:
+                        return json.dumps(val, ensure_ascii=False)
+                except Exception:
+                    pass
+                return delta
+
             def start_block(block: AnthropicContentBlock):
+                nonlocal saw_tool_use_block
+                if block.type == "tool_use":
+                    saw_tool_use_block = True
                 chunk = AnthropicStreamEvent(
                     index=state.content_block_index,
                     type="content_block_start",
@@ -645,9 +733,12 @@ class AnthropicServingMessages(OpenAIServingChat):
                         if len(origin_chunk.choices) == 0:
                             for event in stop_active_block():
                                 yield event
-                            stop_reason = self.stop_reason_map.get(
-                                finish_reason or "stop"
-                            )
+                            if saw_tool_use_block:
+                                stop_reason = "tool_use"
+                            else:
+                                stop_reason = self.stop_reason_map.get(
+                                    finish_reason or "stop"
+                                )
                             chunk = AnthropicStreamEvent(
                                 type="message_delta",
                                 delta=AnthropicDelta(stop_reason=stop_reason),
@@ -768,7 +859,9 @@ class AnthropicServingMessages(OpenAIServingChat):
                                             type="content_block_delta",
                                             delta=AnthropicDelta(
                                                 type="input_json_delta",
-                                                partial_json=tool_call.function.arguments,
+                                                partial_json=normalize_partial_tool_json_delta(
+                                                    tool_call.function.arguments
+                                                ),
                                             ),
                                         )
                                         data = chunk.model_dump_json(exclude_unset=True)
@@ -793,7 +886,9 @@ class AnthropicServingMessages(OpenAIServingChat):
                                             type="content_block_delta",
                                             delta=AnthropicDelta(
                                                 type="input_json_delta",
-                                                partial_json=tool_call.function.arguments,
+                                                partial_json=normalize_partial_tool_json_delta(
+                                                    tool_call.function.arguments
+                                                ),
                                             ),
                                         )
                                         data = chunk.model_dump_json(exclude_unset=True)

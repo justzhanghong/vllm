@@ -475,22 +475,40 @@ class NixlConnectorScheduler:
         # remove the conditional below
         delay_free_blocks = any(len(group) > 0 for group in block_ids)
 
+        blocks_expiry_time = None
         if delay_free_blocks:
-            # Prefill request on remote. It will be read from D upon completion
+            # Prefill request on remote. It will be read from D upon completion.
+            # Record the P-side lease expiry and export it to D so a late read
+            # can be declined instead of reading reclaimed/stale KV blocks.
             logger.debug(
                 "NIXLConnector request_finished(%s) waiting for %d seconds "
                 "for remote decode to fetch blocks",
                 request.request_id,
                 envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT,
             )
-            self._reqs_need_send[request.request_id] = (
-                time.perf_counter() + envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT
+            # The deadline crosses EngineCore/worker process and host
+            # boundaries. Both the internal producer lease and the deadline
+            # exported to D therefore use the same comparable wall clock.
+            blocks_expiry_time = (
+                time.time() + envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT
             )
+            self._reqs_need_send[request.request_id] = blocks_expiry_time
             # NOTE HMA will "mark" empty/null blocks in groups with 0s (eg SWA ones),
             # trimming down after allocating for the whole sequence length. Empty
             # blocks are always at the start of the list.
             # Here we "unpad" blocks to send the actual remote blocks to be read.
             block_ids = self.get_sw_clipped_blocks(block_ids)
+
+            # MTP lookahead can make P allocate one tail block more than D.
+            # Trim to prompt blocks before exporting remote block IDs; otherwise
+            # worker-side tail clipping drops the first block and shifts all KV.
+            try:
+                n_prompt_blocks = cdiv(
+                    request.num_computed_tokens, self.block_size
+                )
+                block_ids = tuple(g[:n_prompt_blocks] for g in block_ids)
+            except Exception:
+                pass
 
         return delay_free_blocks, dict(
             do_remote_prefill=True,
@@ -501,4 +519,5 @@ class NixlConnectorScheduler:
             remote_host=self.side_channel_host,
             remote_port=self.side_channel_port,
             tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
+            remote_blocks_expiry_time=blocks_expiry_time,
         )

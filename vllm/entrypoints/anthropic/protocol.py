@@ -124,6 +124,14 @@ class AnthropicMessagesRequest(BaseModel):
             "Will be accessible by the template."
         ),
     )
+    # Session-mixup isolation (2026-08-15): the gateway sets this to the client's
+    # device_id (from metadata.user_id) so the prefix cache is salted per device.
+    # Without it every user shares one prefix-cache namespace, which is the channel
+    # through which a recycled/stale KV block from user A leaks into user B's reply.
+    cache_salt: str | None = Field(
+        default=None,
+        description="Per-device prefix-cache salt for cross-user isolation.",
+    )
 
     @field_validator("model")
     @classmethod

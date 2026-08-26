@@ -131,6 +131,9 @@ class Request:
         self.num_output_placeholders = 0
         # Used in forced preemption (reset_prefix_cache) with async scheduling.
         self.discard_latest_async_tokens = False
+        # Latest non-empty scheduler step that can still write this request's
+        # KV blocks. Used by the async P/D deferred-free fence (#45357).
+        self.last_sched_seq = 0
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0

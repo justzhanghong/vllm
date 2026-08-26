@@ -77,6 +77,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_KV_BLOCKS_EXPIRY_SAFETY_MARGIN = 5.0
+
 
 class NixlConnectorWorker:
     """Implementation of Worker side methods"""
@@ -1713,8 +1715,9 @@ class NixlConnectorWorker:
         for block_ids in block_ids_for_heterogeneous_attn_post_process:
             self.post_process_device_kv_on_receive_heterogeneous_attn(block_ids)
 
-        # Handle timeout to avoid stranding blocks on remote.
-        now = time.perf_counter()
+        # The producer deadline can cross processes and hosts; compare it in
+        # the same wall-clock domain used when the deadline was created.
+        now = time.time()
         while self._reqs_to_send:
             req_id, expires = next(iter(self._reqs_to_send.items()))
             # Sorted dict, oldest requests are put first so we can exit early.
@@ -1729,7 +1732,7 @@ class NixlConnectorWorker:
                 count,
                 envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT,
             )
-            self._reqs_to_process.remove(req_id)
+            self._reqs_to_process.discard(req_id)
             del self._reqs_to_send[req_id]
             done_sending.add(req_id)
 
@@ -1745,7 +1748,14 @@ class NixlConnectorWorker:
         notified_req_ids: set[str] = set()
         for notifs in self.nixl_wrapper.get_new_notifs().values():
             for notif in notifs:
-                req_id, tp_size = notif.decode("utf-8").rsplit(":", 1)
+                msg = notif.decode("utf-8")
+                if msg.startswith("HB:"):
+                    # v4 runtime patch: tolerate heartbeat notifications from
+                    # newer D/P lifecycles.  Full lease renewal is not required
+                    # for current one-turn proxy traffic, but treating HB as a
+                    # request id would create false invalid-KV errors.
+                    continue
+                req_id, tp_size = msg.rsplit(":", 1)
                 if (
                     req_id not in self._reqs_to_send
                     and req_id not in self._reqs_to_process
@@ -1776,7 +1786,7 @@ class NixlConnectorWorker:
                 ):
                     notified_req_ids.add(req_id)
                     del self.consumer_notification_counts_by_req[req_id]
-                    self._reqs_to_process.remove(req_id)
+                    self._reqs_to_process.discard(req_id)
                     self._reqs_to_send.pop(req_id, None)
         return notified_req_ids
 
@@ -1840,8 +1850,10 @@ class NixlConnectorWorker:
         # TODO (NickLucche) handle failed transfer for HMA.
         if (meta := self._recving_metadata.get(req_id)) and not self._is_hma_required:
             self._invalid_block_ids.update(meta.local_block_ids[0])
-        self.nixl_wrapper.release_xfer_handle(handle)
+        if handle is not None:
+            self.nixl_wrapper.release_xfer_handle(handle)
         self.xfer_stats.record_failed_transfer()
+        self._failed_recv_reqs.add(req_id)
 
     def start_load_kv(self, metadata: NixlConnectorMetadata):
         """
@@ -1895,14 +1907,38 @@ class NixlConnectorWorker:
             # We should never get an abort after setting an expiry timer
             assert req_id not in self._reqs_to_send
 
-        # Add to requests that are waiting to be read and track expiration.
+        # Arm every producer lease. A request can finish prefill in the same
+        # step in which its batch metadata is exported, so gating this on
+        # _reqs_to_process can strand its blocks permanently.
         for req_id, expiration_time in metadata.reqs_to_send.items():
-            if req_id in self._reqs_to_process:
-                self._reqs_to_send[req_id] = expiration_time
+            self._reqs_to_send[req_id] = expiration_time
+
+    def _is_remote_read_expired(self, meta: ReqMeta) -> bool:
+        """Return True if the producer-side KV lease is at/near expiry.
+
+        A late D-side read after P has released blocks can read recycled KV and
+        is a session-mixup hazard.  The proxy/scheduler now forwards the P-side
+        wall-clock lease deadline as remote_blocks_expiry_time; when present,
+        decline such reads and let scheduler recompute/fail according to policy.
+        """
+        assert meta.remote is not None
+        blocks_expiry_time = getattr(meta.remote, "blocks_expiry_time", None)
+        if blocks_expiry_time is None or not meta.local_physical_block_ids:
+            return False
+        return time.time() + _KV_BLOCKS_EXPIRY_SAFETY_MARGIN >= blocks_expiry_time
 
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
         assert meta.remote is not None and self.transfer_topo is not None
         engine_id = meta.remote.engine_id
+        if self._is_remote_read_expired(meta):
+            logger.warning(
+                "Declining expired remote KV read for request %s from engine %s.",
+                req_id,
+                engine_id,
+            )
+            self.xfer_stats.record_kv_expired_req()
+            self._handle_failed_transfer(req_id, None)
+            return
         remote_ranks = self.transfer_topo.target_remote_ranks(engine_id)
         remote_info = self.transfer_topo.get_engine_info(engine_id)
         tp_ratio = self.transfer_topo.tp_ratio(remote_info.remote_tp_size)

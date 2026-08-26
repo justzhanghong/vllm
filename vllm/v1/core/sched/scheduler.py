@@ -40,6 +40,7 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -122,6 +123,7 @@ class Scheduler(SchedulerInterface):
         self.connector = None
         self.connector_prefix_cache_stats: PrefixCacheStats | None = None
         self.recompute_kv_load_failures = True
+        self.defer_block_free = False
         if self.vllm_config.kv_transfer_config is not None:
             assert not self.is_encoder_decoder, (
                 "Encoder-decoder models are not currently supported with KV connectors"
@@ -137,6 +139,18 @@ class Scheduler(SchedulerInterface):
                 self.vllm_config.kv_transfer_config.kv_load_failure_policy
             )
             self.recompute_kv_load_failures = kv_load_failure_policy == "recompute"
+
+            # vLLM #45357: async scheduling / PP can have another GPU step
+            # still writing a finished or preempted request's blocks. On a P/D
+            # consumer those blocks may otherwise be immediately reallocated
+            # and filled by NIXL, racing the stale GPU write.
+            multiple_inflight_batches = bool(
+                self.scheduler_config.async_scheduling
+                or self.parallel_config.pipeline_parallel_size > 1
+            )
+            if multiple_inflight_batches and self.vllm_config.kv_transfer_config.is_kv_consumer:
+                self.defer_block_free = True
+                logger.info("P/D async deferred KV block freeing enabled (#45357)")
 
         self.kv_event_publisher = EventPublisherFactory.create(
             self.kv_events_config,
@@ -267,7 +281,32 @@ class Scheduler(SchedulerInterface):
         )
 
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
-        self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
+        # Session-mixup fix, gate 1 of 3 (2026-08-14). Upstream defines
+        #   needs_kv_cache_zeroing = has_mamba_layers
+        # (kv_cache_interface.py), so on a pure-attention model the zeroing of
+        # freshly allocated blocks NEVER runs -- even though the call site's own
+        # comment says it exists to "prevent stale NaN/data from corrupting
+        # attention". Measured on 94415: 80.2% of freshly allocated NIXL
+        # destination blocks (3760/4688 sampled) still held the PREVIOUS tenant's
+        # KV bytes, which is the residue the reproduced cross-session leak needs.
+        # Default ON here; set VLLM_MIXUP_FORCE_KV_ZEROING=0 to restore upstream
+        # behaviour for an A/B control run.
+        # See report_94415_260814_1800s_byte_cache_zeroing.md section 3.
+        _force_zero = os.environ.get(
+            "VLLM_MIXUP_FORCE_KV_ZEROING", "1"
+        ).strip().lower() not in ("0", "false", "no", "off", "")
+        self.needs_kv_cache_zeroing = (
+            kv_cache_config.needs_kv_cache_zeroing or _force_zero
+        )
+        # Non-empty schedule/update pairs form the fence for deferred frees.
+        self.sched_step_seq = 0
+        self.processed_step_seq = 0
+        self.deferred_frees: deque[tuple[int, list[KVCacheBlock]]] = deque()
+        if _force_zero and not kv_cache_config.needs_kv_cache_zeroing:
+            logger.info(
+                "Session-mixup: forcing KV block zeroing on "
+                "(upstream would skip it because has_mamba_layers=False)"
+            )
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
@@ -626,7 +665,6 @@ class Scheduler(SchedulerInterface):
                     if len(spec_token_ids) > num_scheduled_spec_tokens:
                         spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
                     scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
-
                 # New spec tokens will be set in `update_draft_token_ids` before the
                 # next step when applicable.
                 request.spec_token_ids = []
@@ -731,9 +769,17 @@ class Scheduler(SchedulerInterface):
                         connector_prefix_cache_queries = (
                             request.num_tokens - num_new_local_computed_tokens
                         )
-                        connector_prefix_cache_hits = num_external_computed_tokens
+                        # NIXL P/D transfer tokens are not user-visible prefix
+                        # cache hits.  Keep them for scheduling, but do not
+                        # count them in cache-hit metrics/API usage.
+                        if getattr(
+                            self.connector, "is_disagg_prefill_transfer", False
+                        ):
+                            connector_prefix_cache_hits = 0
+                        else:
+                            connector_prefix_cache_hits = num_external_computed_tokens
 
-                    # Total computed tokens (local + external).
+                    # Total computed tokens (local + external transfer/cache).
                     num_computed_tokens = (
                         num_new_local_computed_tokens + num_external_computed_tokens
                     )
@@ -742,11 +788,24 @@ class Scheduler(SchedulerInterface):
                     # Track first scheduled prefill, not post-preemption repeat prefills
                     if request.prefill_stats is not None:
                         assert num_computed_tokens <= request.num_prompt_tokens
-                        request.prefill_stats.set(
-                            num_prompt_tokens=request.num_prompt_tokens,
-                            num_local_cached_tokens=num_new_local_computed_tokens,
-                            num_external_cached_tokens=num_external_computed_tokens,
-                        )
+                        if (
+                            self.connector is not None
+                            and getattr(
+                                self.connector, "is_disagg_prefill_transfer", False
+                            )
+                        ):
+                            request.prefill_stats.set(
+                                num_prompt_tokens=request.num_prompt_tokens,
+                                num_local_cached_tokens=num_new_local_computed_tokens,
+                                num_external_cached_tokens=0,
+                                num_disagg_transfer_tokens=num_external_computed_tokens,
+                            )
+                        else:
+                            request.prefill_stats.set(
+                                num_prompt_tokens=request.num_prompt_tokens,
+                                num_local_cached_tokens=num_new_local_computed_tokens,
+                                num_external_cached_tokens=num_external_computed_tokens,
+                            )
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0
                     # after async KV recvs are completed.
@@ -1053,6 +1112,10 @@ class Scheduler(SchedulerInterface):
             )
             scheduler_output.ec_connector_metadata = ec_meta
 
+        # Advance only for a step that can enqueue GPU writes.
+        if self.defer_block_free and total_num_scheduled_tokens > 0:
+            self.sched_step_seq += 1
+
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
@@ -1071,7 +1134,7 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
-        self.kv_cache_manager.free(request)
+        self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
@@ -1098,6 +1161,8 @@ class Scheduler(SchedulerInterface):
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
             request.num_computed_tokens += num_scheduled_token
+            if self.defer_block_free:
+                request.last_sched_seq = self.sched_step_seq
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )
@@ -1413,6 +1478,11 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+
+        # The GPU writes associated with this FIFO-ordered output are complete.
+        if self.defer_block_free and scheduler_output.total_num_scheduled_tokens > 0:
+            self.processed_step_seq += 1
+            self._drain_deferred_frees()
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1972,8 +2042,26 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
-        self.kv_cache_manager.free(request)
+        self._free_request_blocks(request)
         del self.requests[request.request_id]
+
+    def _free_request_blocks(self, request: Request) -> None:
+        """Release blocks only after every scheduled writer has completed."""
+        if not self.defer_block_free or request.last_sched_seq <= self.processed_step_seq:
+            self.kv_cache_manager.free(request)
+            return
+        blocks = self.kv_cache_manager.pop_blocks_for_free(request)
+        if blocks:
+            fence = self.sched_step_seq
+            self.deferred_frees.append((fence, blocks))
+
+    def _drain_deferred_frees(self) -> None:
+        while self.deferred_frees:
+            fence, blocks = self.deferred_frees[0]
+            if fence > self.processed_step_seq:
+                break
+            self.deferred_frees.popleft()
+            self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
 
     @property
     def pause_state(self) -> PauseState:
@@ -2182,6 +2270,15 @@ class Scheduler(SchedulerInterface):
             if request.num_computed_tokens:
                 # Cache any valid computed tokens.
                 self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
+                if self.needs_kv_cache_zeroing:
+                    # The allocation-time zeroing notification was already
+                    # consumed while this async load was pending. A failed load
+                    # can therefore leave the blocks after the valid prefix
+                    # unwritten. Re-zero exactly those blocks before local
+                    # recomputation, preserving the valid prefix.
+                    self.kv_cache_manager.record_blocks_for_zeroing(
+                        request.request_id, request.num_computed_tokens
+                    )
             else:
                 # No valid computed tokens, release allocated blocks.
                 # There may be a local cache hit on retry.
@@ -2250,7 +2347,18 @@ class Scheduler(SchedulerInterface):
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
             logger.debug("Finished recving KV transfer for request %s", req_id)
-            assert req_id in self.requests
+            # Session-mixup fix (2026-08-15): the original patch asserted
+            # `req_id in self.requests` here. That fires under no-MTP replay:
+            # a request can be aborted/freed between the moment the worker
+            # records a finished_recving/finished_sending and the moment the
+            # scheduler processes the output. The notification then arrives for
+            # a request that no longer exists, and the assert crashes EngineCore
+            # (observed on 94510 P0: AssertionError in
+            # _update_from_kv_xfer_finished). Tolerate it: a freed request has
+            # nothing left to do -- its blocks were already released by the
+            # abort path.
+            if req_id not in self.requests:
+                continue
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
@@ -2259,7 +2367,10 @@ class Scheduler(SchedulerInterface):
                 self._free_blocks(self.requests[req_id])
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
-            assert req_id in self.requests
+            if req_id not in self.requests:
+                # Same late-notification race as above; the request was already
+                # freed, so there is nothing to free here.
+                continue
             self._free_blocks(self.requests[req_id])
 
     def _update_requests_with_invalid_blocks(

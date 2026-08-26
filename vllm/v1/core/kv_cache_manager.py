@@ -436,6 +436,10 @@ class KVCacheManager:
         """
         self.coordinator.free(request.request_id)
 
+    def pop_blocks_for_free(self, request: Request) -> list[KVCacheBlock]:
+        """Detach request blocks for scheduler-managed deferred release."""
+        return self.coordinator.pop_blocks_for_free(request.request_id)
+
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int
     ) -> None:
@@ -546,6 +550,31 @@ class KVCacheManager:
         for mgr in self.coordinator.single_type_managers:
             ids.extend(mgr.take_new_block_ids())
         return ids
+
+    def record_blocks_for_zeroing(
+        self, request_id: str, start_token: int
+    ) -> list[int]:
+        """Re-record request blocks from ``start_token`` for GPU zeroing.
+
+        A failed asynchronous KV load can leave blocks after the last valid
+        prefix unwritten even though their original allocation-time zeroing
+        notification has already been consumed.  Put those blocks back on the
+        zeroing queue before local recomputation uses them.
+
+        ``start_token`` must be block aligned: zeroing a partially valid block
+        would destroy its valid prefix. The returned IDs identify the blocks
+        queued for zeroing; callers need not consume the return value.
+        """
+        block_ids: list[int] = []
+        for mgr in self.coordinator.single_type_managers:
+            if mgr.records_new_block_ids:
+                assert start_token % mgr.block_size == 0
+                start_idx = start_token // mgr.block_size
+                blocks = mgr.req_to_blocks[request_id]
+                group_block_ids = [blk.block_id for blk in blocks[start_idx:]]
+                mgr.new_block_ids.extend(group_block_ids)
+                block_ids.extend(group_block_ids)
+        return block_ids
 
     def new_step_starts(self) -> None:
         """Called when a new step is started."""

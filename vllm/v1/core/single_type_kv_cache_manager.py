@@ -210,7 +210,20 @@ class SingleTypeKVCacheManager(ABC):
                 cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
             )
             req_blocks.extend(allocated_blocks)
-            if type(self.kv_cache_spec) in (FullAttentionSpec, TQFullAttentionSpec):
+            # Session-mixup fix, gate 3 of 3 (2026-08-14). Was:
+            #   if type(self.kv_cache_spec) in (FullAttentionSpec, TQFullAttentionSpec)
+            # `type(x) in (...)` is an EXACT type comparison, so every FullAttentionSpec
+            # SUBCLASS silently fails it -- including MLAAttentionSpec, which is what
+            # GLM-5.2 uses (engine log: `use_mla: True`, backend TRITON_MLA_SPARSE).
+            # Consequence: new_block_ids stayed empty forever, so take_new_block_ids()
+            # returned nothing and _zero_block_ids() had nothing to zero even when the
+            # other two gates were open. Measured effect: 80.2% of freshly allocated
+            # NIXL destination blocks (3760/4688 sampled) still carried the PREVIOUS
+            # tenant's KV bytes -- see report_94415_260814_1800s_byte_cache_zeroing.md.
+            # isinstance() covers MLAAttentionSpec / TQFullAttentionSpec /
+            # SinkFullAttentionSpec, all of which are full-attention variants where
+            # zeroing a freshly allocated block is meaningful and harmless.
+            if isinstance(self.kv_cache_spec, FullAttentionSpec):
                 self.new_block_ids.extend(b.block_id for b in allocated_blocks)
 
     def allocate_new_blocks(
@@ -238,9 +251,16 @@ class SingleTypeKVCacheManager(ABC):
         else:
             new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
             req_blocks.extend(new_blocks)
-            if type(self.kv_cache_spec) in (FullAttentionSpec, TQFullAttentionSpec):
+            # Session-mixup fix, gate 3 of 3 (2026-08-14) -- same exact-type bug as
+            # in the external-computed branch above. See the comment there.
+            if isinstance(self.kv_cache_spec, FullAttentionSpec):
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
             return new_blocks
+
+    @property
+    def records_new_block_ids(self) -> bool:
+        """Whether this manager's new blocks are zeroed by the worker."""
+        return isinstance(self.kv_cache_spec, FullAttentionSpec)
 
     def take_new_block_ids(self) -> list[int]:
         """Drain and return block IDs allocated since the last call."""
@@ -274,22 +294,16 @@ class SingleTypeKVCacheManager(ABC):
 
         self.num_cached_block[request.request_id] = num_full_blocks
 
-    def free(self, request_id: str) -> None:
-        """
-        Free the blocks for the request.
-
-        Args:
-            request_id: The request ID.
-        """
+    def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+        """Detach request bookkeeping without returning blocks to the pool."""
         # Default to [] in case a request is freed (aborted) before alloc.
         req_blocks = self.req_to_blocks.pop(request_id, [])
-
-        # Free blocks in reverse order so that the tail blocks are
-        # freed first.
-        ordered_blocks = reversed(req_blocks)
-
-        self.block_pool.free_blocks(ordered_blocks)
         self.num_cached_block.pop(request_id, None)
+        return req_blocks
+
+    def free(self, request_id: str) -> None:
+        """Free request blocks, tail first."""
+        self.block_pool.free_blocks(reversed(self.pop_blocks_for_free(request_id)))
 
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
@@ -1009,11 +1023,11 @@ class MambaManager(SingleTypeKVCacheManager):
                 self._allocated_block_reqs.add(request_id)
                 return req_blocks[prev_block_len:]
 
-    def free(self, request_id: str) -> None:
+    def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         if self.mamba_cache_mode == "align":
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
-        super().free(request_id)
+        return super().pop_blocks_for_free(request_id)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """

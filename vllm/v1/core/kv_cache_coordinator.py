@@ -198,6 +198,13 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.free(request_id)
 
+    def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+        """Detach all request blocks without returning them to the pool."""
+        blocks: list[KVCacheBlock] = []
+        for manager in self.single_type_managers:
+            blocks.extend(manager.pop_blocks_for_free(request_id))
+        return blocks
+
     def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
         """
         Get the number of common prefix blocks for all requests with allocated

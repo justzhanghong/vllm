@@ -936,6 +936,8 @@ class GPUModelRunner(
 
         # Cached outputs.
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
+        self._draft_probs: torch.Tensor | None = None
+        self._draft_prob_req_ids: list[str] | None = None
         self._pp_prev_valid_sampled_count: dict[str, int] = {}
         self._mtp_acceptance_log_every = int(
             os.environ.get("VLLM_MTP_ACCEPTANCE_LOG_EVERY", "0") or 0
@@ -1490,23 +1492,11 @@ class GPUModelRunner(
                     optimistic_num_accepted = req_state.prev_num_draft_len
                     req_state.output_token_ids.extend([-1] * optimistic_num_accepted)
 
-                    skip_deferred_correction = (
-                        not is_last_rank
-                        and self._is_mtp_pp_sampled_state_enabled()
+                    # All PP stages use the same deferred GPU correction based
+                    # on the sampler's authoritative accepted count.
+                    deferred_spec_decode_corrections.append(
+                        (req_id, optimistic_num_accepted, req_state)
                     )
-                    if skip_deferred_correction:
-                        prev_valid = self._pp_prev_valid_sampled_count.get(req_id)
-                        if prev_valid is not None:
-                            num_computed_tokens -= (
-                                num_computed_tokens_drift_correction(
-                                    optimistic_num_accepted, prev_valid
-                                )
-                            )
-
-                    if not skip_deferred_correction:
-                        deferred_spec_decode_corrections.append(
-                            (req_id, optimistic_num_accepted, req_state)
-                        )
 
                     prev_req_index = (
                         self.input_batch.prev_req_id_to_index.get(req_id)
@@ -1603,7 +1593,17 @@ class GPUModelRunner(
                 self.input_batch.token_ids_cpu[
                     req_index, start_token_index:end_token_index
                 ] = new_token_ids
-                self.input_batch.num_tokens_no_spec[req_index] = end_token_index
+                # During PP async chunked prefill, new_token_ids is empty while
+                # num_computed_tokens advances one prompt chunk at a time. The
+                # row already contains the complete immutable prompt copied by
+                # InputBatch.add_request(); never shrink its active length to the
+                # computed prefix. Otherwise condense() copies only that prefix
+                # when moving row N -> a hole, leaving the destination prompt
+                # tail from its prior owner (cross-request token contamination).
+                self.input_batch.num_tokens_no_spec[req_index] = max(
+                    int(self.input_batch.num_tokens_no_spec[req_index]),
+                    end_token_index,
+                )
 
             # Add spec_token_ids to token_ids_cpu.
             self.input_batch.update_req_spec_token_ids(req_state, scheduled_spec_tokens)
@@ -1905,6 +1905,17 @@ class GPUModelRunner(
             for cur_index in range(num_reqs):
                 prev_index = prev_positions[cur_index]
                 if prev_index < 0:
+                    continue
+                # Prompt tokens are immutable scheduler-authoritative input.
+                # A prior PP sampled token is needed only for decode, beginning
+                # exactly at num_prompt_tokens. In a mixed async batch, never
+                # let stale/reordered previous-row attribution replace the tail
+                # of any chunk whose current input still begins in the prompt.
+                num_computed = int(
+                    self.input_batch.num_computed_tokens_cpu[cur_index]
+                )
+                num_prompt = int(self.input_batch.num_prompt_tokens[cur_index])
+                if num_computed < num_prompt:
                     continue
                 prev_indices.append(prev_index)
                 req_id = self.input_batch.req_ids[cur_index]
@@ -3947,9 +3958,10 @@ class GPUModelRunner(
             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
+        draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
-            None,  # draft_probs
+            draft_probs,
             logits,
             sampling_metadata,
         )
@@ -5452,6 +5464,8 @@ class GPUModelRunner(
                 log_mtp_timing("broadcast_prev_sampled_token_ids", phase_start)
 
         self._draft_token_ids = None
+        self._draft_probs = None
+        self._draft_prob_req_ids = None
         self._draft_token_req_ids = None
         self.valid_sampled_token_count_gpu = None
         self.valid_sampled_token_count_cpu_ready = False
@@ -6434,7 +6448,9 @@ class GPUModelRunner(
             sampled_width = self.num_spec_tokens + 1
             sampled_token_ids = recv[:, :sampled_width].contiguous()
             self.input_batch.prev_sampled_token_ids = sampled_token_ids
-            self.valid_sampled_token_count_gpu = None
+            self.valid_sampled_token_count_gpu = (
+                recv[:, sampled_width : sampled_width + 1].squeeze(1).contiguous()
+            )
             self.valid_sampled_token_count_cpu_ready = False
             self._draft_token_ids = recv[
                 :, sampled_width + 1 : sampled_width + 1 + self.num_spec_tokens
@@ -6464,16 +6480,22 @@ class GPUModelRunner(
             if mtp_state and gathered_sampled_token_ids is not None:
                 values = gathered_sampled_token_ids[i]
                 valid_count = len(values)
-                pos = self.input_batch.num_tokens_no_spec[i]
+                old_pos = self.input_batch.num_tokens_no_spec[i]
+                if req_state is not None:
+                    optimistic = req_state.prev_num_draft_len
+                    if optimistic:
+                        del req_state.output_token_ids[-optimistic:]
+                    pos = req_state.num_prompt_tokens + len(
+                        req_state.output_token_ids
+                    )
+                else:
+                    pos = old_pos
                 end = pos + valid_count
                 if valid_count:
                     self.input_batch.token_ids_cpu[i, pos:end] = values
                     self.input_batch.is_token_ids[i, pos:end] = True
                 self.input_batch.num_tokens_no_spec[i] = end
                 if req_state is not None:
-                    optimistic = req_state.prev_num_draft_len
-                    if optimistic:
-                        del req_state.output_token_ids[-optimistic:]
                     req_state.output_token_ids.extend(values)
                 self._pp_prev_valid_sampled_count[req_id] = valid_count
             elif req_state is not None:
@@ -6665,6 +6687,36 @@ class GPUModelRunner(
             )
         return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
 
+    def _get_spec_decode_draft_probs(
+        self, spec_decode_metadata: SpecDecodeMetadata
+    ) -> torch.Tensor | None:
+        """Flatten cached q(x) rows in current request/metadata order."""
+        if self._draft_probs is None or self._draft_prob_req_ids is None:
+            return None
+
+        row_by_req_id = {
+            req_id: idx for idx, req_id in enumerate(self._draft_prob_req_ids)
+        }
+        draft_probs_rows: list[torch.Tensor] = []
+        for req_id, num_draft in zip(
+            self.input_batch.req_ids, spec_decode_metadata.num_draft_tokens
+        ):
+            if num_draft == 0:
+                continue
+            row_idx = row_by_req_id.get(req_id)
+            if row_idx is None:
+                logger.warning(
+                    "Missing cached draft probabilities for request %s; "
+                    "falling back to deterministic-draft rejection behavior.",
+                    req_id,
+                )
+                return None
+            draft_probs_rows.append(self._draft_probs[row_idx, :num_draft])
+
+        if not draft_probs_rows:
+            return None
+        return torch.cat(draft_probs_rows, dim=0).contiguous()
+
     def propose_draft_token_ids(
         self,
         scheduler_output: "SchedulerOutput",
@@ -6680,6 +6732,8 @@ class GPUModelRunner(
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
         assert spec_config is not None
+        self._draft_probs = None
+        self._draft_prob_req_ids = None
         mtp_propose_debug = (
             spec_config.method == "mtp"
             and os.environ.get("VLLM_MTP_SAMPLE_TIMING_LOGS", "0") == "1"
@@ -6944,6 +6998,17 @@ class GPUModelRunner(
                 slot_mappings=slot_mappings,
             )
             log_mtp_propose_event("drafter_propose_done")
+            if hasattr(self.drafter, "take_last_draft_probs"):
+                draft_probs = self.drafter.take_last_draft_probs()
+                if draft_probs is not None:
+                    self._draft_probs = draft_probs
+                    self._draft_prob_req_ids = self.input_batch.req_ids.copy()
+                    logger.info_once(
+                        "MTP probabilistic draft probabilities active: "
+                        "shape=%s dtype=%s",
+                        tuple(draft_probs.shape),
+                        draft_probs.dtype,
+                    )
 
         return draft_token_ids
 
@@ -7892,10 +7957,15 @@ class GPUModelRunner(
             )
 
             num_tokens = sum(len(ids) for ids in draft_token_ids)
-            # draft_probs = torch.randn(
-            #     num_tokens, logits.shape[-1], device=self.device,
-            #     dtype=logits.dtype)
             draft_probs = None
+            if self.speculative_config.rejection_sample_method == "probabilistic":
+                draft_probs = torch.rand(
+                    num_tokens,
+                    logits.shape[-1],
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+                draft_probs = torch.softmax(draft_probs, dim=-1)
             logits = torch.randn(
                 num_tokens + num_reqs,
                 logits.shape[-1],
