@@ -325,10 +325,9 @@ class Fp8LinearMethod(LinearMethodBase):
                 col_end = min(col_start + block_k, weight.shape[-1])
                 scale_col = col_start // block_k
                 scale_block = scale[..., scale_row, scale_col].to(out_dtype)
-                out[..., row_start:row_end, col_start:col_end] = (
-                    weight[..., row_start:row_end, col_start:col_end].to(out_dtype)
-                    * scale_block.reshape((*scale_block.shape, 1, 1))
-                )
+                out[..., row_start:row_end, col_start:col_end] = weight[
+                    ..., row_start:row_end, col_start:col_end
+                ].to(out_dtype) * scale_block.reshape((*scale_block.shape, 1, 1))
         return out
 
     def create_weights(
@@ -425,11 +424,7 @@ class Fp8LinearMethod(LinearMethodBase):
         if (
             self.use_marlin
             and self.block_quant
-            and (
-                dequant_shared_experts
-                or dequant_mlp_linear
-                or dequant_attn_linear
-            )
+            and (dequant_shared_experts or dequant_mlp_linear or dequant_attn_linear)
         ):
             assert self.weight_block_size is not None
             weight, weight_scale_inv = process_fp8_weight_block_strategy(
@@ -453,7 +448,7 @@ class Fp8LinearMethod(LinearMethodBase):
             replace_parameter(layer, "weight", weight)
             replace_parameter(layer, "weight_scale_inv", weight_scale_inv)
             layer._fp8_dequant_bf16_linear = True
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
             return
 
         if self.use_marlin:
@@ -851,7 +846,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 shared_experts=layer.shared_experts,
             )
 
-
     @staticmethod
     def _scaled_dequantize_block_fp8_moe_weight(
         weight: torch.Tensor,
@@ -868,10 +862,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 col_end = min(col_start + block_k, weight.shape[-1])
                 scale_col = col_start // block_k
                 scale_block = scale[..., scale_row, scale_col].to(out_dtype)
-                out[..., row_start:row_end, col_start:col_end] = (
-                    weight[..., row_start:row_end, col_start:col_end].to(out_dtype)
-                    * scale_block.reshape((*scale_block.shape, 1, 1))
-                )
+                out[..., row_start:row_end, col_start:col_end] = weight[
+                    ..., row_start:row_end, col_start:col_end
+                ].to(out_dtype) * scale_block.reshape((*scale_block.shape, 1, 1))
         return out
 
     def process_weights_after_loading(self, layer: Module) -> None:
@@ -936,12 +929,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13, w13_scale, block_shape, out_dtype
             )
             replace_parameter(layer, "w13_weight", w13)
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
             w2 = self._scaled_dequantize_block_fp8_moe_weight(
                 w2, w2_scale, block_shape, out_dtype
             )
             replace_parameter(layer, "w2_weight", w2)
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
             unquantized = UnquantizedFusedMoEMethod(layer.moe_config)
             layer._replace_quant_method(unquantized)
             layer.base_quant_method = unquantized
@@ -1016,6 +1009,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             routed_scaling_factor=layer.routed_scaling_factor,
         )
 
+    def supports_aligned_routing_metadata(self, layer: torch.nn.Module) -> bool:
+        if self.moe_kernel is None:
+            return False
+        supports_metadata = getattr(
+            self.moe_kernel.fused_experts,
+            "supports_aligned_routing_metadata",
+            None,
+        )
+        return (
+            supports_metadata is not None
+            and supports_metadata()
+            and layer.expert_map is None
+        )
+
     def apply(
         self,
         layer: FusedMoE,
@@ -1037,6 +1044,31 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             expert_map=layer.expert_map,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
             shared_experts_input=shared_experts_input,
+        )
+
+    def apply_with_aligned_metadata(
+        self,
+        layer: FusedMoE,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+        aligned_routing_metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        assert not self.is_monolithic
+        assert self.moe_kernel is not None
+        return self.moe_kernel.apply(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=layer.activation,
+            global_num_experts=layer.global_num_experts,
+            expert_map=layer.expert_map,
+            apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            shared_experts_input=shared_experts_input,
+            aligned_routing_metadata=aligned_routing_metadata,
         )
 
 

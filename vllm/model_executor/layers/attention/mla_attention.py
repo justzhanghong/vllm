@@ -233,6 +233,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
+from vllm.model_executor.layers.quantization.oscar_mla.capture import (
+    capture_mla_activations,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     QuantKey,
@@ -278,7 +281,9 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheSpec,
     MLAAttentionSpec,
+    OscarMLAAttentionSpec,
 )
+from vllm.v1.worker.oscar_mla_cache import OscarMLACacheTensors
 
 logger = init_logger(__name__)
 
@@ -415,6 +420,43 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.kv_cache_dtype = kv_cache_dtype
         self.calculate_kv_scales = calculate_kv_scales
         _init_kv_cache_quant(self, quant_config, prefix)
+        if self.kv_cache_dtype == "oscar_mla_int2":
+            from vllm.model_executor.layers.quantization.oscar_mla.runtime import (
+                load_layer_runtime_parameters,
+            )
+
+            runtime_parameters = load_layer_runtime_parameters(
+                self.layer_name,
+                latent_rank=self.kv_lora_rank,
+                prefix_tokens=64,
+                recent_tokens=256,
+            )
+            self._oscar_rotation: torch.Tensor
+            self.register_buffer(
+                "_oscar_rotation",
+                runtime_parameters.rotation,
+                persistent=False,
+            )
+            self._oscar_inverse_rotation: torch.Tensor
+            self.register_buffer(
+                "_oscar_inverse_rotation",
+                runtime_parameters.rotation.T.contiguous(),
+                persistent=False,
+            )
+            self._oscar_inverse_rotation_bf16: torch.Tensor
+            self.register_buffer(
+                "_oscar_inverse_rotation_bf16",
+                runtime_parameters.rotation.T.contiguous().to(torch.bfloat16),
+                persistent=False,
+            )
+            self._oscar_clip_ratio = runtime_parameters.clip_ratio
+            self._oscar_artifact_manifest_sha256 = runtime_parameters.manifest_sha256
+            self._oscar_rotations_sha256 = runtime_parameters.rotations_sha256
+            logger.info_once(
+                "OSCAR MLA rotation artifact loaded: manifest=%s tensors=%s",
+                self._oscar_artifact_manifest_sha256,
+                self._oscar_rotations_sha256,
+            )
 
         if (
             cache_config is not None
@@ -544,14 +586,25 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             assert isinstance(slot_mapping, dict), (
                 f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
             )
-            self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
-                kv_c_normed,
-                k_pe,
-                self_kv_cache,
-                slot_mapping.get(self.layer_name),
-                self.kv_cache_dtype,
-                self._k_scale,
-            )
+            if self.kv_cache_dtype == "oscar_mla_int2":
+                if attn_metadata is not None:
+                    self.impl.do_oscar_kv_cache_update(  # type: ignore[attr-defined]
+                        kv_c_normed,
+                        k_pe,
+                        self_kv_cache,
+                        attn_metadata,
+                        self._oscar_rotation,
+                        clip_ratio=self._oscar_clip_ratio,
+                    )
+            else:
+                self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+                    kv_c_normed,
+                    k_pe,
+                    self_kv_cache,
+                    slot_mapping.get(self.layer_name),
+                    self.kv_cache_dtype,
+                    self._k_scale,
+                )
             output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
             self.forward_impl(
                 q,
@@ -782,6 +835,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                         is_lse_base_on_e=not getattr(self, "_use_fi_prefill", False),
                     )
 
+            capture_mla_activations(
+                self.layer_name,
+                k_c_normed,
+                mqa_ql_nope,
+                attn_out,
+                getattr(self.impl, "topk_indices_buffer", None),
+            )
+
             # v_up projection
             self._v_up_proj(attn_out, out=mqa_output_slice)
 
@@ -831,6 +892,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         kv_b_proj_weight = get_and_maybe_dequant_weights(
             self.kv_b_proj, out_dtype=act_dtype
         ).T
+        if self.kv_cache_dtype == "oscar_mla_int2":
+            self._oscar_rotation = self._oscar_rotation.to(
+                device=kv_b_proj_weight.device,
+            )
+            self._oscar_inverse_rotation = self._oscar_inverse_rotation.to(
+                device=kv_b_proj_weight.device,
+            )
+            self._oscar_inverse_rotation_bf16 = self._oscar_inverse_rotation_bf16.to(
+                device=kv_b_proj_weight.device,
+            )
 
         assert kv_b_proj_weight.shape == (
             self.kv_lora_rank,
@@ -954,6 +1025,37 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         return self.attn_backend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        if self.kv_cache_dtype == "oscar_mla_int2":
+            if not self.use_sparse:
+                raise ValueError("oscar_mla_int2 requires sparse MLA")
+            if self.attn_backend.get_name() != "TRITON_MLA_SPARSE":
+                raise ValueError(
+                    "oscar_mla_int2 requires the TRITON_MLA_SPARSE backend"
+                )
+            group_size = 128
+            history_slot_size = (
+                self.kv_lora_rank * 2 // 8 + (self.kv_lora_rank // group_size) * 2 * 4
+            )
+            speculative_config = vllm_config.speculative_config
+            speculative_tokens = (
+                speculative_config.num_speculative_tokens
+                if speculative_config is not None and speculative_config.method == "mtp"
+                else 0
+            )
+            return OscarMLAAttentionSpec(
+                block_size=vllm_config.cache_config.block_size,
+                num_kv_heads=1,
+                head_size=self.head_size,
+                dtype=torch.bfloat16,
+                cache_dtype_str=self.kv_cache_dtype,
+                latent_rank=self.kv_lora_rank,
+                rope_head_size=self.qk_rope_head_dim,
+                history_slot_size=history_slot_size,
+                group_size=group_size,
+                prefix_tokens=64,
+                recent_tokens=256,
+                speculative_tokens=speculative_tokens,
+            )
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
@@ -1022,7 +1124,10 @@ def unified_mla_kv_cache_update(
 
     # This needs to run even when we don't have metadata yet, so that the op
     # is correctly captured.
-    if kv_cache.numel() == 0:
+    cache_storage = (
+        kv_cache.raw if isinstance(kv_cache, OscarMLACacheTensors) else kv_cache
+    )
+    if cache_storage.numel() == 0:
         # Can't update an empty KV cache.
         return torch.empty(0, device=kv_c_normed.device, dtype=kv_c_normed.dtype)
 
@@ -1031,7 +1136,25 @@ def unified_mla_kv_cache_update(
         f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
     )
     layer_slot_mapping = slot_mapping.get(layer_name)
-    if layer_slot_mapping is not None:
+    if kv_cache_dtype == "oscar_mla_int2":
+        attn_metadata_raw = forward_context.attn_metadata
+        if isinstance(attn_metadata_raw, dict):
+            attn_metadata = attn_metadata_raw[layer_name]
+        elif isinstance(attn_metadata_raw, list):
+            attn_metadata = attn_metadata_raw[0][layer_name]
+        else:
+            attn_metadata = attn_metadata_raw
+        if attn_metadata is None:
+            return torch.empty(0, device=kv_c_normed.device, dtype=kv_c_normed.dtype)
+        attn_layer.impl.do_oscar_kv_cache_update(
+            kv_c_normed,
+            k_pe,
+            kv_cache,
+            attn_metadata,
+            attn_layer._oscar_rotation,
+            clip_ratio=attn_layer._oscar_clip_ratio,
+        )
+    elif layer_slot_mapping is not None:
         attn_layer.impl.do_kv_cache_update(
             kv_c_normed,
             k_pe,

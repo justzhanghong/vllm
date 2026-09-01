@@ -28,6 +28,7 @@ import os
 import time
 import typing
 from collections.abc import Callable, Iterable
+from copy import copy
 from itertools import islice
 
 import torch
@@ -754,6 +755,40 @@ def _parse_layer_idx_from_prefix(prefix: str) -> int | None:
     return None
 
 
+def _get_mla_cache_config_for_layer(
+    vllm_config: VllmConfig,
+    config: DeepseekV2Config | DeepseekV3Config,
+    cache_config: CacheConfig | None,
+    prefix: str,
+) -> CacheConfig | None:
+    """Keep an uncalibrated MTP draft layer out of OSCAR's three pools."""
+    if cache_config is None or cache_config.cache_dtype != "oscar_mla_int2":
+        return cache_config
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is None or speculative_config.method != "mtp":
+        return cache_config
+    layer_idx = _parse_layer_idx_from_prefix(prefix)
+    mtp_start = getattr(config, "num_hidden_layers", 0)
+    mtp_end = mtp_start + getattr(config, "num_nextn_predict_layers", 0)
+    if layer_idx is None or not mtp_start <= layer_idx < mtp_end:
+        return cache_config
+    if os.environ.get("VLLM_OSCAR_MTP_DRAFT_INT2", "0") == "1":
+        logger.info_once(
+            "Using calibrated OSCAR MLA INT2 cache for MTP draft layer %s",
+            prefix,
+        )
+        return cache_config
+
+    draft_cache_config = copy(cache_config)
+    draft_cache_config.cache_dtype = "auto"
+    logger.info_once(
+        "Using native BF16 MLA KV cache for MTP draft layer %s while target "
+        "layers use oscar_mla_int2",
+        prefix,
+    )
+    return draft_cache_config
+
+
 def _get_indexer_type(
     config: DeepseekV2Config | DeepseekV3Config,
     layer_idx: int | None,
@@ -1081,6 +1116,12 @@ class DeepseekV2MLAAttention(nn.Module):
             indexer_should_update=self.indexer_should_update,
         )
 
+        mla_cache_config = _get_mla_cache_config_for_layer(
+            vllm_config,
+            config,
+            cache_config,
+            prefix,
+        )
         self.mla_attn = MultiHeadLatentAttentionWrapper(
             self.hidden_size,
             self.num_local_heads,
@@ -1091,7 +1132,7 @@ class DeepseekV2MLAAttention(nn.Module):
             self.q_lora_rank,
             self.kv_lora_rank,
             mla_modules,
-            cache_config,
+            mla_cache_config,
             quant_config,
             prefix,
         )

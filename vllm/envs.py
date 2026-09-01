@@ -87,7 +87,7 @@ if TYPE_CHECKING:
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_SPARSE_INDEXER_MQA_LOGITS_BACKEND: Literal[
         "auto", "cuda", "cuda_v5", "cuda_v7", "triton"
-    ] = "auto"
+    ] = "cuda_v7"
     VLLM_SPARSE_MLA_FORCE_PREFIX_MASK_DECODE: bool = False
     VLLM_SPARSE_MLA_FORCE_PREFIX_MASK_DECODE_MAX_TOKENS: int = 4
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
@@ -127,6 +127,7 @@ if TYPE_CHECKING:
     VLLM_PP_MAX_CONCURRENT_BATCHES: int = 0
     VLLM_PP_BOUNDARY_PROFILING: bool = False
     VLLM_STAGE50_DECODE_PREP_FASTPATH: bool = False
+    VLLM_OSCAR_SYNC_DECODE_PREP_FASTPATH: bool = False
     VLLM_STAGE50_PP3_GREEDY_LOCAL_ARGMAX: bool = False
     VLLM_STAGE50_PP_READY_FIRST_DRAIN: bool = False
     VLLM_FP8_MOE_DEQUANT_BF16: bool = False
@@ -687,6 +688,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_STAGE50_DECODE_PREP_FASTPATH": lambda: bool(
         int(os.getenv("VLLM_STAGE50_DECODE_PREP_FASTPATH", "0"))
     ),
+    # OSCAR c1 synchronous decode probe. Reuse stable metadata buffers after
+    # the first decode step and skip generic per-token gather/pointwise work.
+    "VLLM_OSCAR_SYNC_DECODE_PREP_FASTPATH": lambda: bool(
+        int(os.getenv("VLLM_OSCAR_SYNC_DECODE_PREP_FASTPATH", "0"))
+    ),
     # Stage50 PP3 greedy decode probe. On the final PP rank, compute greedy
     # tokens with vocab-parallel local argmax reduction instead of materializing
     # full logits and running the generic sampler. Disabled by default.
@@ -1165,7 +1171,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # for A/B testing.
     "VLLM_SPARSE_INDEXER_MQA_LOGITS_BACKEND": env_with_choices(
         "VLLM_SPARSE_INDEXER_MQA_LOGITS_BACKEND",
-        "auto",
+        "cuda_v7",
         ["auto", "cuda", "cuda_v5", "cuda_v7", "triton"],
     ),
     # Stage TPOT experiment: force small decode sparse MLA dispatch to the

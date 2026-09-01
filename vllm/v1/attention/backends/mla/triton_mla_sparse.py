@@ -5,6 +5,7 @@ or FlashInfer MLA Sparse (SM100+), e.g. SM80 (A100) and SM121 (GB10)."""
 
 import os
 import time
+from dataclasses import replace
 from typing import ClassVar
 
 import torch
@@ -19,25 +20,66 @@ from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
     AttentionLayer,
+    CommonAttentionMetadata,
+)
+from vllm.v1.attention.backends.mla.flashmla_sparse import (
+    triton_convert_req_index_to_global_index,
 )
 from vllm.v1.attention.backends.mla.xpu_mla_sparse import (
     XPUMLASparseImpl,
     XPUMLASparseMetadata,
     XPUMLASparseMetadataBuilder,
 )
-from vllm.v1.attention.backends.mla.flashmla_sparse import (
-    triton_convert_req_index_to_global_index,
-)
 from vllm.v1.attention.ops.mqa_logits_triton import (
     warmup_fp8_mqa_logits_triton,
     warmup_fp8_paged_mqa_logits_triton,
+)
+from vllm.v1.attention.ops.triton_oscar_mla_decode import (
+    oscar_mla_sparse_prefill,
+    prepare_grouped_h4_score_workspace,
+)
+from vllm.v1.attention.ops.triton_oscar_mla_materialize import (
+    OSCAR_BF16_MATERIALIZATION_MAX_ROWS,
+    OSCAR_MTP_TEMPORAL_MAX_POSITIONS,
+    allocate_oscar_mtp_direct_attention_cache,
+    allocate_oscar_mtp_row576_temporal_cache,
+    allocate_oscar_mtp_temporal_cache,
+    allocate_oscar_mtp_temporal_cache_with_direct_storage,
+    allocate_oscar_mtp_temporal_cache_with_split_direct_storage,
+    can_use_oscar_bf16_materialized_read,
+    commit_oscar_mla_direct_attention_misses,
+    commit_oscar_mla_dual_source_attention_misses,
+    materialize_oscar_mla_bf16_rows,
+    materialize_oscar_mla_bf16_rows_direct_attention,
+    materialize_oscar_mla_bf16_rows_temporal,
+    merge_oscar_chunked_attention_states,
+    prepare_oscar_bf16_materialization_workspace,
+    prepare_oscar_mtp_temporal_workspace,
+    reset_oscar_mtp_temporal_cache,
+    restore_oscar_mla_hp_rows,
+    restore_oscar_topk_after_chunk,
+    save_and_remap_oscar_topk_for_chunk,
+    seed_oscar_mtp_temporal_cache_recent,
+    seed_oscar_mtp_temporal_cache_rows,
+)
+from vllm.v1.attention.ops.triton_oscar_mla_store import (
+    allocate_oscar_demotion_ksplit_workspace,
+    oscar_mla_demote_recent,
+    oscar_mla_rotate_quantize_store,
+    oscar_mla_rotate_quantize_store_decode,
+    oscar_mla_store_bf16,
+    oscar_mla_store_rope,
 )
 from vllm.v1.attention.ops.triton_sparse_mla_kernel import (
     _BLOCK_DV,
     _DIM_QK,
     KV_SPLITS_CANDIDATES,
     triton_sparse_mla_attention,
+    triton_sparse_mla_attention_dual_source,
 )
+from vllm.v1.worker.oscar_mla_cache import OscarMLACacheTensors
+
+logger = init_logger(__name__)
 
 # DeepSeek-V3.2 / GLM-5.1 indexer shape, the only model family this backend
 # serves. Used only for autotune priming — if a future model differs, the
@@ -70,15 +112,96 @@ _ASSUME_VALID_AFTER_TOPK_NOMASK = _env_flag(
     "VLLM_SPARSE_MLA_ASSUME_VALID_AFTER_TOPK_NOMASK"
 )
 _SPARSE_MLA_WARMUP_NUM_TOKENS = os.getenv("VLLM_SPARSE_MLA_WARMUP_NUM_TOKENS")
-_FORCE_PREFIX_MASK_DECODE = _env_flag(
-    "VLLM_SPARSE_MLA_FORCE_PREFIX_MASK_DECODE"
-)
+_FORCE_PREFIX_MASK_DECODE = _env_flag("VLLM_SPARSE_MLA_FORCE_PREFIX_MASK_DECODE")
 _FORCE_PREFIX_MASK_DECODE_MAX_TOKENS = _env_int(
     "VLLM_SPARSE_MLA_FORCE_PREFIX_MASK_DECODE_MAX_TOKENS",
     4,
 )
 _PREFILL_SHAPE_BUCKET_TRACE = _env_flag("VLLM_PREFILL_SHAPE_BUCKET_TRACE")
+_OSCAR_MTP_TEMPORAL_CACHE_ENABLED = _env_flag("VLLM_OSCAR_MTP_TEMPORAL_CACHE")
+_OSCAR_MTP_PREFILL_SEED_ENABLED = _env_flag("VLLM_OSCAR_MTP_PREFILL_SEED")
+_OSCAR_MTP_DIRECT_CACHE_ATTENTION_ENABLED = _env_flag(
+    "VLLM_OSCAR_MTP_DIRECT_CACHE_ATTENTION"
+)
+_OSCAR_MTP_DUAL_SOURCE_ATTENTION_ENABLED = _env_flag(
+    "VLLM_OSCAR_MTP_DUAL_SOURCE_ATTENTION"
+)
+_OSCAR_MTP_TEMPORAL_TWO_WAY_ENABLED = _env_flag("VLLM_OSCAR_MTP_TEMPORAL_TWO_WAY")
+_OSCAR_MTP_PREQUANT_DEMOTION_CACHE_ENABLED = _env_flag(
+    "VLLM_OSCAR_MTP_PREQUANT_DEMOTION_CACHE"
+)
+_OSCAR_MTP_DIRECT_CACHE_ALLOCATION_ONLY_ENABLED = _env_flag(
+    "VLLM_OSCAR_MTP_DIRECT_CACHE_ALLOCATION_ONLY"
+)
+_OSCAR_MTP_DIRECT_CACHE_SPLIT_ALLOCATION_ONLY_ENABLED = _env_flag(
+    "VLLM_OSCAR_MTP_DIRECT_CACHE_SPLIT_ALLOCATION_ONLY"
+)
+_OSCAR_MTP_DIRECT_CACHE_ROW576_ALLOCATION_ONLY_ENABLED = _env_flag(
+    "VLLM_OSCAR_MTP_DIRECT_CACHE_ROW576_ALLOCATION_ONLY"
+)
+_OSCAR_MTP_DIRECT_RESET_EACH_STEP_ENABLED = _env_flag(
+    "VLLM_OSCAR_MTP_DIRECT_RESET_EACH_STEP"
+)
+_OSCAR_MTP_DIRECT_COMPARE_REFERENCE_ENABLED = _env_flag(
+    "VLLM_OSCAR_MTP_DIRECT_COMPARE_REFERENCE"
+)
+_OSCAR_MTP_DIRECT_COMPARE_REFERENCE_STEPS = _env_int(
+    "VLLM_OSCAR_MTP_DIRECT_COMPARE_REFERENCE_STEPS",
+    1,
+)
 logger = init_logger(__name__)
+
+
+def _log_oscar_mtp_direct_reference_diff(
+    *,
+    layer_name: str,
+    compare_step: int,
+    direct_output: torch.Tensor,
+    direct_lse: torch.Tensor,
+    reference_output: torch.Tensor,
+    reference_lse: torch.Tensor,
+) -> None:
+    """Log one eager-only direct/reference attention comparison."""
+    direct_fp32 = direct_output.float()
+    reference_fp32 = reference_output.float()
+    output_diff = (direct_fp32 - reference_fp32).abs()
+    lse_diff = (direct_lse.float() - reference_lse.float()).abs()
+    dot = torch.sum(direct_fp32 * reference_fp32)
+    norm_product = torch.linalg.vector_norm(direct_fp32) * torch.linalg.vector_norm(
+        reference_fp32
+    )
+    cosine = dot / torch.clamp_min(norm_product, 1e-30)
+    summary = torch.stack(
+        (
+            output_diff.max(),
+            output_diff.mean(),
+            torch.count_nonzero(direct_output != reference_output).float(),
+            lse_diff.max(),
+            lse_diff.mean(),
+            cosine,
+        )
+    ).cpu()
+    (
+        output_max_abs,
+        output_mean_abs,
+        output_neq,
+        lse_max_abs,
+        lse_mean_abs,
+        output_cosine,
+    ) = summary.tolist()
+    logger.warning(
+        "OSCAR MTP direct/reference layer=%s step=%d output_max_abs=%.9g "
+        "output_mean_abs=%.9g output_neq=%d lse_max_abs=%.9g "
+        "lse_mean_abs=%.9g output_cosine=%.12g",
+        layer_name,
+        compare_step,
+        output_max_abs,
+        output_mean_abs,
+        int(output_neq),
+        lse_max_abs,
+        lse_mean_abs,
+        output_cosine,
+    )
 
 
 class TritonMLASparseMetadataBuilder(XPUMLASparseMetadataBuilder):
@@ -88,6 +211,26 @@ class TritonMLASparseMetadataBuilder(XPUMLASparseMetadataBuilder):
     is the only place the capability is claimed."""
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+
+    def build_for_drafting(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        draft_index: int,
+    ) -> XPUMLASparseMetadata:
+        metadata = super().build_for_drafting(common_attn_metadata, draft_index)
+        oscar = metadata.oscar_mla
+        if draft_index <= 0 or oscar is None:
+            return metadata
+
+        metadata.oscar_mla = replace(
+            oscar,
+            demotion_hp_rows=oscar.demotion_hp_rows[:0],
+            demotion_positions=oscar.demotion_positions[:0],
+            demotion_page_ids=oscar.demotion_page_ids[:0],
+            demotion_page_offsets=oscar.demotion_page_offsets[:0],
+        )
+        metadata.oscar_mla_draft_step = True
+        return metadata
 
 
 class TritonMLASparseImpl(XPUMLASparseImpl):
@@ -99,12 +242,494 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        if (
+            _OSCAR_MTP_DUAL_SOURCE_ATTENTION_ENABLED
+            and not _OSCAR_MTP_TEMPORAL_CACHE_ENABLED
+        ):
+            raise ValueError(
+                "VLLM_OSCAR_MTP_DUAL_SOURCE_ATTENTION requires "
+                "VLLM_OSCAR_MTP_TEMPORAL_CACHE"
+            )
+        if (
+            _OSCAR_MTP_TEMPORAL_TWO_WAY_ENABLED
+            and not _OSCAR_MTP_DUAL_SOURCE_ATTENTION_ENABLED
+        ):
+            raise ValueError(
+                "VLLM_OSCAR_MTP_TEMPORAL_TWO_WAY requires "
+                "VLLM_OSCAR_MTP_DUAL_SOURCE_ATTENTION"
+            )
+        if _OSCAR_MTP_PREQUANT_DEMOTION_CACHE_ENABLED and not (
+            _OSCAR_MTP_TEMPORAL_CACHE_ENABLED
+            and _OSCAR_MTP_DUAL_SOURCE_ATTENTION_ENABLED
+            and _OSCAR_MTP_TEMPORAL_TWO_WAY_ENABLED
+        ):
+            raise ValueError(
+                "VLLM_OSCAR_MTP_PREQUANT_DEMOTION_CACHE requires temporal "
+                "cache, dual-source attention, and temporal two-way"
+            )
+        if (
+            _OSCAR_MTP_DUAL_SOURCE_ATTENTION_ENABLED
+            and _OSCAR_MTP_DIRECT_CACHE_ATTENTION_ENABLED
+        ):
+            raise ValueError(
+                "VLLM_OSCAR_MTP_DUAL_SOURCE_ATTENTION is incompatible with "
+                "VLLM_OSCAR_MTP_DIRECT_CACHE_ATTENTION"
+            )
+        if _OSCAR_MTP_DUAL_SOURCE_ATTENTION_ENABLED and _OSCAR_MTP_PREFILL_SEED_ENABLED:
+            raise ValueError(
+                "VLLM_OSCAR_MTP_DUAL_SOURCE_ATTENTION is incompatible with "
+                "VLLM_OSCAR_MTP_PREFILL_SEED"
+            )
+        if _OSCAR_MTP_DUAL_SOURCE_ATTENTION_ENABLED and (
+            _OSCAR_MTP_DIRECT_CACHE_ALLOCATION_ONLY_ENABLED
+            or _OSCAR_MTP_DIRECT_CACHE_SPLIT_ALLOCATION_ONLY_ENABLED
+            or _OSCAR_MTP_DIRECT_CACHE_ROW576_ALLOCATION_ONLY_ENABLED
+        ):
+            raise ValueError(
+                "VLLM_OSCAR_MTP_DUAL_SOURCE_ATTENTION is incompatible with "
+                "allocation-only diagnostics"
+            )
+        if (
+            _OSCAR_MTP_DIRECT_RESET_EACH_STEP_ENABLED
+            and not _OSCAR_MTP_DIRECT_CACHE_ATTENTION_ENABLED
+        ):
+            raise ValueError(
+                "VLLM_OSCAR_MTP_DIRECT_RESET_EACH_STEP requires "
+                "VLLM_OSCAR_MTP_DIRECT_CACHE_ATTENTION"
+            )
+        if (
+            _OSCAR_MTP_DIRECT_COMPARE_REFERENCE_ENABLED
+            and not _OSCAR_MTP_DIRECT_RESET_EACH_STEP_ENABLED
+        ):
+            raise ValueError(
+                "VLLM_OSCAR_MTP_DIRECT_COMPARE_REFERENCE requires "
+                "VLLM_OSCAR_MTP_DIRECT_RESET_EACH_STEP"
+            )
+        if (
+            _OSCAR_MTP_DIRECT_COMPARE_REFERENCE_ENABLED
+            and _OSCAR_MTP_DIRECT_COMPARE_REFERENCE_STEPS <= 0
+        ):
+            raise ValueError(
+                "VLLM_OSCAR_MTP_DIRECT_COMPARE_REFERENCE_STEPS must be positive"
+            )
+        if (
+            _OSCAR_MTP_DIRECT_CACHE_ALLOCATION_ONLY_ENABLED
+            and _OSCAR_MTP_DIRECT_CACHE_ATTENTION_ENABLED
+        ):
+            raise ValueError(
+                "VLLM_OSCAR_MTP_DIRECT_CACHE_ALLOCATION_ONLY is incompatible "
+                "with VLLM_OSCAR_MTP_DIRECT_CACHE_ATTENTION"
+            )
+        if (
+            _OSCAR_MTP_DIRECT_CACHE_ALLOCATION_ONLY_ENABLED
+            and not _OSCAR_MTP_TEMPORAL_CACHE_ENABLED
+        ):
+            raise ValueError(
+                "VLLM_OSCAR_MTP_DIRECT_CACHE_ALLOCATION_ONLY requires "
+                "VLLM_OSCAR_MTP_TEMPORAL_CACHE"
+            )
+        if (
+            _OSCAR_MTP_DIRECT_CACHE_SPLIT_ALLOCATION_ONLY_ENABLED
+            and _OSCAR_MTP_DIRECT_CACHE_ATTENTION_ENABLED
+        ):
+            raise ValueError(
+                "VLLM_OSCAR_MTP_DIRECT_CACHE_SPLIT_ALLOCATION_ONLY is "
+                "incompatible with VLLM_OSCAR_MTP_DIRECT_CACHE_ATTENTION"
+            )
+        if (
+            _OSCAR_MTP_DIRECT_CACHE_SPLIT_ALLOCATION_ONLY_ENABLED
+            and _OSCAR_MTP_DIRECT_CACHE_ALLOCATION_ONLY_ENABLED
+        ):
+            raise ValueError(
+                "VLLM_OSCAR_MTP_DIRECT_CACHE_SPLIT_ALLOCATION_ONLY is "
+                "incompatible with VLLM_OSCAR_MTP_DIRECT_CACHE_ALLOCATION_ONLY"
+            )
+        if (
+            _OSCAR_MTP_DIRECT_CACHE_SPLIT_ALLOCATION_ONLY_ENABLED
+            and not _OSCAR_MTP_TEMPORAL_CACHE_ENABLED
+        ):
+            raise ValueError(
+                "VLLM_OSCAR_MTP_DIRECT_CACHE_SPLIT_ALLOCATION_ONLY requires "
+                "VLLM_OSCAR_MTP_TEMPORAL_CACHE"
+            )
+        if (
+            _OSCAR_MTP_DIRECT_CACHE_ROW576_ALLOCATION_ONLY_ENABLED
+            and _OSCAR_MTP_DIRECT_CACHE_ATTENTION_ENABLED
+        ):
+            raise ValueError(
+                "VLLM_OSCAR_MTP_DIRECT_CACHE_ROW576_ALLOCATION_ONLY is "
+                "incompatible with VLLM_OSCAR_MTP_DIRECT_CACHE_ATTENTION"
+            )
+        if _OSCAR_MTP_DIRECT_CACHE_ROW576_ALLOCATION_ONLY_ENABLED and (
+            _OSCAR_MTP_DIRECT_CACHE_ALLOCATION_ONLY_ENABLED
+            or _OSCAR_MTP_DIRECT_CACHE_SPLIT_ALLOCATION_ONLY_ENABLED
+        ):
+            raise ValueError(
+                "VLLM_OSCAR_MTP_DIRECT_CACHE_ROW576_ALLOCATION_ONLY is "
+                "incompatible with other allocation-only diagnostics"
+            )
+        if (
+            _OSCAR_MTP_DIRECT_CACHE_ROW576_ALLOCATION_ONLY_ENABLED
+            and not _OSCAR_MTP_TEMPORAL_CACHE_ENABLED
+        ):
+            raise ValueError(
+                "VLLM_OSCAR_MTP_DIRECT_CACHE_ROW576_ALLOCATION_ONLY requires "
+                "VLLM_OSCAR_MTP_TEMPORAL_CACHE"
+            )
+        if _OSCAR_MTP_DIRECT_CACHE_ATTENTION_ENABLED:
+            if not _OSCAR_MTP_TEMPORAL_CACHE_ENABLED:
+                raise ValueError(
+                    "VLLM_OSCAR_MTP_DIRECT_CACHE_ATTENTION requires "
+                    "VLLM_OSCAR_MTP_TEMPORAL_CACHE"
+                )
+            if _OSCAR_MTP_PREFILL_SEED_ENABLED:
+                raise ValueError(
+                    "VLLM_OSCAR_MTP_DIRECT_CACHE_ATTENTION is incompatible with "
+                    "VLLM_OSCAR_MTP_PREFILL_SEED"
+                )
+        self.oscar_write_calls = 0
+        self.oscar_demotion_calls = 0
+        self.oscar_read_calls = 0
+        self.oscar_restore_calls = 0
+        self._oscar_grouped_h4_score_workspace: torch.Tensor | None = None
+        self._oscar_bf16_materialization_workspace: (
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ]
+            | None
+        ) = None
+        self._oscar_demotion_ksplit_workspace: torch.Tensor | None = None
+        self._oscar_mtp_temporal_cache: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._oscar_mtp_direct_compare_count = 0
+        self._oscar_mtp_temporal_workspace: (
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ]
+            | None
+        ) = None
+        self._oscar_capability_major = 0
+        if (
+            self.kv_cache_dtype == "oscar_mla_int2"
+            and self.topk_indices_buffer is not None
+            and self.num_heads == 8
+            and self.topk_indices_buffer.shape[-1] == 2048
+        ):
+            self._oscar_grouped_h4_score_workspace = prepare_grouped_h4_score_workspace(
+                self.topk_indices_buffer
+            )
+            self._oscar_capability_major = torch.cuda.get_device_capability(
+                self.topk_indices_buffer.device
+            )[0]
+            if self._oscar_capability_major == 8 and self.kv_lora_rank == 512:
+                self._oscar_demotion_ksplit_workspace = (
+                    allocate_oscar_demotion_ksplit_workspace(self.topk_indices_buffer)
+                )
+                self._oscar_bf16_materialization_workspace = (
+                    prepare_oscar_bf16_materialization_workspace(
+                        self.topk_indices_buffer
+                    )
+                )
+                if _OSCAR_MTP_TEMPORAL_CACHE_ENABLED:
+                    if _OSCAR_MTP_DIRECT_CACHE_ATTENTION_ENABLED:
+                        self._oscar_mtp_temporal_cache = (
+                            allocate_oscar_mtp_direct_attention_cache(
+                                self.topk_indices_buffer
+                            )
+                        )
+                    elif _OSCAR_MTP_DIRECT_CACHE_ROW576_ALLOCATION_ONLY_ENABLED:
+                        row576_cache = allocate_oscar_mtp_row576_temporal_cache(
+                            self.topk_indices_buffer
+                        )
+                        self._oscar_mtp_temporal_cache = row576_cache
+                    elif _OSCAR_MTP_DIRECT_CACHE_SPLIT_ALLOCATION_ONLY_ENABLED:
+                        self._oscar_mtp_temporal_cache = (
+                            allocate_oscar_mtp_temporal_cache_with_split_direct_storage(
+                                self.topk_indices_buffer
+                            )
+                        )
+                    elif _OSCAR_MTP_DIRECT_CACHE_ALLOCATION_ONLY_ENABLED:
+                        self._oscar_mtp_temporal_cache = (
+                            allocate_oscar_mtp_temporal_cache_with_direct_storage(
+                                self.topk_indices_buffer
+                            )
+                        )
+                    else:
+                        self._oscar_mtp_temporal_cache = (
+                            allocate_oscar_mtp_temporal_cache(self.topk_indices_buffer)
+                        )
+                    self._oscar_mtp_temporal_workspace = (
+                        prepare_oscar_mtp_temporal_workspace(self.topk_indices_buffer)
+                    )
         # Cached device SM count; passed into the kernel dispatch each forward
         # so the hot path doesn't re-query `q.device.index` → dict lookup.
         self._sm_count: int | None = None
         if self.topk_indices_buffer is not None:
             self._sm_count = num_compute_units(self.topk_indices_buffer.device.index)
         self._warmup_autotune()
+
+    @staticmethod
+    def _oscar_query_positions(
+        attn_metadata: XPUMLASparseMetadata,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        token_rows = torch.arange(
+            num_tokens,
+            dtype=torch.int32,
+            device=attn_metadata.seq_lens.device,
+        )
+        requests = attn_metadata.req_id_per_token[:num_tokens].long()
+        query_ends = attn_metadata.query_start_loc[requests + 1]
+        return attn_metadata.seq_lens[requests] - (query_ends - token_rows)
+
+    def do_oscar_kv_cache_update(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: OscarMLACacheTensors,
+        attn_metadata: XPUMLASparseMetadata,
+        rotation: torch.Tensor,
+        *,
+        clip_ratio: float,
+    ) -> None:
+        """Apply demotion before writing this batch's final three-pool partition."""
+        oscar = attn_metadata.oscar_mla
+        if oscar is None:
+            raise RuntimeError("oscar_mla_int2 attention metadata is missing")
+        if not isinstance(kv_cache, OscarMLACacheTensors):
+            raise TypeError("oscar_mla_int2 requires OSCAR MLA cache views")
+        num_tokens = attn_metadata.num_actual_tokens
+        latent = kv_c_normed[:num_tokens]
+        rope_values = k_pe[:num_tokens]
+        is_decode = (
+            attn_metadata.max_query_len == 1 and num_tokens == attn_metadata.num_reqs
+        )
+        is_incremental_mtp_target = (
+            not is_decode
+            and attn_metadata.num_reqs == 1
+            and attn_metadata.base_seq_len > 0
+            and attn_metadata.full_topk_start <= 0
+            and 1 < num_tokens <= 6
+            and attn_metadata.max_query_len == num_tokens
+        )
+        use_mtp_prefill_seed = (
+            _OSCAR_MTP_PREFILL_SEED_ENABLED
+            and self._oscar_mtp_temporal_cache is not None
+            and not is_decode
+            and not is_incremental_mtp_target
+            and attn_metadata.num_reqs == 1
+        )
+        if (
+            self._oscar_mtp_temporal_cache is not None
+            and not is_decode
+            and not is_incremental_mtp_target
+            and (not use_mtp_prefill_seed or attn_metadata.base_seq_len == 0)
+        ):
+            reset_oscar_mtp_temporal_cache(self._oscar_mtp_temporal_cache)
+        if is_decode:
+            if attn_metadata.oscar_mla_draft_step:
+                final_seq_lens = attn_metadata.seq_lens[:num_tokens]
+                query_positions = final_seq_lens - 1
+            else:
+                query_positions = oscar.decode_positions[:num_tokens]
+                final_seq_lens = oscar.final_seq_lens[:num_tokens]
+            token_hp_rows = oscar.hp_rows[:num_tokens]
+        else:
+            request_indices = attn_metadata.req_id_per_token[:num_tokens].long()
+            query_positions = self._oscar_query_positions(attn_metadata, num_tokens)
+            final_seq_lens = attn_metadata.seq_lens[request_indices]
+            token_hp_rows = oscar.hp_rows[request_indices]
+
+        oscar_mla_store_rope(
+            rope_values,
+            kv_cache.rope,
+            attn_metadata.slot_mapping[:num_tokens],
+        )
+
+        # Prefix caching reuses standard vLLM physical blocks after the
+        # originating request has released its private BF16 row. Persist every
+        # new latent in canonical INT2 form so a later hit can restore its
+        # fixed prefix/recent windows. Keep this extra write fully disabled for
+        # the frozen C135 no-prefix runtime.
+        if attn_metadata.enable_prefix_caching:
+            slots = attn_metadata.slot_mapping[:num_tokens]
+            if (
+                is_decode
+                and num_tokens == 1
+                and self._oscar_demotion_ksplit_workspace is not None
+            ):
+                oscar_mla_rotate_quantize_store_decode(
+                    latent,
+                    rotation,
+                    kv_cache.history_data,
+                    kv_cache.history_scale,
+                    kv_cache.history_zero,
+                    slots,
+                    clip_ratio=clip_ratio,
+                    partial_workspace=self._oscar_demotion_ksplit_workspace,
+                )
+            else:
+                valid_slots = slots >= 0
+                page_ids = torch.where(
+                    valid_slots,
+                    torch.div(
+                        slots,
+                        kv_cache.history_data.shape[1],
+                        rounding_mode="floor",
+                    ),
+                    -1,
+                )
+                page_offsets = torch.where(
+                    valid_slots,
+                    slots % kv_cache.history_data.shape[1],
+                    0,
+                )
+                oscar_mla_rotate_quantize_store(
+                    latent,
+                    rotation,
+                    kv_cache.history_data,
+                    kv_cache.history_scale,
+                    kv_cache.history_zero,
+                    page_ids,
+                    page_offsets,
+                    clip_ratio=clip_ratio,
+                )
+            if self.oscar_write_calls == 0:
+                logger.info_once(
+                    "OSCAR MLA prefix-cache canonical INT2 writes active"
+                )
+
+        if oscar.demotion_positions.numel():
+            if self.oscar_demotion_calls == 0:
+                logger.info_once(
+                    "OSCAR MLA recent-to-INT2 demotion active; first batch=%d tokens",
+                    oscar.demotion_positions.numel(),
+                )
+            oscar_mla_demote_recent(
+                kv_cache.recent,
+                rotation,
+                kv_cache.history_data,
+                kv_cache.history_scale,
+                kv_cache.history_zero,
+                oscar.demotion_positions,
+                oscar.demotion_hp_rows,
+                oscar.demotion_page_ids,
+                oscar.demotion_page_offsets,
+                prefix_tokens=kv_cache.prefix.shape[1],
+                clip_ratio=clip_ratio,
+                partial_workspace=(
+                    self._oscar_demotion_ksplit_workspace
+                    if (
+                        is_decode
+                        and num_tokens == 1
+                        and oscar.demotion_positions.numel() == 1
+                    )
+                    else None
+                ),
+                prequant_temporal_cache=(
+                    self._oscar_mtp_temporal_cache
+                    if (
+                        _OSCAR_MTP_PREQUANT_DEMOTION_CACHE_ENABLED
+                        and is_incremental_mtp_target
+                    )
+                    else None
+                ),
+                temporal_two_way=(
+                    _OSCAR_MTP_PREQUANT_DEMOTION_CACHE_ENABLED
+                    and is_incremental_mtp_target
+                ),
+            )
+            if use_mtp_prefill_seed:
+                assert self._oscar_mtp_temporal_cache is not None
+                seed_oscar_mtp_temporal_cache_recent(
+                    kv_cache.recent,
+                    oscar.demotion_positions,
+                    oscar.demotion_hp_rows,
+                    oscar.demotion_page_ids,
+                    self._oscar_mtp_temporal_cache,
+                    prefix_tokens=kv_cache.prefix.shape[1],
+                )
+            self.oscar_demotion_calls += 1
+
+        if not is_decode and not is_incremental_mtp_target:
+            history_end = torch.maximum(
+                torch.full_like(final_seq_lens, kv_cache.prefix.shape[1]),
+                final_seq_lens - kv_cache.recent_tokens,
+            )
+            current_history = (query_positions >= kv_cache.prefix.shape[1]) & (
+                query_positions < history_end
+            )
+            history_indices = query_positions - kv_cache.prefix.shape[1]
+            logical_pages = torch.div(
+                history_indices,
+                kv_cache.history_data.shape[1],
+                rounding_mode="floor",
+            )
+            valid_history = (
+                current_history
+                & (logical_pages >= 0)
+                & (logical_pages < oscar.history_page_table.shape[1])
+            )
+            safe_logical_pages = torch.clamp(
+                logical_pages,
+                min=0,
+                max=oscar.history_page_table.shape[1] - 1,
+            )
+            page_offsets = history_indices % kv_cache.history_data.shape[1]
+            page_ids = oscar.history_page_table[
+                request_indices,
+                safe_logical_pages.long(),
+            ]
+            page_ids = torch.where(valid_history, page_ids, -1)
+            oscar_mla_rotate_quantize_store(
+                latent,
+                rotation,
+                kv_cache.history_data,
+                kv_cache.history_scale,
+                kv_cache.history_zero,
+                page_ids,
+                page_offsets,
+                clip_ratio=clip_ratio,
+            )
+            if use_mtp_prefill_seed:
+                assert self._oscar_mtp_temporal_cache is not None
+                seed_oscar_mtp_temporal_cache_rows(
+                    latent,
+                    query_positions,
+                    valid_history,
+                    self._oscar_mtp_temporal_cache,
+                )
+
+        store_recent_tokens = (
+            kv_cache.recent.shape[1]
+            if attn_metadata.oscar_mla_draft_step
+            else kv_cache.recent_tokens
+        )
+        oscar_mla_store_bf16(
+            latent,
+            kv_cache.prefix,
+            kv_cache.recent,
+            query_positions,
+            final_seq_lens,
+            token_hp_rows,
+            store_recent_tokens,
+        )
+        if self.oscar_write_calls == 0:
+            logger.info_once(
+                "OSCAR MLA three-pool write active; no full BF16 latent history"
+            )
+        self.oscar_write_calls += 1
 
     def _warmup_autotune(self) -> None:
         """Prime `@triton.autotune` caches at init so the first user request
@@ -195,7 +820,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                             valid_index_base_seq_len=0,
                         )
             del q, indices
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
         # The indexer's fp8 MQA logits kernels live on a separate autotune
         # cache. Prime them here so cold TTFT doesn't include their sweep.
         warmup_fp8_mqa_logits_triton(
@@ -248,7 +873,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
 
         def _trace_sync() -> None:
             if trace_enabled and q_nope.device.type == "cuda":
-                torch.cuda.synchronize(q_nope.device)
+                torch.accelerator.synchronize(device=q_nope.device)
 
         def _sparse_mla_call(label: str, *args, **kwargs):
             start = 0.0
@@ -280,8 +905,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
         use_fused_req_to_global = (
             _FUSED_REQ_TO_GLOBAL
             and attn_metadata.full_topk_start <= 0
-            and num_tokens
-            <= _FUSED_REQ_TO_GLOBAL_MAX_TOKENS
+            and num_tokens <= _FUSED_REQ_TO_GLOBAL_MAX_TOKENS
         )
         if use_fused_req_to_global:
             topk_indices = topk_indices.view(num_tokens, 1, -1)
@@ -320,10 +944,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 )
             sparse_kwargs = {}
         out_heads = q_nope.shape[1] if return_lse else self.num_heads
-        if (
-            _ASSUME_VALID_DYNAMIC
-            and attn_metadata.num_reqs == 1
-        ):
+        if _ASSUME_VALID_DYNAMIC and attn_metadata.num_reqs == 1:
             full_topk_start = attn_metadata.full_topk_start
             if full_topk_start <= 0:
                 if (
@@ -376,10 +997,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                     output, lse = result
                     return output[:, :out_heads, :], lse[:, :out_heads]
                 return result[:, :out_heads, :]
-        if (
-            _ASSUME_VALID_SPLIT
-            and attn_metadata.num_reqs == 1
-        ):
+        if _ASSUME_VALID_SPLIT and attn_metadata.num_reqs == 1:
             full_topk_start = attn_metadata.full_topk_start
             if full_topk_start <= 0:
                 result = _sparse_mla_call(
@@ -461,6 +1079,441 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
         attn_metadata: XPUMLASparseMetadata,
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.kv_cache_dtype == "oscar_mla_int2":
+            if not isinstance(q, tuple):
+                raise TypeError(
+                    "oscar_mla_int2 requires separate latent and RoPE query"
+                )
+            if not isinstance(kv_c_and_k_pe_cache, OscarMLACacheTensors):
+                raise TypeError("oscar_mla_int2 requires OSCAR MLA cache views")
+            oscar = attn_metadata.oscar_mla
+            if oscar is None:
+                raise RuntimeError("oscar_mla_int2 attention metadata is missing")
+            q_nope, q_pe = q
+            num_actual_toks = q_nope.shape[0]
+            assert self.topk_indices_buffer is not None
+            if oscar.num_restore_rows:
+                if self._oscar_bf16_materialization_workspace is None:
+                    raise RuntimeError(
+                        "OSCAR MLA cache-hit restore workspace is missing"
+                    )
+                history_rotated, _, restored, *_ = (
+                    self._oscar_bf16_materialization_workspace
+                )
+                restore_oscar_mla_hp_rows(
+                    positions=oscar.restore_positions,
+                    hp_rows=oscar.restore_hp_rows,
+                    page_ids=oscar.restore_page_ids,
+                    page_offsets=oscar.restore_page_offsets,
+                    num_rows=oscar.num_restore_rows,
+                    history_data=kv_c_and_k_pe_cache.history_data,
+                    history_scale=kv_c_and_k_pe_cache.history_scale,
+                    history_zero=kv_c_and_k_pe_cache.history_zero,
+                    prefix=kv_c_and_k_pe_cache.prefix,
+                    recent=kv_c_and_k_pe_cache.recent,
+                    inverse_rotation=layer._oscar_inverse_rotation_bf16,
+                    history_rotated=history_rotated,
+                    restored=restored,
+                )
+                if self.oscar_restore_calls == 0:
+                    logger.info_once(
+                        "OSCAR MLA prefix-cache BF16 window restore active; rows=%d",
+                        oscar.num_restore_rows,
+                    )
+                self.oscar_restore_calls += 1
+            is_decode = (
+                attn_metadata.max_query_len == 1
+                and num_actual_toks == attn_metadata.num_reqs
+            )
+            topk_width = attn_metadata.topk_tokens
+            if not is_decode:
+                topk_width = min(topk_width, attn_metadata.max_seq_len)
+            use_selected_incremental_materialization = (
+                not is_decode
+                and attn_metadata.num_reqs == 1
+                and attn_metadata.base_seq_len > 0
+                and attn_metadata.full_topk_start <= 0
+                and 1 < num_actual_toks <= 6
+                and attn_metadata.max_query_len == num_actual_toks
+                and num_actual_toks * topk_width <= OSCAR_BF16_MATERIALIZATION_MAX_ROWS
+            )
+            use_mtp_temporal_materialization = (
+                use_selected_incremental_materialization
+                and self._oscar_mtp_temporal_cache is not None
+                and self._oscar_mtp_temporal_workspace is not None
+                and attn_metadata.max_seq_len <= OSCAR_MTP_TEMPORAL_MAX_POSITIONS
+            )
+            use_mtp_direct_cache_attention = (
+                use_mtp_temporal_materialization
+                and _OSCAR_MTP_DIRECT_CACHE_ATTENTION_ENABLED
+            )
+            use_mtp_dual_source_attention = (
+                use_mtp_temporal_materialization
+                and _OSCAR_MTP_DUAL_SOURCE_ATTENTION_ENABLED
+            )
+            group_size = self.kv_lora_rank // kv_c_and_k_pe_cache.history_scale.shape[2]
+            read_recent_tokens = (
+                kv_c_and_k_pe_cache.recent.shape[1]
+                if attn_metadata.oscar_mla_draft_step
+                else kv_c_and_k_pe_cache.recent_tokens
+            )
+            use_bf16_materialized_read = (
+                self._oscar_bf16_materialization_workspace is not None
+                and can_use_oscar_bf16_materialized_read(
+                    capability_major=self._oscar_capability_major,
+                    num_requests=attn_metadata.num_reqs,
+                    num_heads=self.num_heads,
+                    latent_rank=self.kv_lora_rank,
+                    rope_head_size=kv_c_and_k_pe_cache.rope.shape[2],
+                    group_size=group_size,
+                    prefix_tokens=kv_c_and_k_pe_cache.prefix.shape[1],
+                    recent_tokens=kv_c_and_k_pe_cache.recent_tokens,
+                    topk=topk_width,
+                )
+            )
+            if use_bf16_materialized_read:
+                assert self._oscar_bf16_materialization_workspace is not None
+                selected = self.topk_indices_buffer[:num_actual_toks, :topk_width]
+                (
+                    history_rotated,
+                    history_mask,
+                    materialized_kv,
+                    remapped,
+                    partial_output,
+                    accumulated_lse,
+                    partial_lse,
+                ) = self._oscar_bf16_materialization_workspace
+                dual_miss_values: torch.Tensor | None = None
+                use_selected_materialization = (
+                    is_decode or use_selected_incremental_materialization
+                )
+                if (
+                    use_selected_materialization
+                    or attn_metadata.max_seq_len <= OSCAR_BF16_MATERIALIZATION_MAX_ROWS
+                ):
+                    positions = (
+                        selected.reshape(-1) if use_selected_materialization else None
+                    )
+                    if use_selected_incremental_materialization:
+                        materialized_rows = num_actual_toks * topk_width
+                    else:
+                        materialized_rows = (
+                            topk_width if is_decode else attn_metadata.max_seq_len
+                        )
+                    if use_mtp_temporal_materialization:
+                        assert self._oscar_mtp_temporal_cache is not None
+                        assert self._oscar_mtp_temporal_workspace is not None
+                        assert positions is not None
+                        if use_mtp_direct_cache_attention:
+                            if _OSCAR_MTP_DIRECT_RESET_EACH_STEP_ENABLED:
+                                reset_oscar_mtp_temporal_cache(
+                                    self._oscar_mtp_temporal_cache
+                                )
+                            kv, remapped_indices = (
+                                materialize_oscar_mla_bf16_rows_direct_attention(
+                                    positions=positions,
+                                    num_rows=materialized_rows,
+                                    num_requests=attn_metadata.num_reqs,
+                                    prefix=kv_c_and_k_pe_cache.prefix,
+                                    recent=kv_c_and_k_pe_cache.recent,
+                                    rope=kv_c_and_k_pe_cache.rope,
+                                    rope_block_table=attn_metadata.block_table,
+                                    history_data=kv_c_and_k_pe_cache.history_data,
+                                    history_scale=kv_c_and_k_pe_cache.history_scale,
+                                    history_zero=kv_c_and_k_pe_cache.history_zero,
+                                    history_page_table=oscar.history_page_table,
+                                    hp_rows=oscar.hp_rows,
+                                    seq_lens=attn_metadata.seq_lens,
+                                    inverse_rotation=layer._oscar_inverse_rotation_bf16,
+                                    history_rotated=history_rotated,
+                                    remapped_indices=remapped,
+                                    temporal_workspace=(
+                                        self._oscar_mtp_temporal_workspace
+                                    ),
+                                    direct_cache=self._oscar_mtp_temporal_cache,
+                                    recent_tokens=read_recent_tokens,
+                                )
+                            )
+                        else:
+                            kv, remapped_indices = (
+                                materialize_oscar_mla_bf16_rows_temporal(
+                                    positions=positions,
+                                    num_rows=materialized_rows,
+                                    num_requests=attn_metadata.num_reqs,
+                                    prefix=kv_c_and_k_pe_cache.prefix,
+                                    recent=kv_c_and_k_pe_cache.recent,
+                                    rope=kv_c_and_k_pe_cache.rope,
+                                    rope_block_table=attn_metadata.block_table,
+                                    history_data=kv_c_and_k_pe_cache.history_data,
+                                    history_scale=kv_c_and_k_pe_cache.history_scale,
+                                    history_zero=kv_c_and_k_pe_cache.history_zero,
+                                    history_page_table=oscar.history_page_table,
+                                    hp_rows=oscar.hp_rows,
+                                    seq_lens=attn_metadata.seq_lens,
+                                    inverse_rotation=(
+                                        layer._oscar_inverse_rotation_bf16
+                                    ),
+                                    history_rotated=history_rotated,
+                                    history_mask=history_mask,
+                                    output_kv=materialized_kv,
+                                    remapped_indices=remapped,
+                                    temporal_workspace=(
+                                        self._oscar_mtp_temporal_workspace
+                                    ),
+                                    temporal_cache=self._oscar_mtp_temporal_cache,
+                                    recent_tokens=read_recent_tokens,
+                                    dual_source_attention=(
+                                        use_mtp_dual_source_attention
+                                    ),
+                                    two_way=_OSCAR_MTP_TEMPORAL_TWO_WAY_ENABLED,
+                                )
+                            )
+                            if use_mtp_dual_source_attention:
+                                dual_miss_values = kv
+                    else:
+                        kv, remapped_indices = materialize_oscar_mla_bf16_rows(
+                            positions=positions,
+                            num_rows=materialized_rows,
+                            num_requests=attn_metadata.num_reqs,
+                            prefix=kv_c_and_k_pe_cache.prefix,
+                            recent=kv_c_and_k_pe_cache.recent,
+                            rope=kv_c_and_k_pe_cache.rope,
+                            rope_block_table=attn_metadata.block_table,
+                            history_data=kv_c_and_k_pe_cache.history_data,
+                            history_scale=kv_c_and_k_pe_cache.history_scale,
+                            history_zero=kv_c_and_k_pe_cache.history_zero,
+                            history_page_table=oscar.history_page_table,
+                            hp_rows=oscar.hp_rows,
+                            seq_lens=attn_metadata.seq_lens,
+                            inverse_rotation=layer._oscar_inverse_rotation_bf16,
+                            history_rotated=history_rotated,
+                            history_mask=history_mask,
+                            output_kv=materialized_kv,
+                            remapped_indices=remapped,
+                            recent_tokens=read_recent_tokens,
+                        )
+                    indices = (
+                        remapped_indices.view(num_actual_toks, 1, topk_width)
+                        if use_selected_materialization
+                        else selected.view(num_actual_toks, 1, topk_width)
+                    )
+                    if use_mtp_dual_source_attention:
+                        assert positions is not None
+                        assert self._oscar_mtp_temporal_cache is not None
+                        assert dual_miss_values is not None
+                        source_positions = positions.view(
+                            num_actual_toks, 1, topk_width
+                        )
+                        output, lse = triton_sparse_mla_attention_dual_source(
+                            q,
+                            self._oscar_mtp_temporal_cache[0],
+                            dual_miss_values,
+                            kv_c_and_k_pe_cache.rope,
+                            attn_metadata.block_table,
+                            source_positions,
+                            indices,
+                            sm_scale=self.softmax_scale,
+                            num_kv_splits=16,
+                        )
+                        assert self._oscar_mtp_temporal_workspace is not None
+                        commit_oscar_mla_dual_source_attention_misses(
+                            positions=positions,
+                            num_rows=materialized_rows,
+                            miss_values=dual_miss_values,
+                            temporal_workspace=self._oscar_mtp_temporal_workspace,
+                            temporal_cache=self._oscar_mtp_temporal_cache,
+                            two_way=_OSCAR_MTP_TEMPORAL_TWO_WAY_ENABLED,
+                        )
+                    else:
+                        output, lse = triton_sparse_mla_attention(
+                            q,
+                            kv,
+                            indices,
+                            sm_scale=self.softmax_scale,
+                            num_kv_splits=16 if use_selected_materialization else 1,
+                            sm_count=self._sm_count,
+                            assume_valid_indices=False,
+                            return_lse=True,
+                        )
+                    if use_mtp_direct_cache_attention:
+                        assert positions is not None
+                        assert self._oscar_mtp_temporal_workspace is not None
+                        assert self._oscar_mtp_temporal_cache is not None
+                        commit_oscar_mla_direct_attention_misses(
+                            positions=positions,
+                            num_rows=materialized_rows,
+                            temporal_workspace=self._oscar_mtp_temporal_workspace,
+                            direct_cache=self._oscar_mtp_temporal_cache,
+                        )
+                        if (
+                            _OSCAR_MTP_DIRECT_COMPARE_REFERENCE_ENABLED
+                            and self._oscar_mtp_direct_compare_count
+                            < _OSCAR_MTP_DIRECT_COMPARE_REFERENCE_STEPS
+                        ):
+                            reference_kv, reference_remapped_indices = (
+                                materialize_oscar_mla_bf16_rows(
+                                    positions=positions,
+                                    num_rows=materialized_rows,
+                                    num_requests=attn_metadata.num_reqs,
+                                    prefix=kv_c_and_k_pe_cache.prefix,
+                                    recent=kv_c_and_k_pe_cache.recent,
+                                    rope=kv_c_and_k_pe_cache.rope,
+                                    rope_block_table=attn_metadata.block_table,
+                                    history_data=kv_c_and_k_pe_cache.history_data,
+                                    history_scale=kv_c_and_k_pe_cache.history_scale,
+                                    history_zero=kv_c_and_k_pe_cache.history_zero,
+                                    history_page_table=oscar.history_page_table,
+                                    hp_rows=oscar.hp_rows,
+                                    seq_lens=attn_metadata.seq_lens,
+                                    inverse_rotation=(
+                                        layer._oscar_inverse_rotation_bf16
+                                    ),
+                                    history_rotated=history_rotated,
+                                    history_mask=history_mask,
+                                    output_kv=materialized_kv,
+                                    remapped_indices=remapped,
+                                    recent_tokens=read_recent_tokens,
+                                )
+                            )
+                            reference_indices = reference_remapped_indices.view(
+                                num_actual_toks, 1, topk_width
+                            )
+                            reference_output, reference_lse = (
+                                triton_sparse_mla_attention(
+                                    q,
+                                    reference_kv,
+                                    reference_indices,
+                                    sm_scale=self.softmax_scale,
+                                    num_kv_splits=16,
+                                    sm_count=self._sm_count,
+                                    assume_valid_indices=False,
+                                    return_lse=True,
+                                )
+                            )
+                            _log_oscar_mtp_direct_reference_diff(
+                                layer_name=getattr(layer, "layer_name", "unknown"),
+                                compare_step=self._oscar_mtp_direct_compare_count,
+                                direct_output=output,
+                                direct_lse=lse,
+                                reference_output=reference_output,
+                                reference_lse=reference_lse,
+                            )
+                            self._oscar_mtp_direct_compare_count += 1
+                else:
+                    output = None
+                    lse = accumulated_lse[:num_actual_toks]
+                    for row_offset in range(
+                        0,
+                        attn_metadata.max_seq_len,
+                        OSCAR_BF16_MATERIALIZATION_MAX_ROWS,
+                    ):
+                        materialized_rows = min(
+                            OSCAR_BF16_MATERIALIZATION_MAX_ROWS,
+                            attn_metadata.max_seq_len - row_offset,
+                        )
+                        kv, _ = materialize_oscar_mla_bf16_rows(
+                            positions=None,
+                            num_rows=materialized_rows,
+                            row_offset=row_offset,
+                            num_requests=attn_metadata.num_reqs,
+                            prefix=kv_c_and_k_pe_cache.prefix,
+                            recent=kv_c_and_k_pe_cache.recent,
+                            rope=kv_c_and_k_pe_cache.rope,
+                            rope_block_table=attn_metadata.block_table,
+                            history_data=kv_c_and_k_pe_cache.history_data,
+                            history_scale=kv_c_and_k_pe_cache.history_scale,
+                            history_zero=kv_c_and_k_pe_cache.history_zero,
+                            history_page_table=oscar.history_page_table,
+                            hp_rows=oscar.hp_rows,
+                            seq_lens=attn_metadata.seq_lens,
+                            inverse_rotation=layer._oscar_inverse_rotation_bf16,
+                            history_rotated=history_rotated,
+                            history_mask=history_mask,
+                            output_kv=materialized_kv,
+                            remapped_indices=remapped,
+                            recent_tokens=read_recent_tokens,
+                        )
+                        saved_indices = save_and_remap_oscar_topk_for_chunk(
+                            selected,
+                            history_rotated,
+                            row_offset,
+                            materialized_rows,
+                        )
+                        chunk_output_buffer: torch.Tensor | None = (
+                            None if output is None else partial_output[:num_actual_toks]
+                        )
+                        chunk_lse_buffer = (
+                            lse if output is None else partial_lse[:num_actual_toks]
+                        )
+                        chunk_output, chunk_lse = triton_sparse_mla_attention(
+                            q,
+                            kv,
+                            selected.view(num_actual_toks, 1, topk_width),
+                            sm_scale=self.softmax_scale,
+                            num_kv_splits=1,
+                            sm_count=self._sm_count,
+                            out=chunk_output_buffer,
+                            lse_out=chunk_lse_buffer,
+                            assume_valid_indices=False,
+                            return_lse=True,
+                        )
+                        restore_oscar_topk_after_chunk(selected, saved_indices)
+                        if output is None:
+                            output = chunk_output
+                        else:
+                            merge_oscar_chunked_attention_states(
+                                output,
+                                lse,
+                                chunk_output,
+                                chunk_lse,
+                            )
+                    assert output is not None
+                if self.oscar_read_calls == 0:
+                    logger.info_once("OSCAR MLA BF16-materialized sparse read active")
+                self.oscar_read_calls += 1
+                output = output.to(q_nope.dtype)
+                return (
+                    (output, lse)
+                    if self.need_to_return_lse_for_decode
+                    else (output, None)
+                )
+            query_positions = self._oscar_query_positions(
+                attn_metadata,
+                num_actual_toks,
+            )
+            output, lse = oscar_mla_sparse_prefill(
+                q_nope,
+                q_pe,
+                self.topk_indices_buffer[:num_actual_toks, :topk_width],
+                attn_metadata.req_id_per_token[:num_actual_toks],
+                query_positions,
+                kv_c_and_k_pe_cache.prefix,
+                kv_c_and_k_pe_cache.recent,
+                kv_c_and_k_pe_cache.rope,
+                attn_metadata.block_table,
+                kv_c_and_k_pe_cache.history_data,
+                kv_c_and_k_pe_cache.history_scale,
+                kv_c_and_k_pe_cache.history_zero,
+                oscar.history_page_table,
+                oscar.hp_rows,
+                attn_metadata.seq_lens,
+                layer._oscar_rotation,
+                inverse_rotation=layer._oscar_inverse_rotation,
+                attention_scale=self.softmax_scale,
+                num_splits=16 if is_decode else 1,
+                recent_tokens=read_recent_tokens,
+                score_workspace=self._oscar_grouped_h4_score_workspace,
+                group_decode_h4=is_decode,
+            )
+            if self.oscar_read_calls == 0:
+                logger.info_once(
+                    "OSCAR MLA DSA-selected mixed prefix/recent/INT2 read active"
+                )
+            self.oscar_read_calls += 1
+            output = output.to(q_nope.dtype)
+            return (
+                (output, lse) if self.need_to_return_lse_for_decode else (output, None)
+            )
         if is_quantized_kv_cache(self.kv_cache_dtype):
             raise NotImplementedError("FP8 kv is not supported with MLA Sparse yet")
 
@@ -491,6 +1544,7 @@ class TritonMLASparseBackend(AttentionBackend):
         "auto",
         "float16",
         "bfloat16",
+        "oscar_mla_int2",
     ]
 
     @staticmethod

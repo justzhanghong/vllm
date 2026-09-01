@@ -335,6 +335,87 @@ class MLAAttentionSpec(FullAttentionSpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class OscarMLAAttentionSpec(MLAAttentionSpec):
+    """Three-pool INT2 cache geometry for one shared-latent MLA layer."""
+
+    latent_rank: int
+    rope_head_size: int
+    history_slot_size: int
+    group_size: int = 128
+    prefix_tokens: int = 64
+    recent_tokens: int = 256
+    speculative_tokens: int = 0
+    hp_dtype: torch.dtype = torch.bfloat16
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.cache_dtype_str != "oscar_mla_int2":
+            raise ValueError(
+                "OscarMLAAttentionSpec requires cache_dtype_str=oscar_mla_int2"
+            )
+        if self.num_kv_heads != 1:
+            raise ValueError("OSCAR MLA requires one shared latent per token")
+        if self.head_size != self.latent_rank + self.rope_head_size:
+            raise ValueError(
+                "OSCAR MLA head_size must equal latent_rank plus rope_head_size"
+            )
+        if self.hp_dtype is not torch.bfloat16:
+            raise ValueError("OSCAR MLA prefix/recent pools require BF16")
+        if self.group_size <= 0 or self.latent_rank % self.group_size:
+            raise ValueError("group_size must exactly divide the MLA latent rank")
+        if self.latent_rank * 2 % 8:
+            raise ValueError("OSCAR MLA INT2 rows must pack into whole bytes")
+        if (
+            self.prefix_tokens < 0
+            or self.recent_tokens < 0
+            or self.speculative_tokens < 0
+        ):
+            raise ValueError("OSCAR MLA windows must be non-negative")
+        if self.prefix_tokens % self.block_size:
+            raise ValueError("OSCAR MLA prefix window must be block aligned")
+        if self.recent_tokens % self.block_size:
+            raise ValueError("OSCAR MLA recent window must be block aligned")
+        packed_data_bytes = self.latent_rank * 2 // 8
+        metadata_bytes = self.latent_rank // self.group_size * 2 * 4
+        expected_slot_size = packed_data_bytes + metadata_bytes
+        if self.history_slot_size != expected_slot_size:
+            raise ValueError(
+                "history_slot_size does not match INT2 data plus FP32 "
+                f"scale/zero metadata: expected={expected_slot_size}, "
+                f"actual={self.history_slot_size}"
+            )
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        variable_token_bytes = (
+            self.history_slot_size + self.rope_head_size * get_dtype_size(self.hp_dtype)
+        )
+        return self.block_size * variable_token_bytes
+
+    @property
+    def bf16_token_size_bytes(self) -> int:
+        return self.latent_rank * get_dtype_size(self.hp_dtype)
+
+    @property
+    def recent_capacity_tokens(self) -> int:
+        return self.recent_tokens + self.speculative_tokens
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        max_model_len = vllm_config.model_config.max_model_len
+        return cdiv(max_model_len, self.block_size) * self.page_size_bytes
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert all(isinstance(spec, cls) for spec in specs), (
+            "All layers in an OSCAR MLA cache group must use OscarMLAAttentionSpec."
+        )
+        assert all(spec == specs[0] for spec in specs[1:]), (
+            "All layers in an OSCAR MLA cache group must have identical geometry."
+        )
+        return copy.deepcopy(specs[0])
+
+
+@dataclass(frozen=True, kw_only=True)
 class ChunkedLocalAttentionSpec(AttentionSpec):
     attention_chunk_size: int
 
@@ -613,6 +694,10 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    oscar_mla_max_num_seqs: int | None = None
+    """Reserved request rows in the fixed OSCAR MLA BF16 pools."""
+    oscar_mla_history_pages: int | None = None
+    """Number of pages in OSCAR MLA's independent INT2 history namespace."""
 
     @property
     def has_mamba_layers(self) -> bool:

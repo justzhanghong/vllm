@@ -84,6 +84,19 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
     ) -> FusedMoEQuantConfig | None:
         return self.moe_quant_config
 
+    def supports_aligned_routing_metadata(self, layer: torch.nn.Module) -> bool:
+        if self.moe_kernel is None:
+            return False
+        supports_metadata = getattr(
+            self.moe_kernel.fused_experts,
+            "supports_aligned_routing_metadata",
+            None,
+        )
+        expert_map = None if self.disable_expert_map else layer.expert_map
+        return (
+            supports_metadata is not None and supports_metadata() and expert_map is None
+        )
+
     def apply(
         self,
         layer: "FusedMoE",  # type: ignore[name-defined] # noqa: F821
@@ -104,4 +117,28 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
             expert_map=None if self.disable_expert_map else layer.expert_map,
             shared_experts_input=shared_experts_input,
+        )
+
+    def apply_with_aligned_metadata(
+        self,
+        layer: "FusedMoE",  # type: ignore[name-defined] # noqa: F821
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+        aligned_routing_metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        assert self.moe_kernel is not None
+        return self.moe_kernel.apply(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=layer.activation,
+            global_num_experts=layer.global_num_experts,
+            apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            expert_map=None if self.disable_expert_map else layer.expert_map,
+            shared_experts_input=shared_experts_input,
+            aligned_routing_metadata=aligned_routing_metadata,
         )

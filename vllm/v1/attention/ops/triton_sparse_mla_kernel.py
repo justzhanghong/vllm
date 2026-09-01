@@ -27,6 +27,12 @@ _DIM_QK = _BLOCK_DMODEL + _BLOCK_DPE  # 576
 
 _BLOCK_H = int(os.getenv("VLLM_SPARSE_MLA_BLOCK_H", "32"))
 
+# TP=8 gives each rank exactly eight GLM-5.2 query heads.  The dual-source
+# MTP target path is fixed to that geometry; using the general H32 launch
+# wastes 24 masked head lanes in every split program.
+_DUAL_SOURCE_BLOCK_H = 8
+_DUAL_SOURCE_NUM_WARPS = 8
+
 
 def _env_flag(name: str, default: str = "0") -> bool:
     return os.getenv(name, default) == "1"
@@ -105,6 +111,7 @@ _SPLIT_MAX_OCCUPANCY = 4  # skip split when baseline grid fills >=1/4 of SMs
 # controls are fixed for the process lifetime.
 _FORCE_KV_SPLITS = os.getenv("VLLM_SPARSE_MLA_FORCE_KV_SPLITS")
 _REUSE_K_AS_V = _env_flag("VLLM_SPARSE_MLA_REUSE_K_AS_V")
+_DUAL_SOURCE_REUSE_K_AS_V = _env_flag("VLLM_OSCAR_MTP_DUAL_SOURCE_REUSE_K_AS_V")
 _FULL_BLOCK_H_ENABLED = _env_flag("VLLM_SPARSE_MLA_FULL_BLOCK_H")
 _FULL_BLOCK_H_MAX_TOKENS = _env_int("VLLM_SPARSE_MLA_FULL_BLOCK_H_MAX_TOKENS", 0)
 _ASSUME_VALID_NOMASK_ENABLED = _env_flag("VLLM_SPARSE_MLA_ASSUME_VALID_NOMASK")
@@ -118,6 +125,14 @@ _FINAL_DYNAMIC_CONFIG_ENABLED = _env_flag("VLLM_SPARSE_MLA_FINAL_DYNAMIC_CONFIG"
 _FINAL_STATIC_BY_TOKENS_ENABLED = _env_flag(
     "VLLM_SPARSE_MLA_FINAL_STATIC_BY_TOKENS"
 )
+
+
+def _use_static_final_kernel(q_nope: torch.Tensor) -> bool:
+    if _FINAL_STATIC_BY_TOKENS_ENABLED:
+        return True
+    return q_nope.is_cuda and torch.cuda.is_current_stream_capturing()
+
+
 _DECODE_M1_DV_TILE_FINAL_ENABLED = _env_flag(
     "VLLM_SPARSE_MLA_DECODE_M1_DV_TILE_FINAL"
 )
@@ -716,6 +731,176 @@ def _sparse_mla_compute_tile(
                     v = tl.load(k_buffer + offs_v)
             else:
                 v = tl.load(k_buffer + offs_v, mask=mask_kv[:, None], other=0.0)
+
+        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+        re_scale = tl.exp2(e_max - n_e_max)
+        p = tl.exp2(qk - n_e_max[:, None])
+        acc *= re_scale[:, None]
+        acc += tl.dot(p.to(v.dtype), v)
+        e_sum = e_sum * re_scale + tl.sum(p, 1)
+        e_max = n_e_max
+
+    return acc, e_max, e_sum
+
+
+@triton.jit
+def _sparse_mla_compute_tile_dual_source(
+    q_nope_buffer,
+    q_pe_buffer,
+    cache_buffer,
+    miss_buffer,
+    rope_buffer,
+    rope_block_table_ptr,
+    source_positions_ptr,
+    source_indices_ptr,
+    cur_q,
+    cur_head,
+    cur_kv_head_id,
+    mask_h,
+    split_start,
+    split_end,
+    stride_q_nope_token,
+    stride_q_nope_head,
+    stride_q_pe_token,
+    stride_q_pe_head,
+    stride_cache_token,
+    stride_miss_token,
+    stride_rope_block,
+    stride_rope_token,
+    stride_rope_table_page,
+    stride_source_positions_token,
+    stride_source_positions_head,
+    stride_source_indices_token,
+    stride_source_indices_head,
+    sm_scale,
+    CACHE_CAPACITY: tl.constexpr,
+    MISS_ROWS: tl.constexpr,
+    ROPE_BLOCK_SIZE: tl.constexpr,
+    MAX_ROPE_BLOCKS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DPE: tl.constexpr,
+    REUSE_K_AS_V: tl.constexpr,
+    FULL_BLOCK_H: tl.constexpr,
+):
+    """Sparse MLA tile over a persistent D512 cache and compact miss tail."""
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_dpe = tl.arange(0, BLOCK_DPE)
+    offs_dv = tl.arange(0, BLOCK_DV)
+
+    if FULL_BLOCK_H:
+        q = tl.load(
+            q_nope_buffer
+            + cur_q * stride_q_nope_token
+            + cur_head[:, None] * stride_q_nope_head
+            + offs_d[None, :],
+        )
+        qpe = tl.load(
+            q_pe_buffer
+            + cur_q * stride_q_pe_token
+            + cur_head[:, None] * stride_q_pe_head
+            + offs_dpe[None, :],
+        )
+    else:
+        q = tl.load(
+            q_nope_buffer
+            + cur_q * stride_q_nope_token
+            + cur_head[:, None] * stride_q_nope_head
+            + offs_d[None, :],
+            mask=mask_h[:, None],
+            other=0.0,
+        )
+        qpe = tl.load(
+            q_pe_buffer
+            + cur_q * stride_q_pe_token
+            + cur_head[:, None] * stride_q_pe_head
+            + offs_dpe[None, :],
+            mask=mask_h[:, None],
+            other=0.0,
+        )
+
+    neg_large = -1.0e30
+    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) + neg_large
+    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
+
+    for start_indice in range(split_start, split_end, BLOCK_N):
+        offs_indice = start_indice + tl.arange(0, BLOCK_N)
+        mask_indice = offs_indice < split_end
+        source_indices = tl.load(
+            source_indices_ptr
+            + cur_q * stride_source_indices_token
+            + cur_kv_head_id * stride_source_indices_head
+            + offs_indice,
+            mask=mask_indice,
+            other=-1,
+        )
+        source_positions = tl.load(
+            source_positions_ptr
+            + cur_q * stride_source_positions_token
+            + cur_kv_head_id * stride_source_positions_head
+            + offs_indice,
+            mask=mask_indice,
+            other=-1,
+        )
+        is_cache = (
+            mask_indice & (source_indices >= 0) & (source_indices < CACHE_CAPACITY)
+        )
+        miss_indices = source_indices - CACHE_CAPACITY
+        is_miss = mask_indice & (miss_indices >= 0) & (miss_indices < MISS_ROWS)
+        logical_rope_blocks = source_positions // ROPE_BLOCK_SIZE
+        rope_offsets = source_positions % ROPE_BLOCK_SIZE
+        valid_rope = (
+            (source_positions >= 0)
+            & (logical_rope_blocks >= 0)
+            & (logical_rope_blocks < MAX_ROPE_BLOCKS)
+        )
+        physical_rope_blocks = tl.load(
+            rope_block_table_ptr + logical_rope_blocks * stride_rope_table_page,
+            mask=valid_rope,
+            other=-1,
+        )
+        mask_kv = (is_cache | is_miss) & valid_rope & (physical_rope_blocks >= 0)
+
+        cache_indices = tl.where(is_cache, source_indices, 0)
+        safe_miss_indices = tl.where(is_miss, miss_indices, 0)
+        source_row_ptrs = tl.where(
+            is_cache,
+            cache_buffer + cache_indices * stride_cache_token,
+            miss_buffer + safe_miss_indices * stride_miss_token,
+        )
+        k = tl.load(
+            source_row_ptrs[None, :] + offs_d[:, None],
+            mask=mask_kv[None, :],
+            other=0.0,
+        )
+        qk = tl.dot(q, k.to(q.dtype))
+
+        kpe = tl.load(
+            rope_buffer
+            + physical_rope_blocks[None, :] * stride_rope_block
+            + rope_offsets[None, :] * stride_rope_token
+            + offs_dpe[:, None],
+            mask=mask_kv[None, :],
+            other=0.0,
+        )
+        qk += tl.dot(qpe, kpe.to(q.dtype))
+        qk *= sm_scale
+        if FULL_BLOCK_H:
+            qk = tl.where(mask_kv[None, :], qk, neg_large)
+        else:
+            qk = tl.where(mask_h[:, None] & mask_kv[None, :], qk, neg_large)
+
+        if REUSE_K_AS_V:
+            v = tl.trans(k)
+        else:
+            v = tl.load(
+                source_row_ptrs[:, None] + offs_dv[None, :],
+                mask=mask_kv[:, None],
+                other=0.0,
+            )
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
         re_scale = tl.exp2(e_max - n_e_max)
@@ -1485,6 +1670,135 @@ def _sparse_mla_kernel_split(
 
 
 @triton.jit
+def _sparse_mla_kernel_split_dual_source(
+    q_nope_buffer,
+    q_pe_buffer,
+    cache_buffer,
+    miss_buffer,
+    rope_buffer,
+    rope_block_table_ptr,
+    source_positions_ptr,
+    source_indices_ptr,
+    mid_out_ptr,
+    h_q,
+    stride_q_nope_token,
+    stride_q_nope_head,
+    stride_q_pe_token,
+    stride_q_pe_head,
+    stride_cache_token,
+    stride_miss_token,
+    stride_rope_block,
+    stride_rope_token,
+    stride_rope_table_page,
+    stride_source_positions_token,
+    stride_source_positions_head,
+    stride_source_indices_token,
+    stride_source_indices_head,
+    stride_mid_token,
+    stride_mid_head,
+    stride_mid_split,
+    sm_scale,
+    index_topk: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
+    kv_group_num: tl.constexpr,
+    CACHE_CAPACITY: tl.constexpr,
+    MISS_ROWS: tl.constexpr,
+    ROPE_BLOCK_SIZE: tl.constexpr,
+    MAX_ROPE_BLOCKS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DPE: tl.constexpr,
+    LOGE2: tl.constexpr,
+    REUSE_K_AS_V: tl.constexpr,
+    FULL_BLOCK_H: tl.constexpr,
+):
+    """Split-KV stage 1 for OSCAR's D512 cache plus compact miss tail."""
+    cur_q = tl.program_id(0)
+    cur_head_id = tl.program_id(1)
+    split_kv_id = tl.program_id(2)
+    cur_kv_head_id = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
+
+    valid_block_h: tl.constexpr = BLOCK_H if kv_group_num > BLOCK_H else kv_group_num
+    cur_head = cur_head_id * valid_block_h + tl.arange(0, BLOCK_H)
+    mask_h = (cur_head < (cur_head_id + 1) * valid_block_h) & (cur_head < h_q)
+    split_topk: tl.constexpr = tl.cdiv(index_topk, NUM_KV_SPLITS)
+    split_start = split_kv_id * split_topk
+    split_end = tl.minimum(split_start + split_topk, index_topk)
+
+    acc, e_max, e_sum = _sparse_mla_compute_tile_dual_source(
+        q_nope_buffer,
+        q_pe_buffer,
+        cache_buffer,
+        miss_buffer,
+        rope_buffer,
+        rope_block_table_ptr,
+        source_positions_ptr,
+        source_indices_ptr,
+        cur_q,
+        cur_head,
+        cur_kv_head_id,
+        mask_h,
+        split_start,
+        split_end,
+        stride_q_nope_token,
+        stride_q_nope_head,
+        stride_q_pe_token,
+        stride_q_pe_head,
+        stride_cache_token,
+        stride_miss_token,
+        stride_rope_block,
+        stride_rope_token,
+        stride_rope_table_page,
+        stride_source_positions_token,
+        stride_source_positions_head,
+        stride_source_indices_token,
+        stride_source_indices_head,
+        sm_scale,
+        CACHE_CAPACITY,
+        MISS_ROWS,
+        ROPE_BLOCK_SIZE,
+        MAX_ROPE_BLOCKS,
+        BLOCK_H,
+        BLOCK_N,
+        BLOCK_DV,
+        BLOCK_DMODEL,
+        BLOCK_DPE,
+        REUSE_K_AS_V,
+        FULL_BLOCK_H,
+    )
+
+    e_sum_safe = tl.where(e_sum > 0, e_sum, 1.0)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    mid_base_2d = (
+        mid_out_ptr
+        + cur_q * stride_mid_token
+        + cur_head[:, None] * stride_mid_head
+        + split_kv_id * stride_mid_split
+    )
+    if FULL_BLOCK_H:
+        tl.store(mid_base_2d + offs_dv[None, :], acc / e_sum_safe[:, None])
+    else:
+        tl.store(
+            mid_base_2d + offs_dv[None, :],
+            acc / e_sum_safe[:, None],
+            mask=mask_h[:, None],
+        )
+    mid_lse_ptr = (
+        mid_out_ptr
+        + cur_q * stride_mid_token
+        + cur_head * stride_mid_head
+        + split_kv_id * stride_mid_split
+        + BLOCK_DV
+    )
+    if FULL_BLOCK_H:
+        tl.store(mid_lse_ptr, (e_max + tl.log2(e_sum)) * LOGE2)
+    else:
+        tl.store(mid_lse_ptr, (e_max + tl.log2(e_sum)) * LOGE2, mask=mask_h)
+
+
+@triton.jit
 def _sparse_mla_merge_kernel(
     mid_out_ptr,
     out_ptr,
@@ -1588,6 +1902,173 @@ def _choose_num_kv_splits(
     return max(1, num_kv_splits)
 
 
+def triton_sparse_mla_attention_dual_source(
+    q: tuple[torch.Tensor, torch.Tensor],
+    cache_values: torch.Tensor,
+    miss_values: torch.Tensor,
+    rope: torch.Tensor,
+    rope_block_table: torch.Tensor,
+    source_positions: torch.Tensor,
+    source_indices: torch.Tensor,
+    sm_scale: float,
+    num_kv_splits: int = 16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """OSCAR MTP split-KV attention over D512 cache and miss sources."""
+    q_nope, q_pe = q
+    num_tokens, num_heads_q, dim_q_nope = q_nope.shape
+    if dim_q_nope != _BLOCK_DMODEL or q_pe.shape != (
+        num_tokens,
+        num_heads_q,
+        _BLOCK_DPE,
+    ):
+        raise ValueError("OSCAR dual-source query geometry mismatch")
+    if (
+        cache_values.ndim != 2
+        or cache_values.shape[1] != _BLOCK_DMODEL
+        or cache_values.dtype != torch.bfloat16
+        or cache_values.stride(1) != 1
+    ):
+        raise ValueError("OSCAR dual-source cache must be BF16 [capacity, 512]")
+    if (
+        miss_values.ndim != 2
+        or miss_values.shape[1] != _BLOCK_DMODEL
+        or miss_values.dtype != torch.bfloat16
+        or miss_values.stride(1) != 1
+    ):
+        raise ValueError("OSCAR dual-source misses must be BF16 [rows, 512]")
+    if (
+        rope.ndim != 3
+        or rope.shape[2] != _BLOCK_DPE
+        or rope.dtype != torch.bfloat16
+        or rope.stride(2) != 1
+    ):
+        raise ValueError("OSCAR dual-source RoPE cache geometry mismatch")
+    if rope_block_table.ndim != 2 or rope_block_table.dtype != torch.int32:
+        raise ValueError("OSCAR dual-source RoPE block table must be 2D int32")
+    if source_positions.shape != source_indices.shape or source_positions.shape[:2] != (
+        num_tokens,
+        1,
+    ):
+        raise ValueError("OSCAR dual-source position/index shape mismatch")
+    if (
+        source_positions.dtype != torch.int32
+        or source_indices.dtype != torch.int32
+        or source_positions.stride(2) != 1
+        or source_indices.stride(2) != 1
+    ):
+        raise ValueError("OSCAR dual-source positions and indices must be int32")
+    index_topk = source_indices.shape[2]
+    if num_kv_splits <= 1 or index_topk % num_kv_splits != 0:
+        raise ValueError("OSCAR dual-source top-k must divide into multiple KV splits")
+    if index_topk % 32 != 0:
+        raise ValueError("OSCAR dual-source top-k must be divisible by BLOCK_N=32")
+    tensors = (
+        q_nope,
+        q_pe,
+        cache_values,
+        miss_values,
+        rope,
+        rope_block_table,
+        source_positions,
+        source_indices,
+    )
+    if any(tensor.device != q_nope.device for tensor in tensors):
+        raise ValueError("OSCAR dual-source tensors must share one device")
+
+    kv_group_num = num_heads_q
+    num_head_groups = triton.cdiv(num_heads_q, min(_DUAL_SOURCE_BLOCK_H, kv_group_num))
+    full_block_h = (
+        _FULL_BLOCK_H_ENABLED
+        and num_heads_q % _DUAL_SOURCE_BLOCK_H == 0
+        and kv_group_num >= _DUAL_SOURCE_BLOCK_H
+    )
+    full_block_h_max_tokens = _FULL_BLOCK_H_MAX_TOKENS
+    if full_block_h and full_block_h_max_tokens > 0:
+        full_block_h = num_tokens <= full_block_h_max_tokens
+
+    out = torch.empty(
+        (num_tokens, num_heads_q, _BLOCK_DV),
+        dtype=torch.bfloat16,
+        device=q_nope.device,
+    )
+    lse = torch.empty(
+        (num_tokens, num_heads_q),
+        dtype=torch.float32,
+        device=q_nope.device,
+    )
+    mid_out = torch.empty(
+        (num_tokens, num_heads_q, num_kv_splits, _BLOCK_DV + 1),
+        dtype=torch.float32,
+        device=q_nope.device,
+    )
+    _sparse_mla_kernel_split_dual_source[(num_tokens, num_head_groups, num_kv_splits)](
+        q_nope_buffer=q_nope,
+        q_pe_buffer=q_pe,
+        cache_buffer=cache_values,
+        miss_buffer=miss_values,
+        rope_buffer=rope,
+        rope_block_table_ptr=rope_block_table,
+        source_positions_ptr=source_positions,
+        source_indices_ptr=source_indices,
+        mid_out_ptr=mid_out,
+        h_q=num_heads_q,
+        stride_q_nope_token=q_nope.stride(0),
+        stride_q_nope_head=q_nope.stride(1),
+        stride_q_pe_token=q_pe.stride(0),
+        stride_q_pe_head=q_pe.stride(1),
+        stride_cache_token=cache_values.stride(0),
+        stride_miss_token=miss_values.stride(0),
+        stride_rope_block=rope.stride(0),
+        stride_rope_token=rope.stride(1),
+        stride_rope_table_page=rope_block_table.stride(1),
+        stride_source_positions_token=source_positions.stride(0),
+        stride_source_positions_head=source_positions.stride(1),
+        stride_source_indices_token=source_indices.stride(0),
+        stride_source_indices_head=source_indices.stride(1),
+        stride_mid_token=mid_out.stride(0),
+        stride_mid_head=mid_out.stride(1),
+        stride_mid_split=mid_out.stride(2),
+        sm_scale=sm_scale * LOG2E,
+        index_topk=index_topk,
+        NUM_KV_SPLITS=num_kv_splits,
+        kv_group_num=kv_group_num,
+        CACHE_CAPACITY=cache_values.shape[0],
+        MISS_ROWS=miss_values.shape[0],
+        ROPE_BLOCK_SIZE=rope.shape[1],
+        MAX_ROPE_BLOCKS=rope_block_table.shape[1],
+        BLOCK_H=_DUAL_SOURCE_BLOCK_H,
+        BLOCK_N=32,
+        BLOCK_DV=_BLOCK_DV,
+        BLOCK_DMODEL=_BLOCK_DMODEL,
+        BLOCK_DPE=_BLOCK_DPE,
+        LOGE2=LOGE2,
+        REUSE_K_AS_V=_DUAL_SOURCE_REUSE_K_AS_V,
+        FULL_BLOCK_H=full_block_h,
+        num_warps=_DUAL_SOURCE_NUM_WARPS,
+        num_stages=2,
+    )
+    _sparse_mla_merge_kernel[(num_tokens, num_heads_q, _NUM_MERGE_DV_TILES)](
+        mid_out_ptr=mid_out,
+        out_ptr=out,
+        lse_ptr=lse,
+        h_q=num_heads_q,
+        stride_mid_token=mid_out.stride(0),
+        stride_mid_head=mid_out.stride(1),
+        stride_mid_split=mid_out.stride(2),
+        stride_out_token=out.stride(0),
+        stride_out_head=out.stride(1),
+        stride_lse_token=lse.stride(0),
+        NUM_KV_SPLITS=num_kv_splits,
+        kv_group_num=kv_group_num,
+        BLOCK_H=_MERGE_BLOCK_H,
+        BLOCK_DV=_BLOCK_DV,
+        BLOCK_DV_TILE=_MERGE_BLOCK_DV_TILE,
+        RETURN_LSE=True,
+        num_warps=2,
+    )
+    return out, lse
+
+
 def triton_sparse_mla_attention(
     q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     kv: torch.Tensor,
@@ -1602,6 +2083,7 @@ def triton_sparse_mla_attention(
     req_id: torch.Tensor | None = None,
     block_table: torch.Tensor | None = None,
     block_size: int = 64,
+    lse_out: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Sparse MLA attention over topk indices.
 
@@ -1618,6 +2100,8 @@ def triton_sparse_mla_attention(
         sm_count:  device SM count, used by the split heuristic. If None,
             queried from the device — pass a cached value to avoid a dict
             lookup on every decode step.
+        lse_out: optional reusable contiguous FP32 `[num_tokens, num_heads_q]`
+            buffer. Only valid when `return_lse=True`.
 
     Returns:
         out:   [num_tokens, num_heads_q, _BLOCK_DV] bf16
@@ -1677,11 +2161,26 @@ def triton_sparse_mla_attention(
         full_block_h = num_tokens <= full_block_h_max_tokens
     lse = None
     if return_lse:
-        lse = torch.empty(
-            (num_tokens, num_heads_q),
-            dtype=torch.float32,
-            device=q_nope.device,
-        )
+        if lse_out is None:
+            lse = torch.empty(
+                (num_tokens, num_heads_q),
+                dtype=torch.float32,
+                device=q_nope.device,
+            )
+        else:
+            if (
+                lse_out.shape != (num_tokens, num_heads_q)
+                or lse_out.dtype != torch.float32
+                or lse_out.device != q_nope.device
+                or not lse_out.is_contiguous()
+            ):
+                raise RuntimeError(
+                    "sparse MLA lse_out must be contiguous FP32 "
+                    f"{(num_tokens, num_heads_q)} on {q_nope.device}"
+                )
+            lse = lse_out
+    elif lse_out is not None:
+        raise RuntimeError("sparse MLA lse_out requires return_lse=True")
     lse_ptr = lse if lse is not None else out
     assume_valid_nomask_enabled = _ASSUME_VALID_NOMASK_ENABLED
     assume_valid_nomask = assume_valid_nomask_enabled and assume_valid_indices
@@ -1958,7 +2457,7 @@ def triton_sparse_mla_attention(
                 num_stages=num_stages,
             )
             return (out, lse) if return_lse else out
-        if _FINAL_STATIC_BY_TOKENS_ENABLED:
+        if _use_static_final_kernel(q_nope):
             if num_tokens >= 4096:
                 block_n, num_warps, num_stages = 16, 4, 4
             else:

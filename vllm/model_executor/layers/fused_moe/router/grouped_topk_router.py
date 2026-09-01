@@ -348,3 +348,72 @@ class GroupedTopKRouter(BaseRouter):
         )
 
         return topk_weights, topk_ids
+
+    def select_experts_with_aligned_metadata(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    ]:
+        """Select experts and optionally produce block-m8 Marlin metadata."""
+        indices_type = self._get_indices_type()
+        supported = (
+            envs.VLLM_USE_FUSED_MOE_GROUPED_TOPK
+            and current_platform.is_cuda()
+            and hidden_states.size(0) == 1
+            and router_logits.shape == (1, 154)
+            and router_logits.dtype == torch.bfloat16
+            and self.e_score_correction_bias is not None
+            and self.e_score_correction_bias.shape == (154,)
+            and self.e_score_correction_bias.dtype == torch.float32
+            and self.top_k == 8
+            and self.num_expert_group == 1
+            and self.topk_group == 1
+            and self.renormalize
+            and self.scoring_func == "sigmoid"
+            and self.routed_scaling_factor == 1.0
+            and not self.enable_eplb
+            and indices_type in (None, torch.int32)
+        )
+        if not supported:
+            topk_weights, topk_ids = super().select_experts(
+                hidden_states, router_logits
+            )
+            return topk_weights, topk_ids, None
+
+        self._validate_eplb_state()
+        topk_weights = torch.empty(
+            (1, 8), dtype=torch.float32, device=router_logits.device
+        )
+        topk_ids = torch.empty((1, 8), dtype=torch.int32, device=router_logits.device)
+        sorted_token_ids = torch.empty(
+            64, dtype=torch.int32, device=router_logits.device
+        )
+        expert_ids = torch.empty(8, dtype=torch.int32, device=router_logits.device)
+        num_tokens_post_padded = torch.empty(
+            1, dtype=torch.int32, device=router_logits.device
+        )
+        ops.grouped_topk_aligned_out(
+            router_logits,
+            self.e_score_correction_bias,
+            topk_weights,
+            topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+        )
+        if self.capture_fn is not None:
+            self.capture_fn(topk_ids)
+        topk_ids = self._convert_indices_dtype(topk_ids, indices_type)
+        return (
+            topk_weights,
+            topk_ids,
+            (
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+            ),
+        )

@@ -37,7 +37,7 @@ def _env_int(name: str, default: str) -> int:
 _DECODE_EMPTY_LOGITS = _env_flag("VLLM_SPARSE_INDEXER_DECODE_EMPTY_LOGITS")
 _DECODE_LOGITS_BLOCK_PAGES = _env_int(
     "VLLM_SPARSE_INDEXER_DECODE_LOGITS_BLOCK_PAGES",
-    "1",
+    "2",
 )
 _DECODE_LOGITS_BLOCK_PAGES_WARPS = _env_int(
     "VLLM_SPARSE_INDEXER_DECODE_LOGITS_BLOCK_PAGES_WARPS",
@@ -209,9 +209,7 @@ def _fp8_paged_mqa_logits_kernel(
         if TOPK_TILE_SELECT:
             group_id = block_rk
             for candidate_id in range(0, TOPK_TILE_SELECT_CANDIDATES):
-                candidate_col = (
-                    group_id * TOPK_TILE_SELECT_CANDIDATES + candidate_id
-                )
+                candidate_col = group_id * TOPK_TILE_SELECT_CANDIDATES + candidate_id
                 tl.store(
                     topk_tile_logits_ptr
                     + token_id * stride_tile_logits_t
@@ -248,18 +246,14 @@ def _fp8_paged_mqa_logits_kernel(
     if Q_BF16:
         q_base = q_ptr + token_id * stride_q_n
         q = tl.load(
-            q_base
-            + offs_h[:, None] * stride_q_h
-            + offs_d[None, :] * stride_q_d,
+            q_base + offs_h[:, None] * stride_q_h + offs_d[None, :] * stride_q_d,
             mask=mask_h[:, None] & mask_d[None, :],
             other=0.0,
         ).to(tl.bfloat16)
     else:
         q_base = q_ptr + batch_id * stride_q_b + next_n_id * stride_q_n
         q_byte = tl.load(
-            q_base
-            + offs_h[:, None] * stride_q_h
-            + offs_d[None, :] * stride_q_d,
+            q_base + offs_h[:, None] * stride_q_h + offs_d[None, :] * stride_q_d,
             mask=mask_h[:, None] & mask_d[None, :],
             other=0,
         )
@@ -434,9 +428,7 @@ def _fp8_paged_mqa_logits_multi_block_kernel(
         if TOPK_TILE_SELECT:
             group_id = tl.program_id(1)
             for candidate_id in range(0, TOPK_TILE_SELECT_CANDIDATES):
-                candidate_col = (
-                    group_id * TOPK_TILE_SELECT_CANDIDATES + candidate_id
-                )
+                candidate_col = group_id * TOPK_TILE_SELECT_CANDIDATES + candidate_id
                 tl.store(
                     topk_tile_logits_ptr
                     + token_id * stride_tile_logits_t
@@ -481,18 +473,14 @@ def _fp8_paged_mqa_logits_multi_block_kernel(
     if Q_BF16:
         q_base = q_ptr + token_id * stride_q_n
         q = tl.load(
-            q_base
-            + offs_h[:, None] * stride_q_h
-            + offs_d[None, :] * stride_q_d,
+            q_base + offs_h[:, None] * stride_q_h + offs_d[None, :] * stride_q_d,
             mask=mask_h[:, None] & mask_d[None, :],
             other=0.0,
         ).to(tl.bfloat16)
     else:
         q_base = q_ptr + batch_id * stride_q_b + next_n_id * stride_q_n
         q_byte = tl.load(
-            q_base
-            + offs_h[:, None] * stride_q_h
-            + offs_d[None, :] * stride_q_d,
+            q_base + offs_h[:, None] * stride_q_h + offs_d[None, :] * stride_q_d,
             mask=mask_h[:, None] & mask_d[None, :],
             other=0,
         )
@@ -510,9 +498,7 @@ def _fp8_paged_mqa_logits_multi_block_kernel(
         other=0,
     )
     k_scale = tl.load(
-        kv_scale_ptr
-        + block_idx * stride_kvs_block
-        + page_offset * stride_kvs_s,
+        kv_scale_ptr + block_idx * stride_kvs_block + page_offset * stride_kvs_s,
         mask=mask_n & mask_block,
         other=0.0,
     )
@@ -533,12 +519,7 @@ def _fp8_paged_mqa_logits_multi_block_kernel(
     out = tl.sum(s, axis=0)
 
     k_offset = block_group * block_size + offs_n
-    valid = (
-        mask_n
-        & mask_block
-        & (k_offset < context_len)
-        & (k_offset <= q_offset)
-    )
+    valid = mask_n & mask_block & (k_offset < context_len) & (k_offset <= q_offset)
     out = tl.where(valid, out, float("-inf"))
 
     if TOPK_HIST_FUSION or TOPK_BIN_FUSION:
@@ -1208,7 +1189,6 @@ def _mqa_bf16_fused_logits_kernel(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_D)
-    mask_m = offs_m < M
     mask_m_actual = offs_m < actual_m
     mask_n = offs_n < N
     mask_n_actual = offs_n < actual_n
@@ -1221,11 +1201,7 @@ def _mqa_bf16_fused_logits_kernel(
 
     if FAST_INVALID_TILE and ROW_START_ZERO and ROW_END_CONTIGUOUS:
         block_n_start = pid_n * BLOCK_N
-        max_row_end = (
-            row_end_base
-            + tl.minimum((pid_m + 1) * BLOCK_M, actual_m)
-            - 1
-        )
+        max_row_end = row_end_base + tl.minimum((pid_m + 1) * BLOCK_M, actual_m) - 1
         if block_n_start >= max_row_end:
             if not SKIP_INVALID_STORE:
                 tl.store(
@@ -1244,10 +1220,7 @@ def _mqa_bf16_fused_logits_kernel(
         )
     for h in tl.static_range(0, H):
         q = tl.load(
-            q_ptr
-            + h * stride_q_h
-            + offs_m[:, None] * stride_q_m
-            + offs_d[None, :],
+            q_ptr + h * stride_q_h + offs_m[:, None] * stride_q_m + offs_d[None, :],
             mask=mask_m_actual[:, None] & mask_d[None, :],
             other=0.0,
         )
@@ -1283,8 +1256,10 @@ def _mqa_bf16_fused_logits_kernel(
     else:
         row_end = tl.load(ke_ptr + offs_m, mask=mask_m_actual, other=0)
     if ROW_START_ZERO:
-        valid = mask_m_actual[:, None] & mask_n_actual[None, :] & (
-            offs_n[None, :] < row_end[:, None]
+        valid = (
+            mask_m_actual[:, None]
+            & mask_n_actual[None, :]
+            & (offs_n[None, :] < row_end[:, None])
         )
     else:
         row_start = tl.load(ks_ptr + offs_m, mask=mask_m_actual, other=0)
@@ -1322,7 +1297,7 @@ def fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton(
     """Exact fused Triton logits path for pre-dequantized BF16 Q and K."""
     actual_M = q_bf16.shape[1] if actual_m is None else actual_m
     M = actual_M if canonical_m is None else canonical_m
-    if M < actual_M:
+    if actual_M > M:
         raise RuntimeError(f"canonical_m={M} is smaller than actual_m={actual_M}")
     if actual_M > q_bf16.shape[1]:
         raise RuntimeError(
@@ -1330,9 +1305,9 @@ def fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton(
         )
     actual_N = k_bf16.shape[0] if actual_n is None else actual_n
     N = actual_N if canonical_n is None else canonical_n
-    if N < actual_N:
+    if actual_N > N:
         raise RuntimeError(f"canonical_n={N} is smaller than actual_n={actual_N}")
-    if N > k_bf16.shape[0]:
+    if k_bf16.shape[0] < N:
         raise RuntimeError(
             f"canonical_n={N} exceeds available K rows={k_bf16.shape[0]}"
         )
@@ -1354,12 +1329,8 @@ def fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton(
             "fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton requires CUDA bf16 q/k"
         )
 
-    block_m = block_m or int(
-        os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_BLOCK_M", "16")
-    )
-    block_n = block_n or int(
-        os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_BLOCK_N", "128")
-    )
+    block_m = block_m or int(os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_BLOCK_M", "16"))
+    block_n = block_n or int(os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_BLOCK_N", "128"))
     fast_full_tile = (
         os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_FAST_FULL_TILE", "0") == "1"
     )
@@ -1369,50 +1340,30 @@ def fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton(
     skip_invalid_store = (
         os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_SKIP_INVALID_STORE", "0") == "1"
     )
-    reuse_k_tile = (
-        os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_REUSE_K_TILE", "0") == "1"
-    )
-    num_warps = int(
-        os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_NUM_WARPS", "4")
-    )
-    num_stages = int(
-        os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_NUM_STAGES", "3")
-    )
+    reuse_k_tile = os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_REUSE_K_TILE", "0") == "1"
+    num_warps = int(os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_NUM_WARPS", "4"))
+    num_stages = int(os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_NUM_STAGES", "3"))
     decode_m_max_env = os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_DECODE_M_MAX")
     decode_m_max = int(decode_m_max_env) if decode_m_max_env else 0
-    if decode_m_max > 0 and M <= decode_m_max:
-        decode_block_m = os.getenv(
-            "VLLM_MQA_CUDA_V7_FUSED_TRITON_DECODE_BLOCK_M"
-        )
+    if decode_m_max > 0 and decode_m_max >= M:
+        decode_block_m = os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_DECODE_BLOCK_M")
         if decode_block_m:
             block_m = int(decode_block_m)
-        decode_block_n = os.getenv(
-            "VLLM_MQA_CUDA_V7_FUSED_TRITON_DECODE_BLOCK_N"
-        )
+        decode_block_n = os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_DECODE_BLOCK_N")
         if decode_block_n:
             block_n = int(decode_block_n)
-        decode_num_stages = os.getenv(
-            "VLLM_MQA_CUDA_V7_FUSED_TRITON_DECODE_NUM_STAGES"
-        )
+        decode_num_stages = os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_DECODE_NUM_STAGES")
         if decode_num_stages:
             num_stages = int(decode_num_stages)
-        decode_num_warps = os.getenv(
-            "VLLM_MQA_CUDA_V7_FUSED_TRITON_DECODE_NUM_WARPS"
-        )
+        decode_num_warps = os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_DECODE_NUM_WARPS")
         if decode_num_warps:
             num_warps = int(decode_num_warps)
-    small_n_max = int(
-        os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_SMALL_N_MAX", "0")
-    )
-    if small_n_max > 0 and N <= small_n_max:
-        small_block_m = os.getenv(
-            "VLLM_MQA_CUDA_V7_FUSED_TRITON_SMALL_N_BLOCK_M"
-        )
+    small_n_max = int(os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_SMALL_N_MAX", "0"))
+    if small_n_max > 0 and small_n_max >= N:
+        small_block_m = os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_SMALL_N_BLOCK_M")
         if small_block_m is not None:
             block_m = int(small_block_m)
-        small_block_n = os.getenv(
-            "VLLM_MQA_CUDA_V7_FUSED_TRITON_SMALL_N_BLOCK_N"
-        )
+        small_block_n = os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_SMALL_N_BLOCK_N")
         if small_block_n is not None:
             block_n = int(small_block_n)
         small_skip_invalid_store = os.getenv(
@@ -1425,14 +1376,10 @@ def fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton(
         )
         if small_fast_full_tile is not None:
             fast_full_tile = small_fast_full_tile == "1"
-        small_num_stages = os.getenv(
-            "VLLM_MQA_CUDA_V7_FUSED_TRITON_SMALL_N_NUM_STAGES"
-        )
+        small_num_stages = os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_SMALL_N_NUM_STAGES")
         if small_num_stages is not None:
             num_stages = int(small_num_stages)
-        small_num_warps = os.getenv(
-            "VLLM_MQA_CUDA_V7_FUSED_TRITON_SMALL_N_NUM_WARPS"
-        )
+        small_num_warps = os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_SMALL_N_NUM_WARPS")
         if small_num_warps is not None:
             num_warps = int(small_num_warps)
     H, _, D = q_bf16.shape
@@ -1494,8 +1441,7 @@ def fp8_mqa_logits_cuda_v7_fused_triton(
             raise RuntimeError("q is not a CUDA tensor")
         if q.dtype != torch.float8_e4m3fn or k_bf16.dtype != torch.bfloat16:
             raise RuntimeError(
-                "fp8_mqa_logits_cuda_v7_fused_triton requires CUDA fp8 q and "
-                "bf16 k"
+                "fp8_mqa_logits_cuda_v7_fused_triton requires CUDA fp8 q and bf16 k"
             )
         M, H, D = q.shape
         if q_bf16_out is None:
@@ -1558,9 +1504,7 @@ def fp8_mqa_logits_cuda_v7_bf16_k(
     actual_N = k_bf16.shape[0] if actual_n is None else actual_n
     N = actual_N
     pad_n = (
-        os.getenv("VLLM_MQA_CUDA_V7_PAD_N", "0") == "1"
-        and N >= 32768
-        and N % 128 != 0
+        os.getenv("VLLM_MQA_CUDA_V7_PAD_N", "0") == "1" and N >= 32768 and N % 128 != 0
     )
     if pad_n:
         padded_N = ((N + 127) // 128) * 128
@@ -1626,9 +1570,7 @@ def fp8_mqa_logits_cuda_v7_bf16_qk(
     actual_N = k_bf16.shape[0] if actual_n is None else actual_n
     N = actual_N
     pad_n = (
-        os.getenv("VLLM_MQA_CUDA_V7_PAD_N", "0") == "1"
-        and N >= 32768
-        and N % 128 != 0
+        os.getenv("VLLM_MQA_CUDA_V7_PAD_N", "0") == "1" and N >= 32768 and N % 128 != 0
     )
     if pad_n:
         padded_N = ((N + 127) // 128) * 128
@@ -1649,9 +1591,7 @@ def fp8_mqa_logits_cuda_v7_bf16_qk(
         if not q_bf16.is_cuda:
             raise RuntimeError("q_bf16 is not a CUDA tensor")
         if q_bf16.dtype != torch.bfloat16 or k_bf16.dtype != torch.bfloat16:
-            raise RuntimeError(
-                "fp8_mqa_logits_cuda_v7_bf16_qk requires CUDA bf16 q/k"
-            )
+            raise RuntimeError("fp8_mqa_logits_cuda_v7_bf16_qk requires CUDA bf16 q/k")
         from vllm import _custom_ops as _custom_ops  # noqa: F401
 
         torch.ops._C.fp8_mqa_logits_cuda_v7_bf16_qk(
@@ -1733,9 +1673,7 @@ def _fp8_mqa_logits_cuda_op(
     except Exception as err:
         if not fallback:
             raise
-        logger.warning_once(
-            "%s failed; falling back to Triton: %s", op_name, err
-        )
+        logger.warning_once("%s failed; falling back to Triton: %s", op_name, err)
         return fp8_mqa_logits_triton(
             q, (k_fp8, k_scales), weights, cu_seqlen_ks, cu_seqlen_ke
         )

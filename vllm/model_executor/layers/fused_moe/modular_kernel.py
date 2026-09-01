@@ -1204,6 +1204,8 @@ class FusedMoEKernelModularImpl:
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
         expert_tokens_meta: ExpertTokensMetadata | None,
+        aligned_routing_metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | None = None,
     ) -> torch.Tensor:
         _, M_full, N, K, top_k = self.fused_experts.moe_problem_size(
             a1q, w1, w2, topk_ids
@@ -1232,23 +1234,34 @@ class FusedMoEKernelModularImpl:
             activation,
         )
 
-        self.fused_experts.apply(
-            output=fused_out,
-            hidden_states=a1q,
-            w1=w1,
-            w2=w2,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            activation=activation,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
-            a1q_scale=a1q_scale,
-            a2_scale=self.fused_experts.a2_scale,
-            workspace13=workspace13,
-            workspace2=workspace2,
-            expert_tokens_meta=expert_tokens_meta,
-            apply_router_weight_on_input=apply_router_weight_on_input,
+        apply_with_metadata = getattr(
+            self.fused_experts, "apply_with_aligned_metadata", None
         )
+        apply = (
+            apply_with_metadata
+            if aligned_routing_metadata is not None and apply_with_metadata is not None
+            else self.fused_experts.apply
+        )
+        kwargs = {
+            "output": fused_out,
+            "hidden_states": a1q,
+            "w1": w1,
+            "w2": w2,
+            "topk_weights": topk_weights,
+            "topk_ids": topk_ids,
+            "activation": activation,
+            "global_num_experts": global_num_experts,
+            "expert_map": expert_map,
+            "a1q_scale": a1q_scale,
+            "a2_scale": self.fused_experts.a2_scale,
+            "workspace13": workspace13,
+            "workspace2": workspace2,
+            "expert_tokens_meta": expert_tokens_meta,
+            "apply_router_weight_on_input": apply_router_weight_on_input,
+        }
+        if apply is apply_with_metadata:
+            kwargs["aligned_routing_metadata"] = aligned_routing_metadata
+        apply(**kwargs)
 
         return fused_out
 
@@ -1330,6 +1343,8 @@ class FusedMoEKernelModularImpl:
         expert_map: torch.Tensor | None = None,
         apply_router_weight_on_input: bool = False,
         shared_experts_input: torch.Tensor | None = None,
+        aligned_routing_metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | None = None,
     ) -> torch.Tensor:
         """
         This function computes a Mixture of Experts (MoE) layer using two sets
@@ -1369,6 +1384,7 @@ class FusedMoEKernelModularImpl:
         if global_num_experts == -1:
             global_num_experts = local_num_experts
 
+        original_topk_ids = topk_ids
         a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(
             hidden_states,
             topk_weights,
@@ -1377,6 +1393,8 @@ class FusedMoEKernelModularImpl:
             expert_map,
             apply_router_weight_on_input,
         )
+        if expert_tokens_meta is not None or topk_ids is not original_topk_ids:
+            aligned_routing_metadata = None
 
         fused_out = self._fused_experts(
             in_dtype=hidden_states.dtype,
@@ -1392,6 +1410,7 @@ class FusedMoEKernelModularImpl:
             expert_map=expert_map,
             apply_router_weight_on_input=apply_router_weight_on_input,
             expert_tokens_meta=expert_tokens_meta,
+            aligned_routing_metadata=aligned_routing_metadata,
         )
 
         return self._finalize(
@@ -1595,6 +1614,8 @@ class FusedMoEKernel:
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
         shared_experts_input: torch.Tensor | None = None,
+        aligned_routing_metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | None = None,
     ) -> torch.Tensor:
         assert isinstance(self.impl, FusedMoEKernelModularImpl)
         return self.impl.apply(
@@ -1608,4 +1629,5 @@ class FusedMoEKernel:
             expert_map=expert_map,
             apply_router_weight_on_input=apply_router_weight_on_input,
             shared_experts_input=shared_experts_input,
+            aligned_routing_metadata=aligned_routing_metadata,
         )

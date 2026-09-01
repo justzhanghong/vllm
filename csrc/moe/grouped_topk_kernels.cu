@@ -677,7 +677,8 @@ __global__ void grouped_topk_fused_small_expert_count_kernel(
     int64_t const numTokens, int64_t const numGroup, int64_t const topkGroup,
     int64_t const topk, int64_t const numExperts,
     int64_t const numExpertsPerGroup, bool const renormalize,
-    double const routedScalingFactor) {
+    double const routedScalingFactor, IdxT* sortedTokenIds,
+    IdxT* alignedExpertIds, IdxT* numTokensPostPadded) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
 #endif
@@ -877,6 +878,35 @@ __global__ void grouped_topk_fused_small_expert_count_kernel(
       topkValues[laneIdx] = finalScore;
       topkIndices[laneIdx] = expertIdx;
     }
+
+    // Fixed decode contract: batch1, top-8, 154 experts, Marlin block_m=8.
+    // Null pointers preserve the existing grouped-topk behavior.
+    if (sortedTokenIds != nullptr && blockIdx.x == 0 && numTokens == 1 &&
+        topk == 8 && numExperts == 154) {
+      uint32_t packed = laneIdx < 8 ? (static_cast<uint32_t>(expertIdx) << 4) |
+                                          static_cast<uint32_t>(laneIdx)
+                                    : 0x7fffffffu;
+#pragma unroll
+      for (int width = 2; width <= 8; width <<= 1) {
+#pragma unroll
+        for (int distance = width >> 1; distance > 0; distance >>= 1) {
+          uint32_t other = __shfl_xor_sync(FULL_WARP_MASK, packed, distance);
+          bool const ascending = (laneIdx & width) == 0;
+          bool const lower_lane = (laneIdx & distance) == 0;
+          bool const take_other = (packed > other) == (ascending == lower_lane);
+          packed = take_other ? other : packed;
+        }
+      }
+      if (laneIdx < 8) {
+        alignedExpertIds[laneIdx] = static_cast<IdxT>(packed >> 4);
+#pragma unroll
+        for (int slot = 0; slot < 8; ++slot) {
+          sortedTokenIds[laneIdx * 8 + slot] =
+              static_cast<IdxT>(slot == 0 ? packed & 0xfu : 8u);
+        }
+        if (laneIdx == 0) numTokensPostPadded[0] = static_cast<IdxT>(64);
+      }
+    }
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -890,7 +920,10 @@ void invokeNoAuxTc(T* scores, float* topk_values, IdxT* topk_indices,
                    int64_t const num_experts, int64_t const n_group,
                    int64_t const topk_group, int64_t const topk,
                    bool const renormalize, double const routed_scaling_factor,
-                   bool enable_pdl = false, cudaStream_t const stream = 0) {
+                   bool enable_pdl = false, cudaStream_t const stream = 0,
+                   IdxT* sorted_token_ids = nullptr,
+                   IdxT* aligned_expert_ids = nullptr,
+                   IdxT* num_tokens_post_padded = nullptr) {
   cudaLaunchConfig_t config;
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
@@ -949,7 +982,8 @@ void invokeNoAuxTc(T* scores, float* topk_values, IdxT* topk_indices,
     cudaLaunchKernelEx(&config, kernel_instance, scores, topk_values,
                        topk_indices, bias, num_tokens, n_group, topk_group,
                        topk, num_experts, num_experts / n_group, renormalize,
-                       routed_scaling_factor);
+                       routed_scaling_factor, sorted_token_ids,
+                       aligned_expert_ids, num_tokens_post_padded);
   } else {
     auto* kernel_instance = &grouped_topk_fused_kernel<T, BiasT, IdxT, SF>;
     // One block per token; one warp per group.
@@ -978,7 +1012,8 @@ void invokeNoAuxTc(T* scores, float* topk_values, IdxT* topk_indices,
       int64_t const num_tokens, int64_t const num_experts,                   \
       int64_t const n_group, int64_t const topk_group, int64_t const topk,   \
       bool const renormalize, double const routed_scaling_factor,            \
-      bool enable_pdl, cudaStream_t const stream);
+      bool enable_pdl, cudaStream_t const stream, IdxT* sorted_token_ids,    \
+      IdxT* aligned_expert_ids, IdxT* num_tokens_post_padded);
 
 INSTANTIATE_NOAUX_TC(float, float, int32_t, SCORING_SIGMOID);
 INSTANTIATE_NOAUX_TC(float, half, int32_t, SCORING_SIGMOID);
@@ -1104,4 +1139,46 @@ std::tuple<torch::Tensor, torch::Tensor> grouped_topk(
 #undef LAUNCH_KERNEL
 #undef LAUNCH_KERNEL_SF
   return {topk_values, topk_indices};
+}
+
+void grouped_topk_aligned_out(torch::Tensor const& scores,
+                              torch::Tensor const& bias,
+                              torch::Tensor topk_values,
+                              torch::Tensor topk_indices,
+                              torch::Tensor sorted_token_ids,
+                              torch::Tensor aligned_expert_ids,
+                              torch::Tensor num_tokens_post_padded) {
+  TORCH_CHECK(scores.is_cuda() && bias.is_cuda(), "inputs must be CUDA");
+  TORCH_CHECK(scores.scalar_type() == torch::kBFloat16 &&
+                  bias.scalar_type() == torch::kFloat32,
+              "requires BF16 scores and FP32 bias");
+  TORCH_CHECK(
+      scores.sizes() == torch::IntArrayRef({1, 154}) && bias.numel() == 154,
+      "requires scores [1,154]");
+  TORCH_CHECK(topk_values.sizes() == torch::IntArrayRef({1, 8}) &&
+                  topk_values.scalar_type() == torch::kFloat32,
+              "topk_values must be FP32 [1,8]");
+  TORCH_CHECK(topk_indices.sizes() == torch::IntArrayRef({1, 8}) &&
+                  topk_indices.scalar_type() == torch::kInt32,
+              "topk_indices must be INT32 [1,8]");
+  TORCH_CHECK(sorted_token_ids.numel() == 64 &&
+                  sorted_token_ids.scalar_type() == torch::kInt32,
+              "sorted_token_ids must be INT32 [64]");
+  TORCH_CHECK(aligned_expert_ids.numel() == 8 &&
+                  aligned_expert_ids.scalar_type() == torch::kInt32,
+              "aligned_expert_ids must be INT32 [8]");
+  TORCH_CHECK(num_tokens_post_padded.numel() == 1 &&
+                  num_tokens_post_padded.scalar_type() == torch::kInt32,
+              "num_tokens_post_padded must be INT32 [1]");
+  auto stream = c10::cuda::getCurrentCUDAStream(scores.get_device());
+  vllm::moe::invokeNoAuxTc<__nv_bfloat16, float, int32_t,
+                           vllm::moe::SCORING_SIGMOID>(
+      reinterpret_cast<__nv_bfloat16*>(scores.mutable_data_ptr()),
+      reinterpret_cast<float*>(topk_values.mutable_data_ptr()),
+      reinterpret_cast<int32_t*>(topk_indices.mutable_data_ptr()),
+      reinterpret_cast<float const*>(bias.data_ptr()), 1, 154, 1, 1, 8, true,
+      1.0, false, stream,
+      reinterpret_cast<int32_t*>(sorted_token_ids.mutable_data_ptr()),
+      reinterpret_cast<int32_t*>(aligned_expert_ids.mutable_data_ptr()),
+      reinterpret_cast<int32_t*>(num_tokens_post_padded.mutable_data_ptr()));
 }

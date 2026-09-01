@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from vllm.platforms.interface import DeviceCapability
     from vllm.v1.attention.backends.utils import KVCacheLayoutType
     from vllm.v1.kv_cache_interface import AttentionSpec, KVQuantMode
+    from vllm.v1.worker.oscar_mla_cache import OscarMLABatchMetadata
 
 from vllm.v1.kv_cache_interface import get_kv_quant_mode
 
@@ -377,6 +378,7 @@ class CommonAttentionMetadata:
 
     block_table_tensor: torch.Tensor
     slot_mapping: torch.Tensor
+    oscar_mla: "OscarMLABatchMetadata | None" = None
 
     causal: bool = True
 

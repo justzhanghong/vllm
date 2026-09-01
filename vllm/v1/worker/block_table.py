@@ -169,6 +169,35 @@ class BlockTable:
             BLOCK_SIZE=1024,
         )
 
+    def prepare_oscar_sync_decode_metadata(
+        self,
+        num_computed_tokens_value: int,
+        input_id_value: int,
+        num_computed_tokens: torch.Tensor,
+        positions: torch.Tensor,
+        seq_lens: torch.Tensor,
+        input_ids: torch.Tensor,
+    ) -> None:
+        total_cp_world_size = self.pcp_world_size * self.dcp_world_size
+        total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+        _prepare_oscar_sync_decode_metadata_kernel[(1,)](
+            num_computed_tokens_value,
+            input_id_value,
+            self.block_table.gpu,
+            self.block_table.gpu.stride(0),
+            self.block_size,
+            self.slot_mapping.gpu,
+            num_computed_tokens,
+            positions,
+            seq_lens,
+            input_ids,
+            TOTAL_CP_WORLD_SIZE=total_cp_world_size,
+            TOTAL_CP_RANK=total_cp_rank,
+            CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
+            PAD_ID=PAD_SLOT_ID,
+            num_warps=1,
+        )
+
     def commit_block_table(
         self, num_reqs: int, only_if_dirty: bool = False
     ) -> None:
@@ -314,6 +343,25 @@ class MultiGroupBlockTable:
         for block_table in self.block_tables:
             block_table.compute_slot_mapping(num_reqs, query_start_loc, positions)
 
+    def prepare_oscar_sync_decode_metadata(
+        self,
+        num_computed_tokens_value: int,
+        input_id_value: int,
+        num_computed_tokens: torch.Tensor,
+        positions: torch.Tensor,
+        seq_lens: torch.Tensor,
+        input_ids: torch.Tensor,
+    ) -> None:
+        assert len(self.block_tables) == 1
+        self.block_tables[0].prepare_oscar_sync_decode_metadata(
+            num_computed_tokens_value,
+            input_id_value,
+            num_computed_tokens,
+            positions,
+            seq_lens,
+            input_ids,
+        )
+
     def commit_block_table(
         self, num_reqs: int, only_if_dirty: bool = False
     ) -> None:
@@ -385,3 +433,44 @@ def _compute_slot_mapping_kernel(
         slot_ids = block_numbers * block_size + local_block_offsets
         slot_ids = tl.where(is_local, slot_ids, PAD_ID)
         tl.store(slot_mapping_ptr + offsets, slot_ids, mask=mask)
+
+
+@triton.jit
+def _prepare_oscar_sync_decode_metadata_kernel(
+    num_computed_tokens_value,
+    input_id_value,
+    block_table_ptr,
+    block_table_stride,
+    block_size,
+    slot_mapping_ptr,
+    num_computed_tokens_ptr,
+    positions_ptr,
+    seq_lens_ptr,
+    input_ids_ptr,
+    TOTAL_CP_WORLD_SIZE: tl.constexpr,
+    TOTAL_CP_RANK: tl.constexpr,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
+    PAD_ID: tl.constexpr,
+):
+    position = num_computed_tokens_value.to(tl.int64)
+    virtual_block_size = block_size * TOTAL_CP_WORLD_SIZE
+    block_index = position // virtual_block_size
+    block_number = tl.load(block_table_ptr + block_index).to(tl.int64)
+    virtual_block_offset = position - block_index * virtual_block_size
+    is_local = (
+        virtual_block_offset // CP_KV_CACHE_INTERLEAVE_SIZE
+    ) % TOTAL_CP_WORLD_SIZE == TOTAL_CP_RANK
+    local_block_offset = (
+        virtual_block_offset
+        // (TOTAL_CP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
+    ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
+        virtual_block_offset % CP_KV_CACHE_INTERLEAVE_SIZE
+    )
+    slot_id = block_number * block_size + local_block_offset
+    slot_id = tl.where(is_local, slot_id, PAD_ID)
+
+    tl.store(slot_mapping_ptr, slot_id)
+    tl.store(num_computed_tokens_ptr, num_computed_tokens_value)
+    tl.store(positions_ptr, position)
+    tl.store(seq_lens_ptr, num_computed_tokens_value + 1)
+    tl.store(input_ids_ptr, input_id_value)

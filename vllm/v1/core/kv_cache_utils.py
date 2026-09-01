@@ -17,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.utils.hashing import sha256_cbor, xxhash_cbor
 from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import format_gib
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
@@ -24,6 +25,8 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheTensor,
+    MLAAttentionSpec,
+    OscarMLAAttentionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -805,6 +808,26 @@ def get_max_concurrency_for_kv_cache_config(
     """
     Get the maximum concurrency for the given KV cache configuration.
     """
+    if kv_cache_config.oscar_mla_max_num_seqs is not None:
+        assert len(kv_cache_config.kv_cache_groups) == 1
+        spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            spec = next(
+                candidate
+                for candidate in spec.kv_cache_specs.values()
+                if isinstance(candidate, OscarMLAAttentionSpec)
+            )
+        assert isinstance(spec, OscarMLAAttentionSpec)
+        blocks_per_request = cdiv(
+            vllm_config.model_config.max_model_len,
+            spec.block_size,
+        )
+        block_concurrency = (kv_cache_config.num_blocks - 1) / blocks_per_request
+        return min(
+            float(kv_cache_config.oscar_mla_max_num_seqs),
+            block_concurrency,
+        )
+
     num_layer_per_group = max(
         len(group.layer_names) for group in kv_cache_config.kv_cache_groups
     )
@@ -1116,7 +1139,114 @@ def get_kv_cache_config_from_groups(
         )
 
     # Determine how model runners should initialize the KV cache tensors.
+    oscar_mla_max_num_seqs: int | None = None
+    oscar_mla_history_pages: int | None = None
+    only_group_spec = kv_cache_groups[0].kv_cache_spec
     if len(kv_cache_groups) == 1 and isinstance(
+        only_group_spec, UniformTypeKVCacheSpecs
+    ):
+        per_layer_specs = only_group_spec.kv_cache_specs
+    elif len(kv_cache_groups) == 1 and isinstance(
+        only_group_spec, OscarMLAAttentionSpec
+    ):
+        per_layer_specs = {
+            layer_name: only_group_spec for layer_name in kv_cache_groups[0].layer_names
+        }
+    else:
+        per_layer_specs = {}
+    oscar_mla_specs = {
+        layer_name: spec
+        for layer_name, spec in per_layer_specs.items()
+        if isinstance(spec, OscarMLAAttentionSpec)
+    }
+
+    if oscar_mla_specs:
+        if vllm_config.cache_config.num_gpu_blocks_override is not None:
+            raise ValueError("OSCAR MLA does not support num_gpu_blocks_override")
+        from vllm.model_executor.layers.quantization.oscar_mla.cache import (
+            MLACacheGeometry,
+            plan_mla_runtime_cache,
+        )
+
+        group = kv_cache_groups[0]
+        spec = next(iter(oscar_mla_specs.values()))
+        if not all(candidate == spec for candidate in oscar_mla_specs.values()):
+            raise ValueError("OSCAR MLA layers must use identical cache geometry")
+        auxiliary_specs = {
+            layer_name: candidate
+            for layer_name, candidate in per_layer_specs.items()
+            if layer_name not in oscar_mla_specs
+        }
+        if not all(
+            isinstance(candidate, MLAAttentionSpec)
+            for candidate in auxiliary_specs.values()
+        ):
+            raise ValueError("OSCAR MLA only supports native MLA auxiliary caches")
+        geometry = MLACacheGeometry(
+            num_layers=len(oscar_mla_specs),
+            latent_rank=spec.latent_rank,
+            group_size=spec.group_size,
+            block_size=spec.block_size,
+            prefix_tokens=spec.prefix_tokens,
+            recent_tokens=spec.recent_tokens,
+            speculative_tokens=spec.speculative_tokens,
+        )
+        oscar_mla_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        plan = plan_mla_runtime_cache(
+            geometry,
+            total_memory_bytes=available_memory,
+            max_num_seqs=oscar_mla_max_num_seqs,
+            rope_bytes_per_layer_token=(
+                spec.rope_head_size * get_dtype_size(spec.hp_dtype)
+            ),
+            auxiliary_bytes_per_block=sum(
+                candidate.page_size_bytes for candidate in auxiliary_specs.values()
+            ),
+        )
+        num_blocks = plan.num_blocks
+        oscar_mla_history_pages = plan.history_pages
+        fixed_per_layer_bytes = (
+            oscar_mla_max_num_seqs
+            * (spec.prefix_tokens + spec.recent_capacity_tokens)
+            * spec.bf16_token_size_bytes
+        )
+        kv_cache_tensors = []
+        for layer_name in group.layer_names:
+            layer_spec = per_layer_specs[layer_name]
+            size = layer_spec.page_size_bytes * num_blocks
+            if isinstance(layer_spec, OscarMLAAttentionSpec):
+                size += fixed_per_layer_bytes
+            kv_cache_tensors.append(KVCacheTensor(size=size, shared_by=[layer_name]))
+        assert sum(tensor.size for tensor in kv_cache_tensors) == plan.allocated_bytes
+        if not suppress_log:
+            logger.info(
+                "OSCAR MLA pools: logical capacity=%d tokens, BF16 prefix=%d "
+                "slots/%d bytes (%s GiB), BF16 recent=%d slots/%d bytes "
+                "(%s GiB), INT2 history=%d slots/%d pages/%d bytes (%s GiB), "
+                "RoPE=%d bytes (%s GiB), native index/cache=%d bytes (%s GiB), "
+                "unused=%d bytes, BF16 history=absent, compression ratios "
+                "theoretical=%.10fx padded=%.10fx allocated=%.10fx",
+                plan.logical_token_slots,
+                plan.fixed_prefix_slots,
+                plan.fixed_prefix_bytes,
+                format_gib(plan.fixed_prefix_bytes),
+                plan.fixed_recent_slots,
+                plan.fixed_recent_bytes,
+                format_gib(plan.fixed_recent_bytes),
+                plan.history_slots,
+                plan.history_pages,
+                plan.history_bytes,
+                format_gib(plan.history_bytes),
+                plan.rope_bytes,
+                format_gib(plan.rope_bytes),
+                plan.auxiliary_bytes,
+                format_gib(plan.auxiliary_bytes),
+                plan.unused_bytes,
+                plan.theoretical_history_compression_ratio,
+                plan.padded_history_compression_ratio,
+                plan.allocated_capacity_ratio,
+            )
+    elif len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
         # Special case: all layers have the same type of KV cache but with
@@ -1172,6 +1302,8 @@ def get_kv_cache_config_from_groups(
         num_blocks=num_blocks,
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
+        oscar_mla_max_num_seqs=oscar_mla_max_num_seqs,
+        oscar_mla_history_pages=oscar_mla_history_pages,
     )
 
 
@@ -1294,11 +1426,17 @@ def generate_scheduler_kv_cache_config(
     cfg = copy.deepcopy(kv_cache_configs[0])
     for group in cfg.kv_cache_groups:
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
-            # All layers in the UniformTypeKVCacheSpecs have the same type,
-            # so use an arbitrary one to initialize the scheduler.
-            group.kv_cache_spec = next(
-                iter(group.kv_cache_spec.kv_cache_specs.values())
-            )
+            per_layer_specs = group.kv_cache_spec.kv_cache_specs.values()
+            if cfg.oscar_mla_max_num_seqs is not None:
+                group.kv_cache_spec = next(
+                    spec
+                    for spec in per_layer_specs
+                    if isinstance(spec, OscarMLAAttentionSpec)
+                )
+            else:
+                # All layers in UniformTypeKVCacheSpecs have the same
+                # scheduling behavior, so use an arbitrary representative.
+                group.kv_cache_spec = next(iter(per_layer_specs))
     return cfg
 
 
@@ -1317,11 +1455,15 @@ def _report_kv_cache_config(
     )
 
     # Log the KV cache size and maximum concurrency.
-    num_tokens = (
-        kv_cache_config.num_blocks
-        // len(kv_cache_config.kv_cache_groups)
-        * min_block_size
-    )
+    if kv_cache_config.oscar_mla_max_num_seqs is not None:
+        assert len(kv_cache_config.kv_cache_groups) == 1
+        num_tokens = (kv_cache_config.num_blocks - 1) * min_block_size
+    else:
+        num_tokens = (
+            kv_cache_config.num_blocks
+            // len(kv_cache_config.kv_cache_groups)
+            * min_block_size
+        )
     dcp_size = vllm_config.parallel_config.decode_context_parallel_size
     pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
     if pcp_size * dcp_size > 1:
@@ -1597,9 +1739,23 @@ def get_kv_cache_configs(
             partial(_estimate_max_model_len_from_groups, vllm_config, groups),
         )
 
+    has_oscar_mla = [
+        any(isinstance(spec, OscarMLAAttentionSpec) for spec in worker_spec.values())
+        for worker_spec in kv_cache_specs
+    ]
+    planning_memory = available_memory
+    if any(has_oscar_mla):
+        assert all(has_oscar_mla), (
+            "OSCAR MLA cannot be mixed with native cache configs across workers"
+        )
+        # The three-pool plan has several fields derived from the memory budget.
+        # Recompute every worker from the limiting budget instead of shrinking
+        # only num_blocks after the plans have diverged.
+        planning_memory = [min(available_memory)] * len(available_memory)
+
     kv_cache_configs: list[KVCacheConfig] = []
     for projected_groups, kv_cache_spec_one_worker, available_memory_one_worker in zip(
-        projected_groups_per_worker, kv_cache_specs, available_memory
+        projected_groups_per_worker, kv_cache_specs, planning_memory
     ):
         assert sum(len(group.layer_names) for group in projected_groups) == len(
             kv_cache_spec_one_worker
@@ -1616,14 +1772,28 @@ def get_kv_cache_configs(
     min_num_blocks = min(
         kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
     )
+    oscar_mla_configs = [
+        config
+        for config in kv_cache_configs
+        if config.oscar_mla_max_num_seqs is not None
+    ]
+    if oscar_mla_configs:
+        assert len(oscar_mla_configs) == len(kv_cache_configs), (
+            "OSCAR MLA cannot be mixed with native cache configs across workers"
+        )
+        assert all(
+            config.num_blocks == min_num_blocks for config in oscar_mla_configs
+        ), "OSCAR MLA requires identical three-pool plans across workers"
+
     for kv_cache_config in kv_cache_configs:
         num_blocks_old = kv_cache_config.num_blocks
         kv_cache_config.num_blocks = min_num_blocks
 
         # Shrink tensor size proportionally
-        for tensor in kv_cache_config.kv_cache_tensors:
-            assert tensor.size % num_blocks_old == 0
-            tensor.size = tensor.size // num_blocks_old * min_num_blocks
+        if kv_cache_config.oscar_mla_max_num_seqs is None:
+            for tensor in kv_cache_config.kv_cache_tensors:
+                assert tensor.size % num_blocks_old == 0
+                tensor.size = tensor.size // num_blocks_old * min_num_blocks
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             _report_kv_cache_config(vllm_config, kv_cache_config)

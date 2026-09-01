@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
+    from vllm.v1.worker.oscar_mla_cache import OscarMLABatchMetadata
 logger = init_logger(__name__)
 
 
@@ -93,6 +94,10 @@ class XPUMLASparseMetadata(AttentionMetadata):
 
     block_table: torch.Tensor
     req_id_per_token: torch.Tensor
+    seq_lens: torch.Tensor
+    oscar_mla: "OscarMLABatchMetadata | None" = None
+    oscar_mla_draft_step: bool = False
+    enable_prefix_caching: bool = False
 
     block_size: int = 1
     topk_tokens: int = 2048
@@ -113,6 +118,7 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
     ):
         self.kv_cache_spec = kv_cache_spec
         self.model_config = vllm_config.model_config
+        self.enable_prefix_caching = vllm_config.cache_config.enable_prefix_caching
         parallel_config = vllm_config.parallel_config
         self.device = device
         max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -178,6 +184,9 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
             slot_mapping=common_attn_metadata.slot_mapping,
             block_table=common_attn_metadata.block_table_tensor,
             req_id_per_token=req_id_per_token,
+            seq_lens=common_attn_metadata.seq_lens,
+            oscar_mla=common_attn_metadata.oscar_mla,
+            enable_prefix_caching=self.enable_prefix_caching,
             block_size=self.kv_cache_spec.block_size,
             topk_tokens=self.topk_tokens,
             full_topk_start=full_topk_start,

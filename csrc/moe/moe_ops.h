@@ -49,6 +49,14 @@ std::tuple<torch::Tensor, torch::Tensor> grouped_topk(
     torch::Tensor const& scores, int64_t n_group, int64_t topk_group,
     int64_t topk, bool renormalize, double routed_scaling_factor,
     torch::Tensor const& bias, int64_t scoring_func);
+
+void grouped_topk_aligned_out(torch::Tensor const& scores,
+                              torch::Tensor const& bias,
+                              torch::Tensor topk_values,
+                              torch::Tensor topk_indices,
+                              torch::Tensor sorted_token_ids,
+                              torch::Tensor aligned_expert_ids,
+                              torch::Tensor num_tokens_post_padded);
 #endif
 
 bool moe_permute_unpermute_supported();

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -83,6 +84,25 @@ class RejectionSampler(nn.Module):
                 device=device,
             )
         self.synthetic_mode = self.synthetic_conditional_rates is not None
+        self._mtp_decision_diag_dir = os.environ.get(
+            "VLLM_MTP_DECISION_DIAG_DIR", ""
+        ).strip()
+        try:
+            self._mtp_decision_diag_steps = int(
+                os.environ.get("VLLM_MTP_DECISION_DIAG_STEPS", "0") or "0"
+            )
+        except ValueError as error:
+            raise ValueError(
+                "VLLM_MTP_DECISION_DIAG_STEPS must be an integer"
+            ) from error
+        if self._mtp_decision_diag_steps < 0:
+            raise ValueError("VLLM_MTP_DECISION_DIAG_STEPS must be non-negative")
+        if bool(self._mtp_decision_diag_dir) != bool(self._mtp_decision_diag_steps):
+            raise ValueError(
+                "VLLM_MTP_DECISION_DIAG_DIR and "
+                "VLLM_MTP_DECISION_DIAG_STEPS must be enabled together"
+            )
+        self._mtp_decision_diag_count = 0
 
     def forward(
         self,
@@ -177,6 +197,13 @@ class RejectionSampler(nn.Module):
             synthetic_mode=self.synthetic_mode,
             synthetic_conditional_rates=self.synthetic_conditional_rates,
         )
+        self._record_mtp_decision_diagnostic(
+            metadata,
+            target_logits,
+            bonus_token_ids,
+            output_token_ids,
+            sampling_metadata,
+        )
 
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:
@@ -192,6 +219,80 @@ class RejectionSampler(nn.Module):
         return SamplerOutput(
             sampled_token_ids=output_token_ids,
             logprobs_tensors=logprobs_tensors,
+        )
+
+    def _record_mtp_decision_diagnostic(
+        self,
+        metadata: SpecDecodeMetadata,
+        target_logits: torch.Tensor,
+        bonus_token_ids: torch.Tensor,
+        output_token_ids: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> None:
+        # The startup dummy sampler deliberately uses non-greedy metadata.
+        # Skip it without consuming a real-request diagnostic step.
+        if not sampling_metadata.all_greedy:
+            return
+        step = self._mtp_decision_diag_count
+        if step >= self._mtp_decision_diag_steps:
+            return
+        self._mtp_decision_diag_count += 1
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if rank != 0:
+            return
+        if not os.path.isdir(self._mtp_decision_diag_dir):
+            raise RuntimeError(
+                "MTP decision diagnostic directory does not exist: "
+                f"{self._mtp_decision_diag_dir}"
+            )
+
+        target_top_values, target_top_ids = target_logits.topk(
+            min(2, target_logits.shape[-1]), dim=-1
+        )
+        target_argmax = target_top_ids[:, 0]
+        draft_token_ids = metadata.draft_token_ids
+        draft_target_logits = target_logits.gather(
+            1, draft_token_ids.to(torch.int64).unsqueeze(1)
+        ).squeeze(1)
+        output_path = os.path.join(
+            self._mtp_decision_diag_dir, f"decision_step_{step:03d}.pt"
+        )
+        if os.path.exists(output_path):
+            raise RuntimeError(
+                f"MTP decision diagnostic output already exists: {output_path}"
+            )
+        draft_token_ids_cpu = draft_token_ids.detach().cpu()
+        target_logits_cpu = target_logits.detach().cpu()
+        target_argmax_cpu = target_argmax.detach().cpu()
+        target_top_ids_cpu = target_top_ids.detach().cpu()
+        target_top_values_cpu = target_top_values.detach().cpu()
+        draft_target_logits_cpu = draft_target_logits.detach().cpu()
+        bonus_token_ids_cpu = bonus_token_ids.detach().cpu()
+        output_token_ids_cpu = output_token_ids.detach().cpu()
+        payload = {
+            "step": step,
+            "all_greedy": sampling_metadata.all_greedy,
+            "draft_token_ids": draft_token_ids_cpu,
+            "num_draft_tokens": metadata.num_draft_tokens,
+            "target_logits": target_logits_cpu,
+            "target_argmax": target_argmax_cpu,
+            "target_top_ids": target_top_ids_cpu,
+            "target_top_values": target_top_values_cpu,
+            "draft_target_logits": draft_target_logits_cpu,
+            "bonus_token_ids": bonus_token_ids_cpu,
+            "output_token_ids": output_token_ids_cpu,
+        }
+        torch.save(payload, output_path)
+        logger.warning(
+            "MTP decision diagnostic: step=%d draft=%s target_argmax=%s "
+            "target_top_values=%s draft_target_logits=%s bonus=%s output=%s",
+            step,
+            draft_token_ids_cpu.tolist(),
+            target_argmax_cpu.tolist(),
+            target_top_values_cpu.tolist(),
+            draft_target_logits_cpu.tolist(),
+            bonus_token_ids_cpu.tolist(),
+            output_token_ids_cpu.tolist(),
         )
 
     def _get_logprobs_tensors(

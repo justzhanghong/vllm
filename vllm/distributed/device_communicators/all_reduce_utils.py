@@ -97,7 +97,11 @@ NCCL_SYMM_MEM_ALL_REDUCE_CONFIG: dict[str, Any] = {
 }
 
 
-def should_nccl_symm_mem_allreduce(world_size: int, input_tensor: torch.Tensor) -> bool:
+def should_nccl_symm_mem_allreduce(
+    world_size: int,
+    input_tensor: torch.Tensor,
+    custom_allreduce_available: bool,
+) -> bool:
     """
     Determine if NCCL symmetric memory allreduce should be used.
 
@@ -106,7 +110,9 @@ def should_nccl_symm_mem_allreduce(world_size: int, input_tensor: torch.Tensor) 
     - Large tensors (≥128K for 8 GPUs, ≥512K for 4 GPUs): Better bandwidth
 
     Custom_AR is preferred for mid-range sizes where its P2P approach
-    has lower overhead than the symm_mem copy-in/copy-out pattern.
+    has lower overhead than the symm_mem copy-in/copy-out pattern. If
+    custom all-reduce is unavailable, keep using NCCL symmetric memory
+    instead of falling back to regular PyNCCL for those sizes.
     """
     from vllm.distributed.device_communicators.pynccl_allocator import (
         is_symmetric_memory_enabled,
@@ -127,6 +133,8 @@ def should_nccl_symm_mem_allreduce(world_size: int, input_tensor: torch.Tensor) 
     )
 
     if custom_ar_range is not None:
+        if not custom_allreduce_available:
+            return True
         lower_bound, upper_bound = custom_ar_range
         # Use symm_mem for small sizes (≤ lower_bound) and large sizes (≥ upper_bound)
         # Use custom_AR (not symm_mem) for mid-range sizes

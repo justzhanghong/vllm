@@ -451,20 +451,52 @@ class MoERunner(MoERunnerInterface):
                 router_logits=router_logits,
             )
         else:
-            topk_weights, topk_ids = self.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
+            select_with_metadata = getattr(
+                self.router, "select_experts_with_aligned_metadata", None
             )
+            apply_with_metadata = getattr(
+                self.quant_method, "apply_with_aligned_metadata", None
+            )
+            supports_metadata = getattr(
+                self.quant_method, "supports_aligned_routing_metadata", None
+            )
+            if (
+                select_with_metadata is not None
+                and apply_with_metadata is not None
+                and supports_metadata is not None
+                and supports_metadata(layer)
+            ):
+                topk_weights, topk_ids, aligned_routing_metadata = select_with_metadata(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                )
+            else:
+                topk_weights, topk_ids = self.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                )
+                aligned_routing_metadata = None
 
             # Passing shared_experts_input in case SharedExpertsOrder is
             # MK_INTERNAL_OVERLAPPED.
-            fused_out = self.quant_method.apply(
-                layer=layer,
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts_input=shared_experts_input,
-            )
+            if aligned_routing_metadata is None:
+                fused_out = self.quant_method.apply(
+                    layer=layer,
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts_input=shared_experts_input,
+                )
+            else:
+                assert apply_with_metadata is not None
+                fused_out = apply_with_metadata(
+                    layer=layer,
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts_input=shared_experts_input,
+                    aligned_routing_metadata=aligned_routing_metadata,
+                )
 
         self._maybe_apply_shared_experts(
             shared_experts_input,

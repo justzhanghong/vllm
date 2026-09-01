@@ -21,6 +21,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    OscarMLAAttentionSpec,
 )
 from vllm.v1.request import Request
 
@@ -56,17 +57,28 @@ class KVCacheCoordinator(ABC):
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled
         self.use_eagle = use_eagle
-        self.single_type_managers = tuple(
-            get_manager_for_kv_cache_spec(
-                kv_cache_spec=kv_cache_group.kv_cache_spec,
-                block_pool=self.block_pool,
-                enable_caching=enable_caching,
-                kv_cache_group_id=i,
-                dcp_world_size=dcp_world_size,
-                pcp_world_size=pcp_world_size,
+        managers = []
+        for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
+            kwargs = {}
+            if isinstance(kv_cache_group.kv_cache_spec, OscarMLAAttentionSpec):
+                max_num_seqs = kv_cache_config.oscar_mla_max_num_seqs
+                history_pages = kv_cache_config.oscar_mla_history_pages
+                assert max_num_seqs is not None
+                assert history_pages is not None
+                kwargs["max_num_seqs"] = max_num_seqs
+                kwargs["history_pages"] = history_pages
+            managers.append(
+                get_manager_for_kv_cache_spec(
+                    kv_cache_spec=kv_cache_group.kv_cache_spec,
+                    block_pool=self.block_pool,
+                    enable_caching=enable_caching,
+                    kv_cache_group_id=i,
+                    dcp_world_size=dcp_world_size,
+                    pcp_world_size=pcp_world_size,
+                    **kwargs,
+                )
             )
-            for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
-        )
+        self.single_type_managers = tuple(managers)
 
     def get_num_blocks_to_allocate(
         self,

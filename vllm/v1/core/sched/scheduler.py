@@ -1095,6 +1095,9 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            oscar_mla_cache_metadata=self.kv_cache_manager.get_oscar_mla_metadata(
+                list(num_scheduled_tokens)
+            ),
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:

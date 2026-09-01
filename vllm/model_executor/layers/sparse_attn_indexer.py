@@ -64,20 +64,14 @@ def _env_int(name: str, default: str = "0") -> int:
 
 # Stage TPOT services restart per candidate, so these sparse DSA decode
 # controls are fixed for the process lifetime.
-_DECODE_LOGITS_WORKSPACE = _env_flag(
-    "VLLM_SPARSE_INDEXER_DECODE_LOGITS_WORKSPACE"
-)
-_DECODE_PREDEQUANT_Q = _env_flag(
-    "VLLM_SPARSE_INDEXER_DECODE_PREDEQUANT_Q"
-)
+_DECODE_LOGITS_WORKSPACE = _env_flag("VLLM_SPARSE_INDEXER_DECODE_LOGITS_WORKSPACE")
+_DECODE_PREDEQUANT_Q = _env_flag("VLLM_SPARSE_INDEXER_DECODE_PREDEQUANT_Q")
 _DECODE_TRIM_LOGITS = _env_flag("VLLM_SPARSE_INDEXER_DECODE_TRIM_LOGITS")
 _DECODE_LOGITS_BUCKET_SIZE = _env_int(
     "VLLM_SPARSE_INDEXER_DECODE_LOGITS_BUCKET_SIZE",
     "8192",
 )
-_DECODE_TRIM_BLOCK_TABLE = _env_flag(
-    "VLLM_SPARSE_INDEXER_DECODE_TRIM_BLOCK_TABLE"
-)
+_DECODE_TRIM_BLOCK_TABLE = _env_flag("VLLM_SPARSE_INDEXER_DECODE_TRIM_BLOCK_TABLE")
 _DECODE_TOPK_BACKEND = os.getenv(
     "VLLM_SPARSE_INDEXER_DECODE_TOPK_BACKEND",
     "persistent",
@@ -86,15 +80,9 @@ _DECODE_TOPK_PAD_LOGITS_LEN = _env_int(
     "VLLM_SPARSE_INDEXER_DECODE_TOPK_PAD_LOGITS_LEN",
     "0",
 )
-_DECODE_TOPK_HIST_FUSION = _env_flag(
-    "VLLM_SPARSE_INDEXER_DECODE_TOPK_HIST_FUSION"
-)
-_DECODE_TOPK_BIN_FUSION = _env_flag(
-    "VLLM_SPARSE_INDEXER_DECODE_TOPK_BIN_FUSION"
-)
-_DECODE_TOPK_TILE_SELECT = _env_flag(
-    "VLLM_SPARSE_INDEXER_DECODE_TOPK_TILE_SELECT"
-)
+_DECODE_TOPK_HIST_FUSION = _env_flag("VLLM_SPARSE_INDEXER_DECODE_TOPK_HIST_FUSION")
+_DECODE_TOPK_BIN_FUSION = _env_flag("VLLM_SPARSE_INDEXER_DECODE_TOPK_BIN_FUSION")
+_DECODE_TOPK_TILE_SELECT = _env_flag("VLLM_SPARSE_INDEXER_DECODE_TOPK_TILE_SELECT")
 _DECODE_TOPK_TILE_SELECT_NO_STORE = _env_flag(
     "VLLM_SPARSE_INDEXER_DECODE_TOPK_TILE_SELECT_NO_STORE"
 )
@@ -108,11 +96,9 @@ _DECODE_TOPK_TILE_SELECT_CANDIDATES = _env_int(
 )
 _DECODE_LOGITS_BLOCK_PAGES = _env_int(
     "VLLM_SPARSE_INDEXER_DECODE_LOGITS_BLOCK_PAGES",
-    "1",
+    "2",
 )
-_SKIP_PREFILL_TOPK_CLEAR = _env_flag(
-    "VLLM_SPARSE_INDEXER_SKIP_PREFILL_TOPK_CLEAR"
-)
+_SKIP_PREFILL_TOPK_CLEAR = _env_flag("VLLM_SPARSE_INDEXER_SKIP_PREFILL_TOPK_CLEAR")
 _SKIP_DECODE_TOPK_CLEAR = _env_flag("VLLM_SPARSE_INDEXER_SKIP_DECODE_TOPK_CLEAR")
 _PREFILL_SHAPE_BUCKET_TRACE = _env_flag("VLLM_PREFILL_SHAPE_BUCKET_TRACE")
 _PREFILL_MQA_CANONICAL_M = _env_int(
@@ -123,7 +109,7 @@ _PREFILL_MQA_CANONICAL_M = _env_int(
 
 def _shape_bucket_trace_sync(device: torch.device) -> None:
     if _PREFILL_SHAPE_BUCKET_TRACE and device.type == "cuda":
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device=device)
 
 
 def _shape_bucket_trace_ms(start: float, device: torch.device) -> float:
@@ -146,6 +132,8 @@ def sparse_attn_indexer(
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor,
 ) -> torch.Tensor:
+    workspace_shapes: list[tuple[tuple[int, ...], torch.dtype]]
+    topk_workspace: torch.Tensor | None
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
     fp8_dtype = current_platform.fp8_dtype()
@@ -154,7 +142,7 @@ def sparse_attn_indexer(
     # assert isinstance(attn_metadata, dict)
     if not isinstance(attn_metadata, dict):
         # Reserve workspace for indexer during profiling run
-        workspace_shapes: list[tuple[tuple[int, ...], torch.dtype]] = [
+        workspace_shapes = [
             ((total_seq_lens, head_dim), torch.float8_e4m3fn),
             ((total_seq_lens, 4), torch.uint8),
             ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
@@ -206,12 +194,8 @@ def sparse_attn_indexer(
                 and padded_total_seq_lens >= 32768
                 and padded_total_seq_lens % 128 != 0
             ):
-                padded_total_seq_lens = (
-                    (padded_total_seq_lens + 127) // 128
-                ) * 128
-            workspace_shapes.append(
-                ((padded_total_seq_lens, head_dim), torch.bfloat16)
-            )
+                padded_total_seq_lens = ((padded_total_seq_lens + 127) // 128) * 128
+            workspace_shapes.append(((padded_total_seq_lens, head_dim), torch.bfloat16))
         current_workspace_manager().get_simultaneous(*workspace_shapes)
 
         # Dummy allocation to simulate for peak logits tensor memory during inference.
@@ -271,15 +255,9 @@ def sparse_attn_indexer(
         )
 
     skip_prefill_topk_clear = (
-        has_prefill
-        and not has_decode
-        and _SKIP_PREFILL_TOPK_CLEAR
+        has_prefill and not has_decode and _SKIP_PREFILL_TOPK_CLEAR
     )
-    skip_decode_topk_clear = (
-        has_decode
-        and not has_prefill
-        and _SKIP_DECODE_TOPK_CLEAR
-    )
+    skip_decode_topk_clear = has_decode and not has_prefill and _SKIP_DECODE_TOPK_CLEAR
     if not (skip_prefill_topk_clear or skip_decode_topk_clear):
         topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
@@ -309,20 +287,15 @@ def sparse_attn_indexer(
             and os.getenv("VLLM_MQA_CUDA_V7_PREDEQUANT_K", "0") == "1"
         )
         predequant_q = (
-            predequant_k
-            and os.getenv("VLLM_MQA_CUDA_V7_PREDEQUANT_Q", "0") == "1"
+            predequant_k and os.getenv("VLLM_MQA_CUDA_V7_PREDEQUANT_Q", "0") == "1"
         )
         fused_triton = (
-            predequant_k
-            and os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON", "0") == "1"
+            predequant_k and os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON", "0") == "1"
         )
         q_workspace = (
             predequant_k
             and not predequant_q
-            and (
-                fused_triton
-                or os.getenv("VLLM_MQA_CUDA_V7_Q_WORKSPACE", "0") == "1"
-            )
+            and (fused_triton or os.getenv("VLLM_MQA_CUDA_V7_Q_WORKSPACE", "0") == "1")
         )
         use_predequant_workspace = (
             predequant_k
@@ -366,8 +339,7 @@ def sparse_attn_indexer(
             )
             fp8_mqa_dequant_q_cuda(q_fp8, q_bf16_full)
         max_actual_chunk_m = max(
-            chunk.token_end - chunk.token_start
-            for chunk in prefill_metadata.chunks
+            chunk.token_end - chunk.token_start for chunk in prefill_metadata.chunks
         )
         canonical_chunk_m = max_actual_chunk_m
         if fused_triton and _PREFILL_MQA_CANONICAL_M > 0:
@@ -378,9 +350,7 @@ def sparse_attn_indexer(
                     max_actual_chunk_m,
                     _PREFILL_MQA_CANONICAL_M,
                 )
-            canonical_chunk_m = max(
-                canonical_chunk_m, _PREFILL_MQA_CANONICAL_M
-            )
+            canonical_chunk_m = max(canonical_chunk_m, _PREFILL_MQA_CANONICAL_M)
         q_bf16_workspace: torch.Tensor | None = None
         if q_workspace:
             q_bf16_workspace = torch.empty(
@@ -389,12 +359,8 @@ def sparse_attn_indexer(
                 device=hidden_states.device,
             )
         logits_workspace: torch.Tensor | None = None
-        reuse_logits = (
-            predequant_k
-            and (
-                fused_triton
-                or os.getenv("VLLM_MQA_CUDA_V7_REUSE_LOGITS", "0") == "1"
-            )
+        reuse_logits = predequant_k and (
+            fused_triton or os.getenv("VLLM_MQA_CUDA_V7_REUSE_LOGITS", "0") == "1"
         )
         if reuse_logits:
             pad_logits_n = os.getenv("VLLM_MQA_CUDA_V7_PAD_N", "0") == "1"
@@ -405,8 +371,7 @@ def sparse_attn_indexer(
                 return n
 
             max_chunk_n = max(
-                padded_n(chunk.active_seq_lens)
-                for chunk in prefill_metadata.chunks
+                padded_n(chunk.active_seq_lens) for chunk in prefill_metadata.chunks
             )
             logits_workspace = torch.empty(
                 (canonical_chunk_m, max_chunk_n),
@@ -521,9 +486,7 @@ def sparse_attn_indexer(
                 token_start = chunk.token_start
                 row_start_zero = (
                     chunk.num_reqs == 1
-                    and os.getenv(
-                        "VLLM_MQA_CUDA_V7_FUSED_TRITON_ROW_START_ZERO", "0"
-                    )
+                    and os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_ROW_START_ZERO", "0")
                     == "1"
                     and q_chunk.shape[0]
                     >= int(
@@ -580,8 +543,7 @@ def sparse_attn_indexer(
                         )
                     else:
                         logger.info_once(
-                            "Sparse indexer prefill MQA logits backend: "
-                            "CUDA/cuBLAS v7"
+                            "Sparse indexer prefill MQA logits backend: CUDA/cuBLAS v7"
                         )
                     if predequant_k:
                         assert k_bf16_full is not None
@@ -732,8 +694,7 @@ def sparse_attn_indexer(
             if (
                 current_platform.is_cuda()
                 and chunk.num_reqs == 1
-                and os.getenv("VLLM_SPARSE_INDEXER_PREFILL_DECODE_TOPK", "0")
-                == "1"
+                and os.getenv("VLLM_SPARSE_INDEXER_PREFILL_DECODE_TOPK", "0") == "1"
             ):
                 torch.ops._C.top_k_per_row_decode(
                     logits,
@@ -748,8 +709,7 @@ def sparse_attn_indexer(
             elif (
                 current_platform.is_cuda()
                 and chunk.num_reqs == 1
-                and os.getenv("VLLM_SPARSE_INDEXER_PREFILL_PERSISTENT_TOPK", "0")
-                == "1"
+                and os.getenv("VLLM_SPARSE_INDEXER_PREFILL_PERSISTENT_TOPK", "0") == "1"
             ):
                 (topk_workspace,) = workspace_manager.get_simultaneous(
                     ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
@@ -860,7 +820,7 @@ def sparse_attn_indexer(
                 tuple(decode_block_table.shape),
                 _DECODE_TOPK_BACKEND,
             )
-        topk_workspace: torch.Tensor | None = None
+        topk_workspace = None
         decode_topk_backend = _DECODE_TOPK_BACKEND
         decode_topk_logits_len = decode_logits_len
         topk_pad_logits_len = _DECODE_TOPK_PAD_LOGITS_LEN
@@ -949,15 +909,16 @@ def sparse_attn_indexer(
                     tuple(logits.shape),
                     attn_metadata_narrowed.max_seq_len,
                     decode_logits_len,
-                    _shape_bucket_trace_ms(trace_decode_mqa_start,
-                                           hidden_states.device),
+                    _shape_bucket_trace_ms(
+                        trace_decode_mqa_start, hidden_states.device
+                    ),
                 )
         else:
             logits_out: torch.Tensor | None = None
             q_bf16_decode: torch.Tensor | None = None
             if current_platform.is_cuda():
                 workspace_manager = current_workspace_manager()
-                workspace_shapes: list[tuple[tuple[int, ...], torch.dtype]] = []
+                workspace_shapes = []
                 if _DECODE_PREDEQUANT_Q:
                     workspace_shapes.append(
                         (
@@ -1074,10 +1035,7 @@ def sparse_attn_indexer(
                 topk_tile_candidate_cutoffs=topk_tile_candidate_cutoffs,
                 store_logits=not use_topk_tile_select_no_store,
             )
-            if (
-                logits_out is not None
-                and decode_topk_logits_len > decode_logits_len
-            ):
+            if logits_out is not None and decode_topk_logits_len > decode_logits_len:
                 logits = logits_out[:num_padded_tokens, :decode_topk_logits_len]
             if _PREFILL_SHAPE_BUCKET_TRACE:
                 logger.info(
@@ -1088,8 +1046,9 @@ def sparse_attn_indexer(
                     attn_metadata_narrowed.max_seq_len,
                     decode_logits_len,
                     decode_topk_logits_len,
-                    _shape_bucket_trace_ms(trace_decode_mqa_start,
-                                           hidden_states.device),
+                    _shape_bucket_trace_ms(
+                        trace_decode_mqa_start, hidden_states.device
+                    ),
                 )
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
@@ -1213,8 +1172,7 @@ def sparse_attn_indexer(
                 if decode_topk_backend != "legacy"
                 else decode_topk_logits_len,
                 topk_tokens,
-                _shape_bucket_trace_ms(trace_decode_topk_start,
-                                       hidden_states.device),
+                _shape_bucket_trace_ms(trace_decode_topk_start, hidden_states.device),
             )
         if decode_metadata.requires_padding:
             # if padded, we need to unpack

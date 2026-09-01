@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -13,6 +13,9 @@ if TYPE_CHECKING:
     from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
     from vllm.lora.request import LoRARequest
+    from vllm.model_executor.layers.quantization.oscar_mla.cache import (
+        WorkerCacheMetadata,
+    )
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
@@ -25,6 +28,7 @@ else:
     PoolingParams = object
     SamplingParams = object
     Request = object
+    WorkerCacheMetadata = object
 
 
 @dataclass
@@ -237,6 +241,11 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
+
+    # Scheduler-owned stable rows, history pages and generation/version.
+    oscar_mla_cache_metadata: dict[str, WorkerCacheMetadata] = field(
+        default_factory=dict
+    )
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

@@ -156,12 +156,8 @@ def _fused_marlin_moe(
         )
         == "1"
     )
-    w1_thread_k, w1_thread_n, w1_blocks_per_sm = (
-        _get_marlin_moe_exec_config("W1")
-    )
-    w2_thread_k, w2_thread_n, w2_blocks_per_sm = (
-        _get_marlin_moe_exec_config("W2")
-    )
+    w1_thread_k, w1_thread_n, w1_blocks_per_sm = _get_marlin_moe_exec_config("W1")
+    w2_thread_k, w2_thread_n, w2_blocks_per_sm = _get_marlin_moe_exec_config("W2")
 
     intermediate_cache1 = ops.moe_wna16_marlin_gemm(
         gate_up_input,
@@ -289,6 +285,8 @@ def fused_marlin_moe(
     output: torch.Tensor | None = None,
     input_dtype: torch.dtype | None = None,
     inplace: bool = False,
+    aligned_routing_metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    | None = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -364,13 +362,34 @@ def fused_marlin_moe(
 
     if global_num_experts == -1:
         global_num_experts = E
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids,
-        block_size_m,
-        global_num_experts,
-        expert_map,
-        ignore_invalid_experts=True,
+    use_aligned_routing_metadata = (
+        aligned_routing_metadata is not None
+        and M == 1
+        and topk == 8
+        and global_num_experts == 154
+        and expert_map is None
+        and block_size_m == 8
     )
+    if use_aligned_routing_metadata:
+        assert aligned_routing_metadata is not None
+        sorted_token_ids, expert_ids, num_tokens_post_padded = aligned_routing_metadata
+        assert sorted_token_ids.shape == (64,)
+        assert expert_ids.shape == (8,)
+        assert num_tokens_post_padded.shape == (1,)
+        assert sorted_token_ids.dtype == torch.int32
+        assert expert_ids.dtype == torch.int32
+        assert num_tokens_post_padded.dtype == torch.int32
+        assert sorted_token_ids.device == topk_ids.device
+        assert expert_ids.device == topk_ids.device
+        assert num_tokens_post_padded.device == topk_ids.device
+    else:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids,
+            block_size_m,
+            global_num_experts,
+            expert_map,
+            ignore_invalid_experts=True,
+        )
 
     assert activation is not None
     moe_output = _fused_marlin_moe(
@@ -704,6 +723,12 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
 class MarlinExperts(MarlinExpertsBase):
     """Marlin-based fused MoE expert implementation."""
 
+    def supports_aligned_routing_metadata(self) -> bool:
+        forced_block_size_m = int(os.getenv("VLLM_MARLIN_MOE_BLOCK_SIZE_M", "0"))
+        return (
+            self.input_dtype is None or self.input_dtype.itemsize != 1
+        ) and forced_block_size_m in (0, 8)
+
     def supports_expert_map(self) -> bool:
         return True
 
@@ -763,6 +788,8 @@ class MarlinExperts(MarlinExpertsBase):
         workspace2: torch.Tensor,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
+        aligned_routing_metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | None = None,
     ):
         assert self.w1_scale is not None
         assert self.w2_scale is not None
@@ -796,6 +823,45 @@ class MarlinExperts(MarlinExpertsBase):
             sort_indices2=self.w2_g_idx_sort_indices,
             is_k_full=self.is_k_full,
             input_dtype=self.input_dtype,
+            aligned_routing_metadata=aligned_routing_metadata,
+        )
+
+    def apply_with_aligned_metadata(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        a2_scale: torch.Tensor | None,
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        apply_router_weight_on_input: bool,
+        aligned_routing_metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> None:
+        self.apply(
+            output=output,
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=activation,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            a1q_scale=a1q_scale,
+            a2_scale=a2_scale,
+            workspace13=workspace13,
+            workspace2=workspace2,
+            expert_tokens_meta=expert_tokens_meta,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            aligned_routing_metadata=aligned_routing_metadata,
         )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:

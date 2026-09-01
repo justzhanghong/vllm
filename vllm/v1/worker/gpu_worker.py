@@ -67,6 +67,44 @@ from .utils import request_memory
 logger = init_logger(__name__)
 
 
+def _find_oscar_mla_impls(model: Any) -> tuple[Any, ...]:
+    impls = []
+    for module in model.modules():
+        impl = getattr(module, "impl", None)
+        if getattr(impl, "kv_cache_dtype", None) == "oscar_mla_int2":
+            impls.append(impl)
+    return tuple(impls)
+
+
+def _collect_oscar_mla_call_counts(
+    impls: tuple[Any, ...],
+) -> dict[str, int] | None:
+    if not impls:
+        return None
+    per_layer = [
+        (
+            int(impl.oscar_write_calls),
+            int(impl.oscar_demotion_calls),
+            int(impl.oscar_read_calls),
+        )
+        for impl in impls
+    ]
+
+    store, demotion, read = zip(*per_layer)
+    return {
+        "layers": len(per_layer),
+        "store_total": sum(store),
+        "store_min": min(store),
+        "store_max": max(store),
+        "demotion_total": sum(demotion),
+        "demotion_min": min(demotion),
+        "demotion_max": max(demotion),
+        "read_total": sum(read),
+        "read_min": min(read),
+        "read_max": max(read),
+    }
+
+
 def _pp_boundary_scope(name: str) -> AbstractContextManager:
     if not envs.VLLM_PP_BOUNDARY_PROFILING:
         return nullcontext()
@@ -795,6 +833,35 @@ class Worker(WorkerBase):
         )
         return self.profiler.annotate_context_manager(annotation)
 
+    def _log_oscar_mla_call_counts(self) -> None:
+        if self.rank != 0:
+            return
+        impls = getattr(self, "_oscar_mla_impls", None)
+        if impls is None:
+            impls = _find_oscar_mla_impls(self.model_runner.model)
+            self._oscar_mla_impls = impls
+        counts = _collect_oscar_mla_call_counts(impls)
+        if counts is None:
+            return
+        fingerprint = tuple(counts.values())
+        if fingerprint == getattr(self, "_last_oscar_mla_call_counts", None):
+            return
+        self._last_oscar_mla_call_counts = fingerprint
+        logger.info(
+            "OSCAR MLA call counts: layers=%d, store=%d (min=%d max=%d), "
+            "demotion=%d (min=%d max=%d), read=%d (min=%d max=%d)",
+            counts["layers"],
+            counts["store_total"],
+            counts["store_min"],
+            counts["store_max"],
+            counts["demotion_total"],
+            counts["demotion_min"],
+            counts["demotion_max"],
+            counts["read_total"],
+            counts["read_min"],
+            counts["read_max"],
+        )
+
     @torch.inference_mode()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
@@ -938,6 +1005,8 @@ class Worker(WorkerBase):
                 and output is None
             ):
                 output = self.model_runner.pool()  # type: ignore
+            if forward_pass:
+                self._log_oscar_mla_call_counts()
             if isinstance(
                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
             ):

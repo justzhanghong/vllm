@@ -18,8 +18,10 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    OscarMLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.worker.oscar_mla_cache import reshape_oscar_mla_cache
 from vllm.v1.worker.utils import AttentionGroup, bind_kv_cache
 
 
@@ -156,6 +158,16 @@ def _reshape_kv_cache(
             assert isinstance(kv_cache_spec, AttentionSpec)
 
             raw_tensor = kv_cache_raw_tensors[layer_name]
+            if isinstance(kv_cache_spec, OscarMLAAttentionSpec):
+                max_num_seqs = kv_cache_config.oscar_mla_max_num_seqs
+                assert max_num_seqs is not None
+                kv_caches[layer_name] = reshape_oscar_mla_cache(
+                    raw_tensor,
+                    kv_cache_spec,
+                    num_blocks=kv_cache_config.num_blocks,
+                    max_num_seqs=max_num_seqs,
+                )
+                continue
             assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
             num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
 

@@ -125,6 +125,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "Tensor)");
   m.impl("grouped_topk", torch::kCUDA, &grouped_topk);
 
+  m.def(
+      "grouped_topk_aligned_out(Tensor scores, Tensor bias, "
+      "Tensor! topk_values, Tensor! topk_indices, "
+      "Tensor! sorted_token_ids, Tensor! aligned_expert_ids, "
+      "Tensor! num_tokens_post_padded) -> ()");
+  m.impl("grouped_topk_aligned_out", torch::kCUDA, &grouped_topk_aligned_out);
+
   // cuBLAS bf16 x bf16 -> fp32 router GEMM (fallback for non-SM90 / batch > 16)
   m.def("router_gemm_bf16_fp32(Tensor input, Tensor weight) -> Tensor");
   m.impl("router_gemm_bf16_fp32", torch::kCUDA, &router_gemm_bf16_fp32);

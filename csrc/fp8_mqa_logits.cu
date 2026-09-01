@@ -1270,7 +1270,7 @@ void fp8_mqa_logits_cuda_v7(const torch::Tensor& q, const torch::Tensor& k,
     group_size = 2;
   }
   const bool bf16_scores =
-      get_env_int64("VLLM_MQA_CUDA_V7_BF16_SCORES", 0) != 0;
+      get_env_int64("VLLM_MQA_CUDA_V7_BF16_SCORES", 1) != 0;
   const bool two_d_accum =
       get_env_int64("VLLM_MQA_CUDA_V7_2D_ACCUM", 0) != 0;
   fp8_mqa_logits_cuda_impl(q, k, k_scales, weights, cu_seqlen_ks, cu_seqlen_ke,
@@ -1412,7 +1412,7 @@ void fp8_mqa_logits_cuda_v7_bf16_k(const torch::Tensor& q,
     group_size = 2;
   }
   const bool bf16_scores =
-      get_env_int64("VLLM_MQA_CUDA_V7_BF16_SCORES", 0) != 0;
+      get_env_int64("VLLM_MQA_CUDA_V7_BF16_SCORES", 1) != 0;
   const bool two_d_accum =
       get_env_int64("VLLM_MQA_CUDA_V7_2D_ACCUM", 0) != 0;
   fp8_mqa_logits_cuda_compute_bf16_k(q, k_bf16, weights, cu_seqlen_ks,
@@ -1457,7 +1457,7 @@ void fp8_mqa_logits_cuda_v7_bf16_qk(const torch::Tensor& q_bf16,
     group_size = 2;
   }
   const bool bf16_scores =
-      get_env_int64("VLLM_MQA_CUDA_V7_BF16_SCORES", 0) != 0;
+      get_env_int64("VLLM_MQA_CUDA_V7_BF16_SCORES", 1) != 0;
   const bool two_d_accum =
       get_env_int64("VLLM_MQA_CUDA_V7_2D_ACCUM", 0) != 0;
   fp8_mqa_logits_cuda_compute_bf16_qk(

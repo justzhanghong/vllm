@@ -2542,6 +2542,26 @@ def grouped_topk(
     )
 
 
+def grouped_topk_aligned_out(
+    scores: torch.Tensor,
+    bias: torch.Tensor,
+    topk_values: torch.Tensor,
+    topk_indices: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    aligned_expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+) -> None:
+    torch.ops._moe_C.grouped_topk_aligned_out(
+        scores,
+        bias,
+        topk_values,
+        topk_indices,
+        sorted_token_ids,
+        aligned_expert_ids,
+        num_tokens_post_padded,
+    )
+
+
 def moe_wna16_marlin_gemm(
     input: torch.Tensor,
     output: torch.Tensor | None,

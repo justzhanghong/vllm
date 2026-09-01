@@ -5,12 +5,14 @@ import dataclasses
 import os
 import time
 from importlib.util import find_spec
+from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm.compilation.cuda_graph import CUDAGraphOptions, CUDAGraphWrapper
 from vllm.config import (
     CUDAGraphMode,
     VllmConfig,
@@ -82,7 +84,8 @@ class SpecDecodeBaseProposer:
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
         draft_hf_config = getattr(self.draft_model_config, "hf_config", None)
         self._share_mtp_indices = getattr(
-            draft_hf_config, "index_share_for_mtp_iteration", False)
+            draft_hf_config, "index_share_for_mtp_iteration", False
+        )
 
         # We need to get the hidden size from the draft model config because
         # the draft model's hidden size can be different from the target model's
@@ -137,6 +140,25 @@ class SpecDecodeBaseProposer:
         # gpu_model_runner._check_and_update_cudagraph_mode after
         # adjust_cudagraph_sizes_for_spec_decode is called.
         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
+        self._oscar_mtp_draft_graph_capture_metadata: dict[int, Any] = {}
+        self._oscar_mtp_draft_decode_capture_sizes: tuple[int, ...] = ()
+        draft_margin_threshold = os.environ.get(
+            "VLLM_OSCAR_MTP_DRAFT_MARGIN_EARLY_STOP"
+        )
+        self._oscar_mtp_draft_margin_threshold = (
+            float(draft_margin_threshold) if draft_margin_threshold else None
+        )
+        draft_margin_sentinel = os.environ.get(
+            "VLLM_OSCAR_MTP_DRAFT_MARGIN_EARLY_STOP_SENTINEL"
+        )
+        self._oscar_mtp_draft_margin_sentinel = (
+            Path(draft_margin_sentinel) if draft_margin_sentinel else None
+        )
+        self._oscar_mtp_dynamic_draft_enabled = (
+            self._oscar_mtp_draft_margin_threshold is not None
+            and self._oscar_mtp_draft_margin_sentinel is None
+        )
+        self._oscar_mtp_stop_after_current_draft = False
 
         # persistent buffers for cuda graph
         self.input_ids = torch.zeros(
@@ -395,25 +417,80 @@ class SpecDecodeBaseProposer:
     def initialize_cudagraph_keys(self, cudagraph_mode: CUDAGraphMode) -> None:
         """Initialize cudagraph dispatcher keys for eagle.
 
-        Eagle only supports PIECEWISE cudagraphs (via mixed_mode).
+        Eagle only supports PIECEWISE cudagraphs (via mixed_mode) by default.
         This should be called after adjust_cudagraph_sizes_for_spec_decode.
         """
+        mtp_draft_full_cudagraph = (
+            self.method == "mtp"
+            and os.environ.get("VLLM_OSCAR_MTP_DRAFT_FULL_CUDAGRAPH", "0") == "1"
+        )
         if (
             not self.speculative_config.enforce_eager
             and cudagraph_mode.mixed_mode()
             in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]
         ):
-            eagle_cudagraph_mode = CUDAGraphMode.PIECEWISE
+            eagle_cudagraph_mode = (
+                cudagraph_mode if mtp_draft_full_cudagraph else CUDAGraphMode.PIECEWISE
+            )
         else:
             eagle_cudagraph_mode = CUDAGraphMode.NONE
 
-        self.cudagraph_dispatcher.initialize_cudagraph_keys(eagle_cudagraph_mode)
+        if mtp_draft_full_cudagraph and eagle_cudagraph_mode:
+            self.cudagraph_dispatcher.uniform_decode_query_len = 1
+            target_uniform_decode_query_len = 1 + self.num_speculative_tokens
+            capture_sizes = self.compilation_config.cudagraph_capture_sizes
+            assert capture_sizes is not None
+            draft_decode_capture_sizes = {
+                size // target_uniform_decode_query_len
+                for size in capture_sizes
+                if size % target_uniform_decode_query_len == 0
+                and size // target_uniform_decode_query_len <= self.max_batch_size
+            }
+            if (
+                os.environ.get("VLLM_OSCAR_MTP_DRAFT_MARGIN_EARLY_STOP")
+                or os.environ.get("VLLM_OSCAR_MTP_ACCEPTANCE_ADAPTIVE")
+                or os.environ.get("VLLM_OSCAR_MTP_PERIODIC_DRAFT")
+            ):
+                draft_decode_capture_sizes.update(
+                    range(1, self.num_speculative_tokens + 2)
+                )
+            draft_capture_sizes = sorted(
+                set(capture_sizes) | draft_decode_capture_sizes
+            )
+            self._oscar_mtp_draft_decode_capture_sizes = tuple(
+                size for size in draft_capture_sizes if size <= self.max_batch_size
+            )
+            self.cudagraph_dispatcher.initialize_cudagraph_keys(
+                eagle_cudagraph_mode,
+                uniform_decode_query_len=1,
+                cudagraph_capture_sizes=draft_capture_sizes,
+            )
+        else:
+            self.cudagraph_dispatcher.initialize_cudagraph_keys(eagle_cudagraph_mode)
 
     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Greedy-sample draft tokens from hidden states."""
+        self._oscar_mtp_stop_after_current_draft = False
         if self.use_local_argmax_reduction:
             return self.model.get_top_tokens(hidden_states)
-        return self.model.compute_logits(hidden_states).argmax(dim=-1)
+        logits = self.model.compute_logits(hidden_states)
+        sampled_ids = logits.argmax(dim=-1)
+        threshold = self._oscar_mtp_draft_margin_threshold
+        if (
+            self._oscar_mtp_dynamic_draft_enabled
+            and threshold is not None
+            and self.method == "mtp"
+            and self.num_speculative_tokens == 5
+            and logits.ndim == 2
+            and logits.shape[0] == 1
+            and logits.shape[1] >= 2
+        ):
+            top_values = torch.topk(logits, 2, dim=-1).values
+            margin = top_values[:, 0] - top_values[:, 1]
+            self._oscar_mtp_stop_after_current_draft = bool(
+                torch.all(margin < threshold).item()
+            )
+        return sampled_ids
 
     def _sample_from_logits(
         self,
@@ -474,9 +551,34 @@ class SpecDecodeBaseProposer:
         slot_mappings: dict[str, torch.Tensor]
         | list[dict[str, torch.Tensor]]
         | None = None,
+        draft_token_limit: int | None = None,
     ) -> torch.Tensor:
         self._last_draft_probs = None
         batch_size = common_attn_metadata.batch_size()
+        num_speculative_tokens = self.num_speculative_tokens
+        if draft_token_limit is not None:
+            if (
+                self.method != "mtp"
+                or batch_size != 1
+                or self.parallel_drafting
+                or not 1 <= draft_token_limit <= self.num_speculative_tokens
+            ):
+                raise ValueError(
+                    "draft_token_limit requires batch-1 sequential MTP and must "
+                    "not exceed the configured speculative token count"
+                )
+            num_speculative_tokens = draft_token_limit
+        if (
+            not self._oscar_mtp_dynamic_draft_enabled
+            and self._oscar_mtp_draft_margin_threshold is not None
+            and self._oscar_mtp_draft_margin_sentinel is not None
+            and self._oscar_mtp_draft_margin_sentinel.is_file()
+        ):
+            self._oscar_mtp_dynamic_draft_enabled = True
+            logger.info(
+                "OSCAR MTP5 dynamic draft early-stop enabled at margin %.6f",
+                self._oscar_mtp_draft_margin_threshold,
+            )
         mtp_propose_debug = (
             self.method == "mtp"
             and os.environ.get("VLLM_MTP_SAMPLE_TIMING_LOGS", "0") == "1"
@@ -607,8 +709,7 @@ class SpecDecodeBaseProposer:
             num_input_tokens=num_input_tokens,
             slot_mapping_size=slot_mapping_size,
         )
-        if self._share_mtp_indices and hasattr(self.model.model,
-                                               "set_skip_topk"):
+        if self._share_mtp_indices and hasattr(self.model.model, "set_skip_topk"):
             self.model.model.set_skip_topk(False)
         with set_forward_context(
             per_layer_attn_metadata,
@@ -626,8 +727,7 @@ class SpecDecodeBaseProposer:
                 hidden_states = last_hidden_states
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
-        if self._share_mtp_indices and hasattr(self.model.model,
-                                               "set_skip_topk"):
+        if self._share_mtp_indices and hasattr(self.model.model, "set_skip_topk"):
             # Compact sparse-index rows before later MTP steps reuse them.
             self.model.model.set_skip_topk(True)
             if hasattr(self.model.model, "compact_topk_indices"):
@@ -650,7 +750,7 @@ class SpecDecodeBaseProposer:
         )
 
         # Early exit if there is only one draft token to be generated.
-        if self.num_speculative_tokens == 1 or self.parallel_drafting:
+        if num_speculative_tokens == 1 or self.parallel_drafting:
             phase_start = time.perf_counter()
             log_mtp_proposer_event("draft_sample_enter")
             draft_token_ids, draft_probs = self._sample_draft_tokens(
@@ -663,9 +763,9 @@ class SpecDecodeBaseProposer:
             )
             if draft_probs is not None:
                 self._last_draft_probs = draft_probs.view(
-                    batch_size, self.num_speculative_tokens, -1
+                    batch_size, num_speculative_tokens, -1
                 ).contiguous()
-            return draft_token_ids.view(-1, self.num_speculative_tokens)
+            return draft_token_ids.view(-1, num_speculative_tokens)
 
         if self.uses_mrope:
             positions = self.mrope_positions[:, token_indices_to_sample]
@@ -705,8 +805,15 @@ class SpecDecodeBaseProposer:
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
 
+        mtp_draft_full_cudagraph = (
+            self.method == "mtp"
+            and os.environ.get("VLLM_OSCAR_MTP_DRAFT_FULL_CUDAGRAPH", "0") == "1"
+        )
         cudagraph_runtime_mode, input_batch_size, batch_size_across_dp = (
-            self._determine_batch_execution_and_padding(batch_size)
+            self._determine_batch_execution_and_padding(
+                batch_size,
+                uniform_decode=mtp_draft_full_cudagraph,
+            )
         )
 
         common_attn_metadata.num_actual_tokens = batch_size
@@ -726,9 +833,21 @@ class SpecDecodeBaseProposer:
             common_attn_metadata._seq_lens_cpu = None
             common_attn_metadata._num_computed_tokens_cpu = None
 
+        if (
+            mtp_draft_full_cudagraph
+            and os.environ.get("VLLM_OSCAR_MTP_DRAFT_INT2", "0") == "1"
+            and cudagraph_runtime_mode == CUDAGraphMode.FULL
+        ):
+            self._bind_oscar_mtp_draft_graph_metadata(
+                common_attn_metadata,
+                input_batch_size,
+            )
+
         block_size = self.block_size
         assert block_size > 0, "block_size has not been initialized."
-        for token_index in range(self.num_speculative_tokens - 1):
+        for token_index in range(num_speculative_tokens - 1):
+            if self._oscar_mtp_stop_after_current_draft:
+                break
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
@@ -1019,6 +1138,104 @@ class SpecDecodeBaseProposer:
                 per_layer_attn_metadata[layer_name] = attn_metadata
         return per_group_attn_metadata, per_layer_attn_metadata
 
+    def _remember_oscar_mtp_draft_graph_metadata(
+        self,
+        input_batch_size: int,
+        per_layer_attn_metadata: dict[str, object],
+    ) -> None:
+        for metadata in per_layer_attn_metadata.values():
+            oscar_mla = getattr(metadata, "oscar_mla", None)
+            if oscar_mla is not None:
+                capture_metadata = getattr(
+                    self,
+                    "_oscar_mtp_draft_graph_capture_metadata",
+                    None,
+                )
+                if capture_metadata is None:
+                    capture_metadata = {}
+                    self._oscar_mtp_draft_graph_capture_metadata = capture_metadata
+                capture_metadata[input_batch_size] = oscar_mla
+                return
+
+    def _bind_oscar_mtp_draft_graph_metadata(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        input_batch_size: int,
+    ) -> None:
+        runtime_oscar = common_attn_metadata.oscar_mla
+        if runtime_oscar is None:
+            return
+        captured_oscar = self._oscar_mtp_draft_graph_capture_metadata.get(
+            input_batch_size
+        )
+        if captured_oscar is None:
+            raise RuntimeError(
+                "OSCAR MTP draft FULL cudagraph runtime has no capture-bound "
+                f"metadata for batch size {input_batch_size}"
+            )
+        if captured_oscar is runtime_oscar:
+            return
+
+        def _copy_vector(name: str, padding_value: int) -> None:
+            source = getattr(runtime_oscar, name)
+            target = getattr(captured_oscar, name)
+            if source.ndim != 1 or target.ndim != 1:
+                raise RuntimeError(f"OSCAR MTP {name} must be one-dimensional")
+            if source.numel() > target.numel():
+                raise RuntimeError(f"OSCAR MTP runtime {name} exceeds capture capacity")
+            if source.dtype != target.dtype or source.device != target.device:
+                raise RuntimeError(
+                    f"OSCAR MTP runtime {name} does not match capture storage"
+                )
+            if source.data_ptr() == target.data_ptr():
+                if source.shape == target.shape:
+                    return
+                source = source.clone()
+            target.fill_(padding_value)
+            target[: source.numel()].copy_(source)
+
+        _copy_vector("hp_rows", -1)
+        _copy_vector("decode_positions", -1)
+        _copy_vector("final_seq_lens", 0)
+        _copy_vector("previous_seq_lens", 0)
+
+        source_history = runtime_oscar.history_page_table
+        target_history = captured_oscar.history_page_table
+        if source_history.ndim != 2 or target_history.ndim != 2:
+            raise RuntimeError("OSCAR MTP history page tables must be two-dimensional")
+        if any(
+            source_size > target_size
+            for source_size, target_size in zip(
+                source_history.shape,
+                target_history.shape,
+            )
+        ):
+            raise RuntimeError(
+                "OSCAR MTP runtime history page table exceeds capture capacity"
+            )
+        if (
+            source_history.dtype != target_history.dtype
+            or source_history.device != target_history.device
+        ):
+            raise RuntimeError(
+                "OSCAR MTP runtime history page table does not match capture storage"
+            )
+        if source_history.data_ptr() != target_history.data_ptr():
+            target_history.zero_()
+            target_history[
+                : source_history.shape[0],
+                : source_history.shape[1],
+            ].copy_(source_history)
+        elif source_history.shape != target_history.shape:
+            source_history = source_history.clone()
+            target_history.zero_()
+            target_history[
+                : source_history.shape[0],
+                : source_history.shape[1],
+            ].copy_(source_history)
+
+        common_attn_metadata.oscar_mla = captured_oscar
+
     def model_returns_tuple(self) -> bool:
         if self.method == "mtp":
             # GLM-5.2's speculative setup rewrites the draft architecture to
@@ -1170,6 +1387,7 @@ class SpecDecodeBaseProposer:
             max_seq_len=common_attn_metadata.max_seq_len,
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping[:total_num_tokens],
+            oscar_mla=common_attn_metadata.oscar_mla,
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
         )
@@ -1453,6 +1671,7 @@ class SpecDecodeBaseProposer:
             max_seq_len=new_seq_lens_cpu.max().item(),
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping[token_indices],
+            oscar_mla=common_attn_metadata.oscar_mla,
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
         )
@@ -1577,6 +1796,31 @@ class SpecDecodeBaseProposer:
                 )
             else:
                 self.parallel_drafting_hidden_state_tensor.copy_(flat_mask)
+
+        self._maybe_wrap_oscar_mtp_draft_full_cudagraph()
+
+    def _maybe_wrap_oscar_mtp_draft_full_cudagraph(self) -> None:
+        cudagraph_mode = self.vllm_config.compilation_config.cudagraph_mode
+        if (
+            self.method != "mtp"
+            or os.environ.get("VLLM_OSCAR_MTP_DRAFT_FULL_CUDAGRAPH", "0") != "1"
+            or self.speculative_config.enforce_eager
+            or cudagraph_mode is None
+            or not cudagraph_mode.has_full_cudagraphs()
+            or self.vllm_config.parallel_config.use_ubatching
+            or isinstance(self.model, CUDAGraphWrapper)
+        ):
+            return
+
+        self.model = CUDAGraphWrapper(
+            self.model,
+            self.vllm_config,
+            runtime_mode=CUDAGraphMode.FULL,
+            cudagraph_options=CUDAGraphOptions(
+                weak_ref_output=False,
+                strong_ref_entry_output=True,
+            ),
+        )
 
     def _maybe_share_embeddings(self, target_language_model: nn.Module) -> None:
         """
@@ -1748,17 +1992,118 @@ class SpecDecodeBaseProposer:
         use_cudagraphs: bool = True,
         is_graph_capturing: bool = False,
         slot_mappings: dict[str, torch.Tensor] | None = None,
+        common_attn_metadata: CommonAttentionMetadata | None = None,
     ) -> None:
         # FIXME: when using tree-based specdec, adjust number of forward-passes
         # according to the depth of the tree.
-        only_one_forward_pass = is_graph_capturing or self.parallel_drafting
-        for fwd_idx in range(
-            1 if only_one_forward_pass else self.num_speculative_tokens
-        ):
-            if fwd_idx <= 1:
+        capture_mtp_draft_full_cudagraph = (
+            is_graph_capturing
+            and use_cudagraphs
+            and self.method == "mtp"
+            and os.environ.get("VLLM_OSCAR_MTP_DRAFT_FULL_CUDAGRAPH", "0") == "1"
+        )
+        only_one_forward_pass = (
+            is_graph_capturing and not capture_mtp_draft_full_cudagraph
+        ) or self.parallel_drafting
+        num_forward_passes = 1 if only_one_forward_pass else self.num_speculative_tokens
+        if capture_mtp_draft_full_cudagraph:
+            assert common_attn_metadata is not None, (
+                "MTP draft FULL cudagraph capture requires attention metadata"
+            )
+            draft_capture_sizes = self._oscar_mtp_draft_decode_capture_sizes
+            if not draft_capture_sizes:
+                draft_capture_sizes = (common_attn_metadata.batch_size(),)
+            capture_batch_size = common_attn_metadata.batch_size()
+            captured_sizes = getattr(
+                self,
+                "_oscar_mtp_draft_graph_capture_metadata",
+                {},
+            )
+            draft_capture_sizes = tuple(
+                sorted(
+                    (
+                        size
+                        for size in draft_capture_sizes
+                        if size <= capture_batch_size and size not in captured_sizes
+                    ),
+                    reverse=True,
+                )
+            )
+            num_forward_passes = 1 + len(draft_capture_sizes)
+
+        for fwd_idx in range(num_forward_passes):
+            if capture_mtp_draft_full_cudagraph:
+                dispatch_num_tokens = (
+                    num_tokens if fwd_idx == 0 else draft_capture_sizes[fwd_idx - 1]
+                )
                 cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
                     self._determine_batch_execution_and_padding(
-                        num_tokens, use_cudagraphs=use_cudagraphs
+                        dispatch_num_tokens,
+                        use_cudagraphs=use_cudagraphs,
+                        uniform_decode=fwd_idx > 0,
+                    )
+                )
+            elif fwd_idx <= 1:
+                dispatch_num_tokens = num_tokens
+                cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
+                    self._determine_batch_execution_and_padding(
+                        dispatch_num_tokens,
+                        use_cudagraphs=use_cudagraphs,
+                        uniform_decode=False,
+                    )
+                )
+
+            if (
+                capture_mtp_draft_full_cudagraph
+                and self._share_mtp_indices
+                and hasattr(self.model.model, "set_skip_topk")
+            ):
+                # GLM-5.2 computes sparse indices on the first MTP pass and
+                # reuses them on later draft passes. Freeze each FULL graph
+                # with the same branch state used by real requests.
+                self.model.model.set_skip_topk(fwd_idx > 0)
+
+            per_layer_attn_metadata = None
+            if capture_mtp_draft_full_cudagraph:
+                assert common_attn_metadata is not None
+                capture_common_attn_metadata = common_attn_metadata
+                if fwd_idx > 0:
+                    batch_size = draft_capture_sizes[fwd_idx - 1]
+                    assert num_input_tokens == batch_size
+                    capture_oscar_mla = common_attn_metadata.oscar_mla
+                    if capture_oscar_mla is not None:
+                        capture_oscar_mla = replace(
+                            capture_oscar_mla,
+                            hp_rows=capture_oscar_mla.hp_rows[:batch_size],
+                            decode_positions=capture_oscar_mla.decode_positions[
+                                :batch_size
+                            ],
+                            final_seq_lens=capture_oscar_mla.final_seq_lens[
+                                :batch_size
+                            ],
+                            history_page_table=capture_oscar_mla.history_page_table[
+                                :batch_size
+                            ],
+                            previous_seq_lens=capture_oscar_mla.previous_seq_lens[
+                                :batch_size
+                            ],
+                        )
+                    capture_common_attn_metadata = common_attn_metadata.unpadded(
+                        batch_size,
+                        batch_size,
+                    ).replace(
+                        oscar_mla=capture_oscar_mla,
+                        max_query_len=1,
+                        query_start_loc=self.arange[: batch_size + 1],
+                        query_start_loc_cpu=torch.from_numpy(
+                            self.token_arange_np[: batch_size + 1]
+                        ).clone(),
+                        slot_mapping=self._slot_mapping_buffer[:batch_size],
+                    )
+                _, per_layer_attn_metadata = (
+                    self.build_per_group_and_layer_attn_metadata(
+                        capture_common_attn_metadata,
+                        draft_index=min(fwd_idx, 1),
                     )
                 )
 
@@ -1772,28 +2117,57 @@ class SpecDecodeBaseProposer:
             else:
                 slot_mapping_dict = slot_mappings or {}
 
+            if self.supports_mm_inputs:
+                input_ids = None
+                inputs_embeds = self.inputs_embeds[:num_input_tokens]
+            else:
+                input_ids = self.input_ids[:num_input_tokens]
+                inputs_embeds = None
+
+            kwargs = dict(
+                input_ids=input_ids,
+                positions=self._get_positions(num_input_tokens),
+                inputs_embeds=inputs_embeds,
+            )
+            if self.pass_hidden_states_to_model:
+                kwargs["hidden_states"] = self.hidden_states[:num_input_tokens]
+
+            if (
+                capture_mtp_draft_full_cudagraph
+                and fwd_idx > 0
+                and os.environ.get("VLLM_USE_NCCL_SYMM_MEM", "0") == "1"
+            ):
+                # NCCL symmetric-memory buffers must be allocated and their
+                # communication windows registered before CUDA graph capture.
+                # An eager pass with the exact draft shape lets the memory pool
+                # reuse those registered segments during the following capture.
+                with set_forward_context(
+                    per_layer_attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_input_tokens,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                    slot_mapping=slot_mapping_dict,
+                ):
+                    self.model(**kwargs)
+
             with set_forward_context(
-                None,
+                per_layer_attn_metadata,
                 self.vllm_config,
                 num_tokens=num_input_tokens,
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=slot_mapping_dict,
             ):
-                if self.supports_mm_inputs:
-                    input_ids = None
-                    inputs_embeds = self.inputs_embeds[:num_input_tokens]
-                else:
-                    input_ids = self.input_ids[:num_input_tokens]
-                    inputs_embeds = None
-
-                kwargs = dict(
-                    input_ids=input_ids,
-                    positions=self._get_positions(num_input_tokens),
-                    inputs_embeds=inputs_embeds,
-                )
-                if self.pass_hidden_states_to_model:
-                    kwargs["hidden_states"] = self.hidden_states[:num_input_tokens]
+                if (
+                    capture_mtp_draft_full_cudagraph
+                    and os.environ.get("VLLM_OSCAR_MTP_DRAFT_INT2", "0") == "1"
+                    and fwd_idx > 0
+                ):
+                    self._remember_oscar_mtp_draft_graph_metadata(
+                        num_input_tokens,
+                        per_layer_attn_metadata or {},
+                    )
                 self.model(**kwargs)
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
@@ -1901,9 +2275,11 @@ class SpecDecodeBaseProposer:
         self,
         num_tokens: int,
         use_cudagraphs: bool = True,
+        uniform_decode: bool = False,
     ) -> tuple[CUDAGraphMode, int, torch.Tensor | None]:
         cudagraph_mode, batch_desc = self.cudagraph_dispatcher.dispatch(
             num_tokens,
+            uniform_decode=uniform_decode,
             valid_modes=({CUDAGraphMode.NONE} if not use_cudagraphs else None),
         )
         num_tokens_padded = batch_desc.num_tokens
@@ -1932,6 +2308,7 @@ class SpecDecodeBaseProposer:
                 # batch_descriptor
                 cudagraph_mode, batch_desc = self.cudagraph_dispatcher.dispatch(
                     num_tokens_padded,
+                    uniform_decode=uniform_decode,
                     valid_modes={CUDAGraphMode(synced_cudagraph_mode)},
                 )
                 # Assert to make sure the agreed upon token count is correct
