@@ -1480,9 +1480,9 @@ def _validate_attention_inputs(
 def _prefill_head_block_size(num_heads: int) -> int:
     if num_heads <= 0:
         raise ValueError("num_heads must be positive")
-    if num_heads <= 8:
-        return 8
-    return 16 if num_heads <= 16 else 32
+    # The production-proven SM80 kernel groups eight heads. Larger groups can
+    # exceed shared memory or fault for PP8/TP2's 32 local heads, so tile them.
+    return 8
 
 
 _grouped_h4_score_workspace_cache: dict[tuple[str, int | None], torch.Tensor] = {}
@@ -1824,7 +1824,8 @@ def _oscar_mla_sparse_attention(
         "num_splits": num_splits,
         "packed_group_bytes": packed_group_bytes,
     }
-    if group_prefill_heads and num_splits == 1:
+    use_grouped_prefill = group_prefill_heads and num_splits == 1
+    if use_grouped_prefill:
         block_h = _prefill_head_block_size(num_heads)
         stage1 = _mixed_sparse_prefill_stage1
         stage1_grid = (num_queries, triton.cdiv(num_heads, block_h))
@@ -1912,7 +1913,7 @@ def _oscar_mla_sparse_attention(
             block_d=block_d,
             block_r=triton.next_power_of_2(rope.shape[2]),
             **stage1_extra,
-            num_warps=8 if group_prefill_heads and num_splits == 1 else 4,
+            num_warps=8 if use_grouped_prefill else 4,
             num_stages=1,
         )
 
@@ -2095,6 +2096,7 @@ def oscar_mla_sparse_prefill(
     output: torch.Tensor | None = None,
     output_lse: torch.Tensor | None = None,
     recent_tokens: int | None = None,
+    group_prefill_heads: bool = True,
     group_decode_h4: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Attend multi-token prefill queries with request mapping and causality."""
@@ -2125,6 +2127,6 @@ def oscar_mla_sparse_prefill(
         output=output,
         output_lse=output_lse,
         recent_tokens=recent_tokens,
-        group_prefill_heads=True,
+        group_prefill_heads=group_prefill_heads,
         group_decode_h4=group_decode_h4,
     )

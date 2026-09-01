@@ -423,12 +423,12 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
         if (
             self.kv_cache_dtype == "oscar_mla_int2"
             and self.topk_indices_buffer is not None
-            and self.num_heads == 8
             and self.topk_indices_buffer.shape[-1] == 2048
         ):
-            self._oscar_grouped_h4_score_workspace = prepare_grouped_h4_score_workspace(
-                self.topk_indices_buffer
-            )
+            if self.num_heads == 8:
+                self._oscar_grouped_h4_score_workspace = (
+                    prepare_grouped_h4_score_workspace(self.topk_indices_buffer)
+                )
             self._oscar_capability_major = torch.cuda.get_device_capability(
                 self.topk_indices_buffer.device
             )[0]
@@ -438,10 +438,11 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 )
                 self._oscar_bf16_materialization_workspace = (
                     prepare_oscar_bf16_materialization_workspace(
-                        self.topk_indices_buffer
+                        self.topk_indices_buffer,
+                        self.num_heads,
                     )
                 )
-                if _OSCAR_MTP_TEMPORAL_CACHE_ENABLED:
+                if _OSCAR_MTP_TEMPORAL_CACHE_ENABLED and self.num_heads == 8:
                     if _OSCAR_MTP_DIRECT_CACHE_ATTENTION_ENABLED:
                         self._oscar_mtp_temporal_cache = (
                             allocate_oscar_mtp_direct_attention_cache(
@@ -490,6 +491,10 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
             device=attn_metadata.seq_lens.device,
         )
         requests = attn_metadata.req_id_per_token[:num_tokens].long()
+        oscar = attn_metadata.oscar_mla
+        if oscar is not None and oscar.num_actual_tokens is not None:
+            query_starts = attn_metadata.query_start_loc[requests]
+            return oscar.previous_seq_lens[requests] + token_rows - query_starts
         query_ends = attn_metadata.query_start_loc[requests + 1]
         return attn_metadata.seq_lens[requests] - (query_ends - token_rows)
 
@@ -509,7 +514,16 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
             raise RuntimeError("oscar_mla_int2 attention metadata is missing")
         if not isinstance(kv_cache, OscarMLACacheTensors):
             raise TypeError("oscar_mla_int2 requires OSCAR MLA cache views")
-        num_tokens = attn_metadata.num_actual_tokens
+        is_mtp_target = (
+            attn_metadata.num_reqs == 1
+            and attn_metadata.base_seq_len > 0
+            and 1 < attn_metadata.max_query_len <= 6
+        )
+        num_tokens = (
+            attn_metadata.num_actual_tokens
+            if is_mtp_target or oscar.num_actual_tokens is None
+            else min(attn_metadata.num_actual_tokens, oscar.num_actual_tokens)
+        )
         latent = kv_c_normed[:num_tokens]
         rope_values = k_pe[:num_tokens]
         is_decode = (
@@ -517,10 +531,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
         )
         is_incremental_mtp_target = (
             not is_decode
-            and attn_metadata.num_reqs == 1
-            and attn_metadata.base_seq_len > 0
-            and attn_metadata.full_topk_start <= 0
-            and 1 < num_tokens <= 6
+            and is_mtp_target
             and attn_metadata.max_query_len == num_tokens
         )
         use_mtp_prefill_seed = (
@@ -547,8 +558,21 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
             token_hp_rows = oscar.hp_rows[:num_tokens]
         else:
             request_indices = attn_metadata.req_id_per_token[:num_tokens].long()
-            query_positions = self._oscar_query_positions(attn_metadata, num_tokens)
-            final_seq_lens = attn_metadata.seq_lens[request_indices]
+            query_positions = (
+                torch.arange(
+                    num_tokens,
+                    dtype=torch.int32,
+                    device=attn_metadata.seq_lens.device,
+                )
+                + attn_metadata.base_seq_len
+                if is_incremental_mtp_target
+                else self._oscar_query_positions(attn_metadata, num_tokens)
+            )
+            final_seq_lens = (
+                attn_metadata.seq_lens[request_indices]
+                if is_incremental_mtp_target
+                else oscar.final_seq_lens[request_indices]
+            )
             token_hp_rows = oscar.hp_rows[request_indices]
 
         oscar_mla_store_rope(
@@ -606,11 +630,14 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                     clip_ratio=clip_ratio,
                 )
             if self.oscar_write_calls == 0:
-                logger.info_once(
-                    "OSCAR MLA prefix-cache canonical INT2 writes active"
-                )
+                logger.info_once("OSCAR MLA prefix-cache canonical INT2 writes active")
 
         if oscar.demotion_positions.numel():
+            use_prequant_temporal_cache = (
+                _OSCAR_MTP_PREQUANT_DEMOTION_CACHE_ENABLED
+                and is_incremental_mtp_target
+                and self._oscar_mtp_temporal_cache is not None
+            )
             if self.oscar_demotion_calls == 0:
                 logger.info_once(
                     "OSCAR MLA recent-to-INT2 demotion active; first batch=%d tokens",
@@ -639,16 +666,10 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 ),
                 prequant_temporal_cache=(
                     self._oscar_mtp_temporal_cache
-                    if (
-                        _OSCAR_MTP_PREQUANT_DEMOTION_CACHE_ENABLED
-                        and is_incremental_mtp_target
-                    )
+                    if use_prequant_temporal_cache
                     else None
                 ),
-                temporal_two_way=(
-                    _OSCAR_MTP_PREQUANT_DEMOTION_CACHE_ENABLED
-                    and is_incremental_mtp_target
-                ),
+                temporal_two_way=use_prequant_temporal_cache,
             )
             if use_mtp_prefill_seed:
                 assert self._oscar_mtp_temporal_cache is not None
@@ -1090,7 +1111,18 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
             if oscar is None:
                 raise RuntimeError("oscar_mla_int2 attention metadata is missing")
             q_nope, q_pe = q
-            num_actual_toks = q_nope.shape[0]
+            is_mtp_target = (
+                attn_metadata.num_reqs == 1
+                and attn_metadata.base_seq_len > 0
+                and 1 < attn_metadata.max_query_len <= 6
+            )
+            num_actual_toks = (
+                q_nope.shape[0]
+                if is_mtp_target or oscar.num_actual_tokens is None
+                else min(q_nope.shape[0], oscar.num_actual_tokens)
+            )
+            q_nope = q_nope[:num_actual_toks]
+            q_pe = q_pe[:num_actual_toks]
             assert self.topk_indices_buffer is not None
             if oscar.num_restore_rows:
                 if self._oscar_bf16_materialization_workspace is None:
@@ -1125,23 +1157,29 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 attn_metadata.max_query_len == 1
                 and num_actual_toks == attn_metadata.num_reqs
             )
+            is_incremental_mtp_target = (
+                not is_decode
+                and is_mtp_target
+                and attn_metadata.max_query_len == num_actual_toks
+            )
+            oscar_max_seq_len = (
+                attn_metadata.max_seq_len
+                if is_incremental_mtp_target or oscar.max_seq_len is None
+                else oscar.max_seq_len
+            )
             topk_width = attn_metadata.topk_tokens
             if not is_decode:
-                topk_width = min(topk_width, attn_metadata.max_seq_len)
+                topk_width = min(topk_width, oscar_max_seq_len)
             use_selected_incremental_materialization = (
-                not is_decode
-                and attn_metadata.num_reqs == 1
-                and attn_metadata.base_seq_len > 0
+                is_incremental_mtp_target
                 and attn_metadata.full_topk_start <= 0
-                and 1 < num_actual_toks <= 6
-                and attn_metadata.max_query_len == num_actual_toks
                 and num_actual_toks * topk_width <= OSCAR_BF16_MATERIALIZATION_MAX_ROWS
             )
             use_mtp_temporal_materialization = (
                 use_selected_incremental_materialization
                 and self._oscar_mtp_temporal_cache is not None
                 and self._oscar_mtp_temporal_workspace is not None
-                and attn_metadata.max_seq_len <= OSCAR_MTP_TEMPORAL_MAX_POSITIONS
+                and oscar_max_seq_len <= OSCAR_MTP_TEMPORAL_MAX_POSITIONS
             )
             use_mtp_direct_cache_attention = (
                 use_mtp_temporal_materialization
@@ -1159,6 +1197,9 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
             )
             use_bf16_materialized_read = (
                 self._oscar_bf16_materialization_workspace is not None
+                and not (
+                    is_incremental_mtp_target and attn_metadata.full_topk_start > 0
+                )
                 and can_use_oscar_bf16_materialized_read(
                     capability_major=self._oscar_capability_major,
                     num_requests=attn_metadata.num_reqs,
@@ -1189,7 +1230,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 )
                 if (
                     use_selected_materialization
-                    or attn_metadata.max_seq_len <= OSCAR_BF16_MATERIALIZATION_MAX_ROWS
+                    or oscar_max_seq_len <= OSCAR_BF16_MATERIALIZATION_MAX_ROWS
                 ):
                     positions = (
                         selected.reshape(-1) if use_selected_materialization else None
@@ -1198,7 +1239,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                         materialized_rows = num_actual_toks * topk_width
                     else:
                         materialized_rows = (
-                            topk_width if is_decode else attn_metadata.max_seq_len
+                            topk_width if is_decode else oscar_max_seq_len
                         )
                     if use_mtp_temporal_materialization:
                         assert self._oscar_mtp_temporal_cache is not None
@@ -1333,6 +1374,14 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                             num_kv_splits=16 if use_selected_materialization else 1,
                             sm_count=self._sm_count,
                             assume_valid_indices=False,
+                            valid_index_base_seq_len=(
+                                attn_metadata.base_seq_len
+                                if (
+                                    is_incremental_mtp_target
+                                    and attn_metadata.full_topk_start > 0
+                                )
+                                else None
+                            ),
                             return_lse=True,
                         )
                     if use_mtp_direct_cache_attention:
@@ -1404,12 +1453,12 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                     lse = accumulated_lse[:num_actual_toks]
                     for row_offset in range(
                         0,
-                        attn_metadata.max_seq_len,
+                        oscar_max_seq_len,
                         OSCAR_BF16_MATERIALIZATION_MAX_ROWS,
                     ):
                         materialized_rows = min(
                             OSCAR_BF16_MATERIALIZATION_MAX_ROWS,
-                            attn_metadata.max_seq_len - row_offset,
+                            oscar_max_seq_len - row_offset,
                         )
                         kv, _ = materialize_oscar_mla_bf16_rows(
                             positions=None,
@@ -1455,6 +1504,14 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                             out=chunk_output_buffer,
                             lse_out=chunk_lse_buffer,
                             assume_valid_indices=False,
+                            valid_index_base_seq_len=(
+                                attn_metadata.base_seq_len
+                                if (
+                                    is_incremental_mtp_target
+                                    and attn_metadata.full_topk_start > 0
+                                )
+                                else None
+                            ),
                             return_lse=True,
                         )
                         restore_oscar_topk_after_chunk(selected, saved_indices)
@@ -1477,34 +1534,53 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                     if self.need_to_return_lse_for_decode
                     else (output, None)
                 )
-            query_positions = self._oscar_query_positions(
-                attn_metadata,
-                num_actual_toks,
+            query_positions = (
+                torch.arange(
+                    num_actual_toks,
+                    dtype=torch.int32,
+                    device=attn_metadata.seq_lens.device,
+                )
+                + attn_metadata.base_seq_len
+                if is_incremental_mtp_target
+                else self._oscar_query_positions(
+                    attn_metadata,
+                    num_actual_toks,
+                )
             )
-            output, lse = oscar_mla_sparse_prefill(
-                q_nope,
-                q_pe,
-                self.topk_indices_buffer[:num_actual_toks, :topk_width],
-                attn_metadata.req_id_per_token[:num_actual_toks],
-                query_positions,
-                kv_c_and_k_pe_cache.prefix,
-                kv_c_and_k_pe_cache.recent,
-                kv_c_and_k_pe_cache.rope,
-                attn_metadata.block_table,
-                kv_c_and_k_pe_cache.history_data,
-                kv_c_and_k_pe_cache.history_scale,
-                kv_c_and_k_pe_cache.history_zero,
-                oscar.history_page_table,
-                oscar.hp_rows,
-                attn_metadata.seq_lens,
-                layer._oscar_rotation,
-                inverse_rotation=layer._oscar_inverse_rotation,
-                attention_scale=self.softmax_scale,
-                num_splits=16 if is_decode else 1,
-                recent_tokens=read_recent_tokens,
-                score_workspace=self._oscar_grouped_h4_score_workspace,
-                group_decode_h4=is_decode,
+            mixed_seq_lens = (
+                attn_metadata.seq_lens
+                if is_incremental_mtp_target
+                else oscar.final_seq_lens
             )
+
+            def _run_mixed_attention(item: slice) -> tuple[torch.Tensor, torch.Tensor]:
+                return oscar_mla_sparse_prefill(
+                    q_nope[item],
+                    q_pe[item],
+                    self.topk_indices_buffer[item, :topk_width],
+                    attn_metadata.req_id_per_token[item],
+                    query_positions[item],
+                    kv_c_and_k_pe_cache.prefix,
+                    kv_c_and_k_pe_cache.recent,
+                    kv_c_and_k_pe_cache.rope,
+                    attn_metadata.block_table,
+                    kv_c_and_k_pe_cache.history_data,
+                    kv_c_and_k_pe_cache.history_scale,
+                    kv_c_and_k_pe_cache.history_zero,
+                    oscar.history_page_table,
+                    oscar.hp_rows,
+                    mixed_seq_lens,
+                    layer._oscar_rotation,
+                    inverse_rotation=layer._oscar_inverse_rotation,
+                    attention_scale=self.softmax_scale,
+                    num_splits=16 if is_decode else 1,
+                    recent_tokens=read_recent_tokens,
+                    group_prefill_heads=not is_incremental_mtp_target,
+                    score_workspace=self._oscar_grouped_h4_score_workspace,
+                    group_decode_h4=is_decode,
+                )
+
+            output, lse = _run_mixed_attention(slice(0, num_actual_toks))
             if self.oscar_read_calls == 0:
                 logger.info_once(
                     "OSCAR MLA DSA-selected mixed prefix/recent/INT2 read active"

@@ -1857,8 +1857,6 @@ class VllmConfig:
             unsupported.append("prefill context parallelism")
         if self.parallel_config.enable_dbo:
             unsupported.append("dual batch overlap")
-        if self.scheduler_config.async_scheduling:
-            unsupported.append("asynchronous scheduling")
         if self.kv_transfer_config is not None:
             unsupported.append("KV transfer")
         if self.cache_config.kv_offloading_size is not None:

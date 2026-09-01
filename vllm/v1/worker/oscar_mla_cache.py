@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -45,6 +45,8 @@ class OscarMLABatchMetadata:
     demotion_positions: torch.Tensor
     demotion_page_ids: torch.Tensor
     demotion_page_offsets: torch.Tensor
+    num_actual_tokens: int | None = None
+    max_seq_len: int | None = None
     restore_positions: torch.Tensor = field(
         default_factory=lambda: torch.empty(0, dtype=torch.int32)
     )
@@ -216,6 +218,7 @@ class OscarMLAWorkerOwnership:
         padded_size: int | None = None,
         cudagraph_max_history_pages: int | None = None,
         max_demotion_tokens_per_request: int = 1,
+        num_actual_tokens: int | None = None,
     ) -> OscarMLABatchMetadata:
         """Materialize scheduler ownership and incremental demotions on a device."""
         if recent_capacity_tokens is None:
@@ -231,6 +234,8 @@ class OscarMLAWorkerOwnership:
             padded_size = len(request_ids)
         if padded_size < len(request_ids):
             raise ValueError("padded_size cannot be smaller than the request batch")
+        if num_actual_tokens is not None and num_actual_tokens < 0:
+            raise ValueError("num_actual_tokens cannot be negative")
         if max_demotion_tokens_per_request <= 0:
             raise ValueError("max demotion tokens per request must be positive")
 
@@ -255,6 +260,9 @@ class OscarMLAWorkerOwnership:
                 )
             )
             metadata_rows.append(metadata)
+        max_seq_len = max(
+            (metadata.logical_length for metadata in metadata_rows), default=0
+        )
 
         actual_max_history_pages = max(
             [1, *(len(metadata.history_pages) for metadata in metadata_rows)]
@@ -338,6 +346,8 @@ class OscarMLAWorkerOwnership:
                 demotion_positions=_device_tensor(demotion_positions),
                 demotion_page_ids=_device_tensor(demotion_pages),
                 demotion_page_offsets=_device_tensor(demotion_offsets),
+                num_actual_tokens=num_actual_tokens,
+                max_seq_len=max_seq_len,
                 restore_positions=_device_tensor(restore_positions),
                 restore_hp_rows=_device_tensor(restore_hp_rows),
                 restore_page_ids=_device_tensor(restore_pages),
@@ -435,7 +445,11 @@ class OscarMLAWorkerOwnership:
         )
         if restore_positions:
             raise RuntimeError("OSCAR MLA cache-hit restore cannot run in a CUDA graph")
-        return graph_metadata
+        return replace(
+            graph_metadata,
+            num_actual_tokens=num_actual_tokens,
+            max_seq_len=max_seq_len,
+        )
 
     def get(self, request_id: str) -> WorkerCacheMetadata:
         return self._metadata[request_id]

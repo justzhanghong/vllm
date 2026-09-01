@@ -2780,12 +2780,14 @@ class GPUModelRunner(
                     max_history_pages if use_oscar_cudagraph_metadata else None
                 ),
                 max_demotion_tokens_per_request=(oscar_spec.speculative_tokens + 1),
+                num_actual_tokens=num_tokens,
             )
         cm_base_attn = cm_base
 
         should_pad_prefill_metadata = (
             self.prefill_shape_bucket_enabled
             and self.prefill_shape_bucket_pad_metadata
+            and self.cache_config.cache_dtype != "oscar_mla_int2"
             and not for_cudagraph_capture
             and num_tokens_padded > num_tokens
             and max_query_len > self.uniform_decode_query_len

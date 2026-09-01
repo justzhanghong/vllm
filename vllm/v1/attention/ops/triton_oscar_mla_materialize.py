@@ -19,7 +19,7 @@ OSCAR_MTP_DIRECT_CACHE_ATTENTION_CAPACITY = 32768
 OSCAR_MTP_TEMPORAL_MAX_POSITIONS = 65536
 OSCAR_MTP_TEMPORAL_MAX_ROWS = 6 * 2048
 _workspace_cache: dict[
-    tuple[str, int | None],
+    tuple[str, int | None, int],
     tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1346,7 +1346,7 @@ def can_use_oscar_bf16_materialized_read(
     return (
         capability_major == 8
         and num_requests == 1
-        and num_heads == 8
+        and num_heads in (8, 16, 32)
         and latent_rank == 512
         and rope_head_size == 64
         and group_size == 128
@@ -1359,6 +1359,7 @@ def can_use_oscar_bf16_materialized_read(
 def allocate_oscar_bf16_materialization_workspace(
     reference: torch.Tensor,
     max_rows: int,
+    num_heads: int = 8,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1371,6 +1372,8 @@ def allocate_oscar_bf16_materialization_workspace(
     """Allocate the reusable BF16 dense materialization workspace."""
     if max_rows <= 0:
         raise ValueError("max_rows must be positive")
+    if num_heads <= 0:
+        raise ValueError("num_heads must be positive")
     if reference.ndim != 2 or reference.shape[1] != 2048:
         raise ValueError("C012 workspace requires a [max_tokens, 2048] reference")
     device = reference.device
@@ -1383,14 +1386,15 @@ def allocate_oscar_bf16_materialization_workspace(
         torch.empty((max_rows,), dtype=torch.uint8, device=device),
         torch.empty((max_rows, 576), dtype=torch.bfloat16, device=device),
         torch.empty((max_rows,), dtype=torch.int32, device=device),
-        torch.empty((max_tokens, 8, 512), dtype=torch.bfloat16, device=device),
-        torch.empty((max_tokens, 8), dtype=torch.float32, device=device),
-        torch.empty((max_tokens, 8), dtype=torch.float32, device=device),
+        torch.empty((max_tokens, num_heads, 512), dtype=torch.bfloat16, device=device),
+        torch.empty((max_tokens, num_heads), dtype=torch.float32, device=device),
+        torch.empty((max_tokens, num_heads), dtype=torch.float32, device=device),
     )
 
 
 def prepare_oscar_bf16_materialization_workspace(
     reference: torch.Tensor,
+    num_heads: int = 8,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1401,7 +1405,7 @@ def prepare_oscar_bf16_materialization_workspace(
     torch.Tensor,
 ]:
     """Return the single C012 workspace shared by all layers on one device."""
-    key = (reference.device.type, reference.device.index)
+    key = (reference.device.type, reference.device.index, num_heads)
     workspace = _workspace_cache.get(key)
     if workspace is not None:
         return workspace
@@ -1412,6 +1416,7 @@ def prepare_oscar_bf16_materialization_workspace(
     workspace = allocate_oscar_bf16_materialization_workspace(
         reference,
         OSCAR_BF16_MATERIALIZATION_MAX_ROWS,
+        num_heads,
     )
     _workspace_cache[key] = workspace
     return workspace
@@ -2538,8 +2543,8 @@ def merge_oscar_chunked_attention_states(
     """Merge one BF16 partial state into `[tokens, heads]` natural-log LSE."""
     if output.shape != partial_output.shape or output.dtype != torch.bfloat16:
         raise ValueError("C012 partial outputs must have identical BF16 shapes")
-    if output.ndim != 3 or output.shape[1:] != (8, 512):
-        raise ValueError("C012 partial output must be [tokens, 8, 512]")
+    if output.ndim != 3 or output.shape[1] <= 0 or output.shape[2] != 512:
+        raise ValueError("C012 partial output must be [tokens, heads, 512]")
     expected_lse_shape = output.shape[:2]
     if (
         output_lse.shape != expected_lse_shape
@@ -2547,7 +2552,7 @@ def merge_oscar_chunked_attention_states(
         or output_lse.dtype != torch.float32
         or partial_lse.dtype != torch.float32
     ):
-        raise ValueError("C012 LSE buffers must be FP32 [tokens, 8]")
+        raise ValueError("C012 LSE buffers must be FP32 [tokens, heads]")
     tensors = (output, output_lse, partial_output, partial_lse)
     if any(not tensor.is_contiguous() for tensor in tensors):
         raise ValueError("C012 merge buffers must be contiguous")
@@ -2559,7 +2564,7 @@ def merge_oscar_chunked_attention_states(
         partial_output,
         partial_lse,
         output.shape[0],
-        num_heads=8,
+        num_heads=output.shape[1],
         head_size=512,
         block_d=512,
         num_warps=4,

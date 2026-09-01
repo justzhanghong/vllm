@@ -1743,19 +1743,14 @@ def get_kv_cache_configs(
         any(isinstance(spec, OscarMLAAttentionSpec) for spec in worker_spec.values())
         for worker_spec in kv_cache_specs
     ]
-    planning_memory = available_memory
     if any(has_oscar_mla):
         assert all(has_oscar_mla), (
             "OSCAR MLA cannot be mixed with native cache configs across workers"
         )
-        # The three-pool plan has several fields derived from the memory budget.
-        # Recompute every worker from the limiting budget instead of shrinking
-        # only num_blocks after the plans have diverged.
-        planning_memory = [min(available_memory)] * len(available_memory)
 
     kv_cache_configs: list[KVCacheConfig] = []
     for projected_groups, kv_cache_spec_one_worker, available_memory_one_worker in zip(
-        projected_groups_per_worker, kv_cache_specs, planning_memory
+        projected_groups_per_worker, kv_cache_specs, available_memory
     ):
         assert sum(len(group.layer_names) for group in projected_groups) == len(
             kv_cache_spec_one_worker
@@ -1781,16 +1776,36 @@ def get_kv_cache_configs(
         assert len(oscar_mla_configs) == len(kv_cache_configs), (
             "OSCAR MLA cannot be mixed with native cache configs across workers"
         )
-        assert all(
-            config.num_blocks == min_num_blocks for config in oscar_mla_configs
-        ), "OSCAR MLA requires identical three-pool plans across workers"
 
     for kv_cache_config in kv_cache_configs:
         num_blocks_old = kv_cache_config.num_blocks
         kv_cache_config.num_blocks = min_num_blocks
 
         # Shrink tensor size proportionally
-        if kv_cache_config.oscar_mla_max_num_seqs is None:
+        if kv_cache_config.oscar_mla_max_num_seqs is not None:
+            assert len(kv_cache_config.kv_cache_groups) == 1
+            group = kv_cache_config.kv_cache_groups[0]
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
+                per_layer_specs = group.kv_cache_spec.kv_cache_specs
+            else:
+                assert isinstance(group.kv_cache_spec, OscarMLAAttentionSpec)
+                per_layer_specs = {
+                    layer_name: group.kv_cache_spec for layer_name in group.layer_names
+                }
+            max_num_seqs = kv_cache_config.oscar_mla_max_num_seqs
+            for tensor, layer_name in zip(
+                kv_cache_config.kv_cache_tensors, group.layer_names, strict=True
+            ):
+                layer_spec = per_layer_specs[layer_name]
+                tensor.size = layer_spec.page_size_bytes * min_num_blocks
+                if isinstance(layer_spec, OscarMLAAttentionSpec):
+                    tensor.size += (
+                        max_num_seqs
+                        * (layer_spec.prefix_tokens + layer_spec.recent_capacity_tokens)
+                        * layer_spec.bf16_token_size_bytes
+                    )
+            kv_cache_config.oscar_mla_history_pages = min_num_blocks
+        else:
             for tensor in kv_cache_config.kv_cache_tensors:
                 assert tensor.size % num_blocks_old == 0
                 tensor.size = tensor.size // num_blocks_old * min_num_blocks
