@@ -9,6 +9,7 @@ import torch
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,

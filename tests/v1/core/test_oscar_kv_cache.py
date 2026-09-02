@@ -23,10 +23,8 @@ from vllm.v1.core.single_type_kv_cache_manager import OscarKVCacheManager
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
-    KVCacheSpecKind,
     KVQuantMode,
     OscarKVCacheSpec,
-    get_kv_cache_spec_kind,
 )
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
@@ -69,7 +67,6 @@ def test_oscar_spec_exposes_both_pool_page_sizes() -> None:
     assert spec.flush_interval == 8
     assert spec.recent_row_capacity == 272
     assert spec.max_memory_usage_bytes(config) == 512 * spec.page_size_bytes
-    assert get_kv_cache_spec_kind(spec) == KVCacheSpecKind.OSCAR
 
 
 def test_oscar_spec_merge_rejects_different_geometry() -> None:
@@ -385,7 +382,6 @@ def test_oscar_manager_owns_and_reuses_hp_rows_with_quant_blocks() -> None:
         block_pool=block_pool,
         enable_caching=False,
         kv_cache_group_id=0,
-        scheduler_block_size=spec.block_size,
         max_num_seqs=2,
     )
 
@@ -412,7 +408,6 @@ def test_oscar_prefix_hit_stops_before_request_owned_recent() -> None:
         block_pool=block_pool,
         enable_caching=True,
         kv_cache_group_id=0,
-        scheduler_block_size=spec.block_size,
         max_num_seqs=1,
     )
     source, branch = create_requests(
@@ -464,7 +459,6 @@ def test_oscar_prefix_hit_waits_for_materialization_barrier() -> None:
         block_pool=block_pool,
         enable_caching=True,
         kv_cache_group_id=0,
-        scheduler_block_size=spec.block_size,
         max_num_seqs=1,
     )
     source, branch = create_requests(
@@ -511,7 +505,6 @@ def test_oscar_prefix_pages_follow_quant_block_lru_eviction() -> None:
         block_pool=block_pool,
         enable_caching=True,
         kv_cache_group_id=0,
-        scheduler_block_size=spec.block_size,
         max_num_seqs=1,
     )
     old, new = create_requests(
@@ -548,7 +541,6 @@ def test_oscar_prefix_eviction_discards_pending_readiness() -> None:
         block_pool=block_pool,
         enable_caching=True,
         kv_cache_group_id=0,
-        scheduler_block_size=spec.block_size,
         max_num_seqs=1,
     )
     old, new = create_requests(
@@ -583,7 +575,6 @@ def test_oscar_prefix_hit_shares_pages_but_recomputes_recent() -> None:
         block_pool=block_pool,
         enable_caching=True,
         kv_cache_group_id=0,
-        scheduler_block_size=spec.block_size,
         max_num_seqs=2,
     )
     source, branch = create_requests(
@@ -608,7 +599,7 @@ def test_oscar_prefix_hit_shares_pages_but_recomputes_recent() -> None:
     )[0]
     assert len(hit) == 16
 
-    manager.add_local_computed_blocks("branch", hit, 256, 0)
+    manager.allocate_new_computed_blocks("branch", hit, 256, 0)
     manager.allocate_new_blocks("branch", 512, 512)
     assert manager.get_shared_hit_tokens("branch") == 256
     assert manager.get_prefix_page_ids("branch") == manager.get_prefix_page_ids(
@@ -635,7 +626,6 @@ def test_oscar_extra_prefix_pages_delay_lru_eviction_and_reset() -> None:
         block_pool=block_pool,
         enable_caching=True,
         kv_cache_group_id=0,
-        scheduler_block_size=spec.block_size,
         max_num_seqs=1,
     )
     old, new = create_requests(
@@ -681,8 +671,6 @@ def test_scheduler_preemption_releases_and_reuses_oscar_hp_rows() -> None:
     scheduler.kv_cache_manager = KVCacheManager(
         kv_cache_config=kv_cache_config,
         max_model_len=100,
-        max_num_batched_tokens=100,
-        scheduler_block_size=spec.block_size,
         hash_block_size=spec.block_size,
         enable_caching=False,
         log_stats=True,

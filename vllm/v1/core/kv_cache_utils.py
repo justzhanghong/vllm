@@ -1898,6 +1898,24 @@ def get_kv_cache_configs(
                         * layer_spec.bf16_token_size_bytes
                     )
             kv_cache_config.oscar_mla_history_pages = min_num_blocks
+        elif kv_cache_config.oscar_max_num_seqs is not None:
+            assert len(kv_cache_config.kv_cache_groups) == 1
+            group = kv_cache_config.kv_cache_groups[0]
+            assert isinstance(group.kv_cache_spec, OscarKVCacheSpec)
+            spec = group.kv_cache_spec
+            max_num_seqs = kv_cache_config.oscar_max_num_seqs
+            prefix_pages = max_num_seqs * (
+                spec.prefix_tokens // spec.block_size
+            ) + cdiv(spec.prefix_cache_extra_tokens, spec.block_size)
+            recent_pages = max_num_seqs * (
+                spec.recent_row_capacity // spec.block_size
+            )
+            fixed_hp_bytes = (
+                prefix_pages + recent_pages
+            ) * spec.hp_page_size_bytes
+            per_layer_size = min_num_blocks * spec.page_size_bytes + fixed_hp_bytes
+            for tensor in kv_cache_config.kv_cache_tensors:
+                tensor.size = per_layer_size
         else:
             for tensor in kv_cache_config.kv_cache_tensors:
                 assert tensor.size % num_blocks_old == 0

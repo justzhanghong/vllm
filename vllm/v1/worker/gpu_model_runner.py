@@ -156,6 +156,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
+    KVQuantMode,
     MambaSpec,
     OscarKVCacheSpec,
     OscarMLAAttentionSpec,
@@ -2860,16 +2861,7 @@ class GPUModelRunner(
                 else None
             ),
         )
-        if len(kv_cache_groups) == 1 and isinstance(
-            kv_cache_groups[0].kv_cache_spec, OscarKVCacheSpec
-        ):
-            minimal_config = get_kv_cache_config_from_groups(
-                self.vllm_config,
-                kv_cache_groups,
-                available_memory=0,
-                oscar_profiling_quant_pages=min_blocks,
-            )
-        elif self.cache_config.cache_dtype == "oscar_mla_int2":
+        if self.cache_config.cache_dtype == "oscar_mla_int2":
             oscar_spec = next(
                 spec
                 for group in kv_cache_groups
@@ -8555,7 +8547,16 @@ class GPUModelRunner(
         )
         min_blocks = cdiv(max_capture_tokens, min_block_size)
 
-        if self.cache_config.cache_dtype == "oscar_mla_int2":
+        if len(kv_cache_groups) == 1 and isinstance(
+            kv_cache_groups[0].kv_cache_spec, OscarKVCacheSpec
+        ):
+            minimal_config = get_kv_cache_config_from_groups(
+                self.vllm_config,
+                kv_cache_groups,
+                available_memory=0,
+                oscar_profiling_quant_pages=min_blocks,
+            )
+        elif self.cache_config.cache_dtype == "oscar_mla_int2":
             oscar_fixed_bytes = sum(
                 self.max_num_reqs
                 * (spec.prefix_tokens + spec.recent_capacity_tokens)

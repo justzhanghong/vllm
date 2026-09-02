@@ -17,6 +17,7 @@ BF16 pools use stable request-owned rows supplied by the scheduler.
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -25,6 +26,7 @@ from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.oscar.config import OscarConfig
 from vllm.model_executor.layers.quantization.oscar.rotation import get_layer_rotation
+from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -76,6 +78,26 @@ logger = init_logger(__name__)
 _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
 if _HAS_FLASH_ATTN:
     from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
+
+
+def _token_to_req_indices(
+    common_attn_metadata: CommonAttentionMetadata,
+    buffer: torch.Tensor,
+) -> torch.Tensor:
+    """Build the per-token request mapping in a persistent device buffer."""
+    num_tokens = common_attn_metadata.num_actual_tokens
+    starts = np.asarray(common_attn_metadata.query_start_loc_cpu, dtype=np.int32)
+    query_lens = np.diff(starts)
+    mapped = np.repeat(np.arange(query_lens.shape[0], dtype=np.int32), query_lens)
+    num_mapped_tokens = mapped.shape[0]
+    assert buffer.shape[0] >= max(num_mapped_tokens, num_tokens)
+    source = torch.from_numpy(mapped)
+    if buffer.device.type != "cpu" and is_pin_memory_available():
+        source = source.pin_memory()
+    buffer[:num_mapped_tokens].copy_(source, non_blocking=True)
+    if num_mapped_tokens < num_tokens:
+        buffer[num_mapped_tokens:num_tokens].zero_()
+    return buffer[:num_tokens]
 
 
 def _materialize_token_capacity(
@@ -148,7 +170,7 @@ class OscarAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
-        return kv_cache_dtype is not None and kv_cache_dtype.startswith("oscar_")
+        return kv_cache_dtype == "oscar_int2"
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
@@ -295,7 +317,7 @@ class OscarMetadataBuilder(AttentionMetadataBuilder[OscarMetadata]):
             raise RuntimeError(
                 "OSCAR attention requires scheduler-owned shared hit lengths"
             )
-        token_to_req_indices = cam.token_to_req_indices(self.token_to_req_indices)
+        token_to_req_indices = _token_to_req_indices(cam, self.token_to_req_indices)
         num_reqs = cam.seq_lens.shape[0]
         torch.cumsum(
             cam.seq_lens,

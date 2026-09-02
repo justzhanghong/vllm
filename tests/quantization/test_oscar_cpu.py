@@ -24,7 +24,10 @@ from vllm.model_executor.layers.quantization.oscar.rotation import (
     get_layer_rotation,
 )
 from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
-from vllm.v1.attention.backends.oscar_attn import OscarMetadataBuilder
+from vllm.v1.attention.backends.oscar_attn import (
+    OscarAttentionBackend,
+    OscarMetadataBuilder,
+)
 from vllm.v1.attention.ops.oscar_cache_contract import (
     has_linear_oscar_arena_layout,
     validate_oscar_separated_arenas,
@@ -43,6 +46,13 @@ from vllm.v1.attention.ops.triton_oscar_bulk_flush import (
 
 
 class TestOscarConfigAndLayout(unittest.TestCase):
+    def test_full_attention_backend_only_accepts_full_oscar_dtype(self):
+        self.assertTrue(OscarAttentionBackend.supports_kv_cache_dtype("oscar_int2"))
+        self.assertFalse(
+            OscarAttentionBackend.supports_kv_cache_dtype("oscar_mla_int2")
+        )
+        self.assertFalse(OscarAttentionBackend.supports_kv_cache_dtype("auto"))
+
     def test_bulk_flush_plan_crosses_noncontiguous_pages(self):
         block_table = torch.tensor([[7, 2, 11, 5]], dtype=torch.int32)
         plan = build_oscar_bulk_flush_plan_cpu(
@@ -343,6 +353,7 @@ class TestOscarConfigAndLayout(unittest.TestCase):
                 decode_context_parallel_size=1,
                 tensor_parallel_size=1,
                 pipeline_parallel_size=1,
+                use_ubatching=False,
             ),
             speculative_config=None,
             kv_transfer_config=SimpleNamespace(kv_connector=None),
@@ -662,7 +673,7 @@ class TestOscarConfigAndLayout(unittest.TestCase):
         )
 
         for runner_cls, prepare_name, first_mutation in (
-            (ModularGPUModelRunner, "prepare_inputs", "update_pp_decode_requests"),
+            (ModularGPUModelRunner, "prepare_inputs", "finish_requests"),
             (LegacyGPUModelRunner, "_prepare_inputs", "execute_model_state"),
         ):
             execute_source = inspect.getsource(runner_cls.execute_model)
@@ -912,16 +923,9 @@ class TestOscarConfigAndLayout(unittest.TestCase):
                     blocks * block_size + logical % block_size
                 )
 
-        with (
-            patch(
-                "vllm.v1.attention.backend.np_to_pinned_tensor",
-                side_effect=torch.from_numpy,
-            ),
-            patch(
-                "vllm.v1.attention.backends.oscar_attn."
-                "materialize_oscar_slot_ids",
-                side_effect=materialize,
-            ),
+        with patch(
+            "vllm.v1.attention.backends.oscar_attn.materialize_oscar_slot_ids",
+            side_effect=materialize,
         ):
             captured = builder.build_for_cudagraph_capture(
                 common_metadata(seq_len=4, query_len=4, padded_tokens=4)
@@ -1292,7 +1296,7 @@ class TestOscarConfigAndLayout(unittest.TestCase):
             dispatch_source,
         )
 
-        kernel_source = inspect.getsource(_oscar_decode_quant_stage1_grouped_h4)
+        kernel_source = inspect.getsource(_oscar_decode_quant_stage1_grouped_h4.fn)
         self.assertIn("q0 = tl.load(", kernel_source)
         self.assertIn("q1 = tl.load(", kernel_source)
         self.assertIn("q2 = tl.load(", kernel_source)
@@ -1355,7 +1359,7 @@ class TestOscarConfigAndLayout(unittest.TestCase):
             _oscar_decode_quant_stage1_grouped_h4,
         )
 
-        kernel_source = inspect.getsource(_oscar_decode_quant_stage1_grouped_h4)
+        kernel_source = inspect.getsource(_oscar_decode_quant_stage1_grouped_h4.fn)
         k_load = kernel_source.index("k_packed = tl.load(")
         k_meta = kernel_source.index("k_meta_pair = tl.load(")
         v_load = kernel_source.index("v_packed = tl.load(")
@@ -1442,7 +1446,7 @@ class TestOscarConfigAndLayout(unittest.TestCase):
             oscar_decode_attention,
         )
 
-        kernel_source = inspect.getsource(_oscar_decode_quant_stage1_grouped_h4)
+        kernel_source = inspect.getsource(_oscar_decode_quant_stage1_grouped_h4.fn)
         self.assertIn("K_meta_pair_ptr + meta_bases", kernel_source)
         self.assertIn("V_meta_pair_ptr + meta_bases", kernel_source)
         self.assertEqual(kernel_source.count("other=0x00003F80"), 2)
