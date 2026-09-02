@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Worker-side logic for the NIXL connector."""
 
+import hashlib
 import logging
 import os
 import queue
@@ -40,6 +41,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     TransferHandle,
     compute_nixl_compatibility_hash,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.oscar_mla import (
+    OscarMLAAgentMetadata,
+    OscarMLARequestMetadata,
+    build_oscar_mla_descriptor_pairs,
+    project_oscar_mla_request_prefix,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
     NixlKVConnectorStats,
 )
@@ -66,9 +73,12 @@ from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     MambaSpec,
+    MLAAttentionSpec,
+    OscarMLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.block_table import BlockTable
+from vllm.v1.worker.oscar_mla_cache import OscarMLACacheTensors
 from vllm.v1.worker.utils import select_common_block_size
 
 if TYPE_CHECKING:
@@ -284,8 +294,12 @@ class NixlConnectorWorker:
         # [req_id -> list[handle]]
         self._recving_metadata: dict[ReqId, ReqMeta] = {}
         self._recving_transfers = defaultdict[ReqId, list[TransferHandle]](list)
+        self._oscar_mla_recv_traces: dict[
+            ReqId, tuple[float, dict[str, int], int]
+        ] = {}
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
+        self._oscar_mla_send_generations: dict[ReqId, int] = {}
         # Set of requests that have been part of a batch, regardless of status.
         self._reqs_to_process: set[ReqId] = set()
 
@@ -311,6 +325,11 @@ class NixlConnectorWorker:
         self.model_config = vllm_config.model_config
 
         self.use_mla = self.model_config.use_mla
+        self._is_oscar_mla = (
+            self.vllm_config.cache_config.cache_dtype == "oscar_mla_int2"
+        )
+        self._oscar_mla_agent_meta: OscarMLAAgentMetadata | None = None
+        self._remote_oscar_mla_agent_meta: dict[str, OscarMLAAgentMetadata] = {}
 
         # Get the attention backend from the first layer
         # NOTE (NickLucche) models with multiple backends are not supported yet
@@ -650,8 +669,11 @@ class NixlConnectorWorker:
         # Forwarding a real layer name rather than a synthetic key
         self.register_kv_caches({first_layer: kv_cache})
 
-    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+    def register_kv_caches(
+        self, kv_caches: dict[str, torch.Tensor | OscarMLACacheTensors]
+    ):
         """Register the KV Cache data in nixl."""
+        first_cache = next(iter(kv_caches.values()))
         self.transfer_topo = TransferTopology(
             tp_rank=self.tp_rank,
             tp_size=self.world_size,
@@ -661,7 +683,11 @@ class NixlConnectorWorker:
             total_num_kv_heads=self.model_config.get_total_num_kv_heads(),
             attn_backends=self.attn_backends,
             # SSM States come in tuples (ssm, conv)
-            tensor_shape=next(iter(kv_caches.values())).shape
+            tensor_shape=(
+                first_cache.history_data.shape
+                if isinstance(first_cache, OscarMLACacheTensors)
+                else first_cache.shape
+            )
             if not self._has_mamba
             else None,
             is_mamba=self._has_mamba,
@@ -669,6 +695,10 @@ class NixlConnectorWorker:
         self.compat_hash = compute_nixl_compatibility_hash(
             self.vllm_config, self.backend_name, self.transfer_topo.cross_layers_blocks
         )
+
+        if self._is_oscar_mla:
+            self._register_oscar_mla_kv_caches(kv_caches)
+            return
 
         if self.use_host_buffer:
             self.initialize_host_xfer_buffer(kv_caches=kv_caches)
@@ -863,6 +893,328 @@ class NixlConnectorWorker:
             compatibility_hash=self.compat_hash,
             agent_metadata_bytes=encoder.encode(agent_metadata),
         )
+
+    @staticmethod
+    def _build_oscar_mla_blocks_data(
+        base_addresses: list[int],
+        agent: OscarMLAAgentMetadata,
+        device_id: int,
+    ) -> list[tuple[int, int, int]]:
+        packed_bytes = agent.latent_rank * 2 // 8
+        groups = agent.latent_rank // agent.group_size
+        regions = (
+            (agent.num_blocks, agent.block_size * packed_bytes),
+            (agent.num_blocks, agent.block_size * groups * 4),
+            (agent.num_blocks, agent.block_size * groups * 4),
+            (agent.num_blocks, agent.block_size * agent.rope_head_size * 2),
+            (agent.max_num_seqs, agent.prefix_tokens * agent.latent_rank * 2),
+            (
+                agent.max_num_seqs,
+                agent.recent_capacity_tokens * agent.latent_rank * 2,
+            ),
+        )
+        expected_regions = (
+            len(agent.layer_names) * len(regions)
+            + len(agent.auxiliary_layer_names)
+        )
+        if len(base_addresses) != expected_regions:
+            raise ValueError("OSCAR MLA NIXL region count mismatch")
+        blocks_data: list[tuple[int, int, int]] = []
+        for layer_idx in range(len(agent.layer_names)):
+            layer_base = layer_idx * len(regions)
+            for region_idx, (count, item_bytes) in enumerate(regions):
+                base_addr = base_addresses[layer_base + region_idx]
+                blocks_data.extend(
+                    (base_addr + item * item_bytes, item_bytes, device_id)
+                    for item in range(count)
+                )
+        auxiliary_offset = len(agent.layer_names) * len(regions)
+        for auxiliary_idx, page_bytes in enumerate(agent.auxiliary_page_bytes):
+            base_addr = base_addresses[auxiliary_offset + auxiliary_idx]
+            blocks_data.extend(
+                (base_addr + block * page_bytes, page_bytes, device_id)
+                for block in range(agent.num_blocks)
+            )
+        return blocks_data
+
+    def _register_oscar_mla_kv_caches(
+        self, kv_caches: dict[str, torch.Tensor | OscarMLACacheTensors]
+    ) -> None:
+        """Register OSCAR's page pools and HP-row pools without materialization."""
+        from vllm.model_executor.layers.quantization.oscar_mla.runtime import (
+            load_runtime_artifact_identity,
+        )
+
+        layer_specs = {}
+        for layer_name in kv_caches:
+            layer_spec = self._layer_specs[layer_name]
+            if isinstance(layer_spec, UniformTypeKVCacheSpecs):
+                layer_spec = layer_spec.kv_cache_specs[layer_name]
+            layer_specs[layer_name] = layer_spec
+        layer_names = tuple(
+            name
+            for name, spec in layer_specs.items()
+            if isinstance(spec, OscarMLAAttentionSpec)
+        )
+        auxiliary_layer_names = tuple(
+            name
+            for name, spec in layer_specs.items()
+            if not isinstance(spec, OscarMLAAttentionSpec)
+        )
+        if not layer_names:
+            raise TypeError("oscar_mla_int2 requires OscarMLAAttentionSpec")
+        first_spec = layer_specs[layer_names[0]]
+        assert isinstance(first_spec, OscarMLAAttentionSpec)
+        if any(layer_specs[name] != first_spec for name in layer_names):
+            raise ValueError("OSCAR MLA NIXL requires identical per-layer geometry")
+        auxiliary_page_bytes: list[int] = []
+        for layer_name in auxiliary_layer_names:
+            if not isinstance(layer_specs[layer_name], MLAAttentionSpec):
+                raise TypeError("OSCAR MLA NIXL only supports MLA auxiliary caches")
+            cache = kv_caches[layer_name]
+            if not isinstance(cache, torch.Tensor):
+                raise TypeError("OSCAR MLA auxiliary cache must be a tensor")
+            cache_bytes = cache.numel() * cache.element_size()
+            if cache_bytes % self.kv_cache_config.num_blocks:
+                raise ValueError("OSCAR MLA auxiliary cache is not page aligned")
+            auxiliary_page_bytes.append(
+                cache_bytes // self.kv_cache_config.num_blocks
+            )
+        max_num_seqs = self.kv_cache_config.oscar_mla_max_num_seqs
+        if max_num_seqs is None:
+            raise ValueError("OSCAR MLA NIXL requires max_num_seqs")
+        identity = load_runtime_artifact_identity()
+        agent = OscarMLAAgentMetadata(
+            protocol_version=1,
+            layer_names=layer_names,
+            auxiliary_layer_names=auxiliary_layer_names,
+            auxiliary_page_bytes=tuple(auxiliary_page_bytes),
+            num_blocks=self.kv_cache_config.num_blocks,
+            max_num_seqs=max_num_seqs,
+            block_size=first_spec.block_size,
+            latent_rank=first_spec.latent_rank,
+            rope_head_size=first_spec.rope_head_size,
+            group_size=first_spec.group_size,
+            prefix_tokens=first_spec.prefix_tokens,
+            recent_tokens=first_spec.recent_tokens,
+            speculative_tokens=first_spec.speculative_tokens,
+            hp_dtype=str(first_spec.hp_dtype).removeprefix("torch."),
+            artifact_manifest_sha256=identity.manifest_sha256,
+            artifact_rotations_sha256=identity.rotations_sha256,
+        )
+
+        region_tensors: list[torch.Tensor] = []
+        for layer_name in layer_names:
+            cache = kv_caches[layer_name]
+            if not isinstance(cache, OscarMLACacheTensors):
+                raise TypeError("OSCAR MLA NIXL received an unshaped cache tensor")
+            region_tensors.extend(
+                (
+                    cache.history_data,
+                    cache.history_scale,
+                    cache.history_zero,
+                    cache.rope,
+                    cache.prefix,
+                    cache.recent,
+                )
+            )
+        for layer_name in auxiliary_layer_names:
+            cache = kv_caches[layer_name]
+            assert isinstance(cache, torch.Tensor)
+            region_tensors.append(cache)
+        if not region_tensors:
+            raise ValueError("OSCAR MLA NIXL received no cache regions")
+        self.device_id = max(region_tensors[0].get_device(), 0)
+        base_addresses = [tensor.data_ptr() for tensor in region_tensors]
+        caches_data = [
+            (
+                tensor.data_ptr(),
+                tensor.numel() * tensor.element_size(),
+                self.device_id,
+                "",
+            )
+            for tensor in region_tensors
+        ]
+        registered = self.nixl_wrapper.get_reg_descs(
+            caches_data, self.nixl_memory_type
+        )
+        self.nixl_wrapper.register_memory(registered, backends=self.nixl_backends)
+        self._registered_descs.append(registered)
+
+        blocks_data = self._build_oscar_mla_blocks_data(
+            base_addresses, agent, self.device_id
+        )
+        handle = self.nixl_wrapper.prep_xfer_dlist(
+            "NIXL_INIT_AGENT",
+            self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type),
+        )
+        self.src_xfer_handles_by_block_size[self.block_size] = handle
+        self.src_blocks_data = blocks_data
+        self.block_len_per_layer = [
+            first_spec.block_size * first_spec.latent_rank * 2 // 8
+        ] * len(layer_names) + auxiliary_page_bytes
+        self.num_regions = 6 * len(layer_names) + len(auxiliary_layer_names)
+        self.num_descs = len(blocks_data)
+        self.device_kv_caches = kv_caches  # type: ignore[assignment]
+        self._oscar_mla_agent_meta = agent
+        self.kv_caches_base_addr[self.engine_id][self.tp_rank] = base_addresses
+        self.dst_num_blocks[self.engine_id] = agent.num_blocks
+
+        agent_metadata = NixlAgentMetadata(
+            engine_id=self.engine_id,
+            agent_metadata=self.nixl_wrapper.get_agent_metadata(),
+            kv_caches_base_addr=base_addresses,
+            device_id=self.device_id,
+            num_blocks=agent.num_blocks,
+            block_lens=self.block_len_per_layer,
+            kv_cache_layout=self.kv_cache_layout,
+            block_size=self.block_size,
+            ssm_sizes=self._mamba_ssm_size,
+            attn_backend_name=self.backend_name,
+            oscar_mla=agent,
+        )
+        assert self.compat_hash is not None
+        self.xfer_handshake_metadata = NixlHandshakePayload(
+            compatibility_hash=self.compat_hash,
+            agent_metadata_bytes=msgspec.msgpack.encode(agent_metadata),
+        )
+        logger.info(
+            "Registered OSCAR MLA NIXL pools: layers=%d auxiliary_layers=%d "
+            "descriptors=%d",
+            len(layer_names),
+            len(auxiliary_layer_names),
+            len(blocks_data),
+        )
+
+    def _debug_oscar_mla_checksums(
+        self,
+        request: OscarMLARequestMetadata,
+    ) -> dict[str, str]:
+        """Hash exactly the OSCAR regions selected by one transfer."""
+        agent = self._oscar_mla_agent_meta
+        if agent is None:
+            raise RuntimeError("OSCAR MLA agent metadata is not initialized")
+
+        chunks: dict[str, list[torch.Tensor]] = {
+            "history_data": [],
+            "history_scale": [],
+            "history_zero": [],
+            "rope": [],
+            "prefix": [],
+            "recent": [],
+            "auxiliary": [],
+            "valid_history_data": [],
+            "valid_history_scale": [],
+            "valid_history_zero": [],
+            "valid_rope": [],
+            "valid_prefix": [],
+            "valid_recent": [],
+            "valid_auxiliary": [],
+        }
+
+        def select_pages(tensor: torch.Tensor, ids: tuple[int, ...]) -> torch.Tensor:
+            indices = torch.tensor(ids, dtype=torch.long, device=tensor.device)
+            return tensor.index_select(0, indices)
+
+        def select_valid_slots(
+            tensor: torch.Tensor,
+            ids: tuple[int, ...],
+            num_tokens: int,
+        ) -> list[torch.Tensor]:
+            selected: list[torch.Tensor] = []
+            remaining = num_tokens
+            for page in ids:
+                if remaining <= 0:
+                    break
+                take = min(agent.block_size, remaining)
+                selected.append(tensor[page, :take])
+                remaining -= take
+            if remaining:
+                raise RuntimeError("OSCAR MLA debug ownership is incomplete")
+            return selected
+
+        for layer_name in agent.layer_names:
+            cache = self.device_kv_caches[layer_name]
+            assert isinstance(cache, OscarMLACacheTensors)
+            if request.history_pages:
+                chunks["history_data"].append(
+                    select_pages(cache.history_data, request.history_pages)
+                )
+                chunks["history_scale"].append(
+                    select_pages(cache.history_scale, request.history_pages)
+                )
+                chunks["history_zero"].append(
+                    select_pages(cache.history_zero, request.history_pages)
+                )
+                chunks["valid_history_data"].extend(
+                    select_valid_slots(
+                        cache.history_data,
+                        request.history_pages,
+                        request.history_tokens,
+                    )
+                )
+                chunks["valid_history_scale"].extend(
+                    select_valid_slots(
+                        cache.history_scale,
+                        request.history_pages,
+                        request.history_tokens,
+                    )
+                )
+                chunks["valid_history_zero"].extend(
+                    select_valid_slots(
+                        cache.history_zero,
+                        request.history_pages,
+                        request.history_tokens,
+                    )
+                )
+            chunks["rope"].append(select_pages(cache.rope, request.block_ids))
+            chunks["prefix"].append(cache.prefix[request.hp_row])
+            chunks["recent"].append(cache.recent[request.hp_row])
+            chunks["valid_rope"].extend(
+                select_valid_slots(
+                    cache.rope,
+                    request.block_ids,
+                    request.logical_length,
+                )
+            )
+            valid_prefix = min(request.logical_length, agent.prefix_tokens)
+            if valid_prefix:
+                chunks["valid_prefix"].append(
+                    cache.prefix[request.hp_row, :valid_prefix]
+                )
+            recent_begin = max(
+                agent.prefix_tokens,
+                request.logical_length - agent.recent_capacity_tokens,
+            )
+            for position in range(recent_begin, request.logical_length):
+                recent_offset = (
+                    position - agent.prefix_tokens
+                ) % agent.recent_capacity_tokens
+                chunks["valid_recent"].append(
+                    cache.recent[request.hp_row, recent_offset]
+                )
+
+        for layer_name in agent.auxiliary_layer_names:
+            cache = self.device_kv_caches[layer_name]
+            assert isinstance(cache, torch.Tensor)
+            chunks["auxiliary"].append(select_pages(cache, request.block_ids))
+            chunks["valid_auxiliary"].extend(
+                select_valid_slots(cache, request.block_ids, request.logical_length)
+            )
+
+        checksums: dict[str, str] = {}
+        for name, tensors in chunks.items():
+            digest = hashlib.sha256()
+            if tensors:
+                packed = torch.cat(
+                    [
+                        tensor.contiguous().view(torch.uint8).flatten()
+                        for tensor in tensors
+                    ]
+                )
+                digest.update(packed.detach().cpu().numpy().tobytes())
+            checksums[name] = digest.hexdigest()
+        return checksums
 
     def _build_mamba_local(
         self,
@@ -1191,6 +1543,43 @@ class NixlConnectorWorker:
         remote_agent_name = self.nixl_wrapper.add_remote_agent(
             nixl_agent_meta.agent_metadata
         )
+
+        if self._is_oscar_mla:
+            local_oscar = self._oscar_mla_agent_meta
+            remote_oscar = nixl_agent_meta.oscar_mla
+            if local_oscar is None or remote_oscar is None:
+                raise RuntimeError("OSCAR MLA NIXL handshake metadata is missing")
+            if remote_tp_size != self.world_size:
+                raise RuntimeError("OSCAR MLA NIXL requires identical TP size")
+            if nixl_agent_meta.block_size != self.block_size:
+                raise RuntimeError("OSCAR MLA NIXL requires identical block size")
+            if local_oscar.geometry_fingerprint != remote_oscar.geometry_fingerprint:
+                raise RuntimeError("OSCAR MLA NIXL cache geometry mismatch")
+            if local_oscar.artifact_fingerprint != remote_oscar.artifact_fingerprint:
+                raise RuntimeError("OSCAR MLA NIXL artifact mismatch")
+
+            self.dst_num_blocks[engine_id] = remote_oscar.num_blocks
+            self.kv_caches_base_addr[engine_id][remote_tp_rank] = (
+                nixl_agent_meta.kv_caches_base_addr
+            )
+            self._remote_oscar_mla_agent_meta[engine_id] = remote_oscar
+            blocks_data = self._build_oscar_mla_blocks_data(
+                nixl_agent_meta.kv_caches_base_addr,
+                remote_oscar,
+                nixl_agent_meta.device_id,
+            )
+            descs = self.nixl_wrapper.get_xfer_descs(
+                blocks_data, self.nixl_memory_type
+            )
+            self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
+                self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
+            )
+            logger.info(
+                "Registered remote OSCAR MLA NIXL pools for engine %s rank %d",
+                engine_id,
+                remote_tp_rank,
+            )
+            return remote_agent_name
 
         # Create dst descs and xfer side handles. TP workers have same #blocks
         # so we only register once per engine_id.
@@ -1686,6 +2075,31 @@ class NixlConnectorWorker:
             meta = self._recving_metadata.pop(req_id, None)
             assert meta is not None, f"{req_id} not found in recving_metadata list"
             assert meta.remote is not None
+            trace = self._oscar_mla_recv_traces.pop(req_id, None)
+            if trace is not None:
+                started, byte_breakdown, descriptors = trace
+                logger.info(
+                    "OSCAR_PD_TRANSFER_DONE request_id=%s rank=%d status=success "
+                    "elapsed_ms=%.3f bytes=%d descriptors=%d byte_breakdown=%s",
+                    req_id,
+                    self.tp_rank,
+                    (time.perf_counter() - started) * 1000.0,
+                    sum(byte_breakdown.values()),
+                    descriptors,
+                    byte_breakdown,
+                )
+            if (
+                os.getenv("VLLM_OSCAR_PD_DEBUG_CHECKSUMS") == "1"
+                and meta.oscar_mla is not None
+            ):
+                logger.info(
+                    "OSCAR_PD_CHECKSUM role=consumer request_id=%s rank=%d "
+                    "ownership=%s checksums=%s",
+                    req_id,
+                    self.tp_rank,
+                    meta.oscar_mla,
+                    self._debug_oscar_mla_checksums(meta.oscar_mla),
+                )
             if self.use_host_buffer:
                 self.sync_recved_kv_to_device(req_id, meta)
 
@@ -1734,6 +2148,7 @@ class NixlConnectorWorker:
             )
             self._reqs_to_process.discard(req_id)
             del self._reqs_to_send[req_id]
+            self._oscar_mla_send_generations.pop(req_id, None)
             done_sending.add(req_id)
 
         return done_sending, done_recving
@@ -1755,7 +2170,13 @@ class NixlConnectorWorker:
                     # for current one-turn proxy traffic, but treating HB as a
                     # request id would create false invalid-KV errors.
                     continue
-                req_id, tp_size = msg.rsplit(":", 1)
+                generation: int | None = None
+                if msg.startswith("OSCAR:"):
+                    request_with_prefix, generation_text, tp_size = msg.rsplit(":", 2)
+                    req_id = request_with_prefix.removeprefix("OSCAR:")
+                    generation = int(generation_text)
+                else:
+                    req_id, tp_size = msg.rsplit(":", 1)
                 if (
                     req_id not in self._reqs_to_send
                     and req_id not in self._reqs_to_process
@@ -1765,6 +2186,16 @@ class NixlConnectorWorker:
                         "unrecognized request %s were retrieved by "
                         "a decode worker. They may have expired.",
                         req_id,
+                    )
+                    continue
+                expected_generation = self._oscar_mla_send_generations.get(req_id)
+                if generation != expected_generation:
+                    logger.error(
+                        "Ignoring OSCAR MLA ACK generation mismatch for request %s: "
+                        "expected=%s actual=%s",
+                        req_id,
+                        expected_generation,
+                        generation,
                     )
                     continue
 
@@ -1788,6 +2219,7 @@ class NixlConnectorWorker:
                     del self.consumer_notification_counts_by_req[req_id]
                     self._reqs_to_process.discard(req_id)
                     self._reqs_to_send.pop(req_id, None)
+                    self._oscar_mla_send_generations.pop(req_id, None)
         return notified_req_ids
 
     def _pop_done_transfers(self, transfers: dict[str, list[int]]) -> set[str]:
@@ -1852,6 +2284,19 @@ class NixlConnectorWorker:
             self._invalid_block_ids.update(meta.local_block_ids[0])
         if handle is not None:
             self.nixl_wrapper.release_xfer_handle(handle)
+        trace = self._oscar_mla_recv_traces.pop(req_id, None)
+        if trace is not None:
+            started, byte_breakdown, descriptors = trace
+            logger.warning(
+                "OSCAR_PD_TRANSFER_DONE request_id=%s rank=%d status=failed "
+                "elapsed_ms=%.3f bytes=%d descriptors=%d byte_breakdown=%s",
+                req_id,
+                self.tp_rank,
+                (time.perf_counter() - started) * 1000.0,
+                sum(byte_breakdown.values()),
+                descriptors,
+                byte_breakdown,
+            )
         self.xfer_stats.record_failed_transfer()
         self._failed_recv_reqs.add(req_id)
 
@@ -1912,6 +2357,19 @@ class NixlConnectorWorker:
         # _reqs_to_process can strand its blocks permanently.
         for req_id, expiration_time in metadata.reqs_to_send.items():
             self._reqs_to_send[req_id] = expiration_time
+        self._oscar_mla_send_generations.update(
+            metadata.oscar_mla_send_generations
+        )
+        if os.getenv("VLLM_OSCAR_PD_DEBUG_CHECKSUMS") == "1":
+            for req_id, ownership in metadata.oscar_mla_send_ownership.items():
+                logger.info(
+                    "OSCAR_PD_CHECKSUM role=producer request_id=%s rank=%d "
+                    "ownership=%s checksums=%s",
+                    req_id,
+                    self.tp_rank,
+                    ownership,
+                    self._debug_oscar_mla_checksums(ownership),
+                )
 
     def _is_remote_read_expired(self, meta: ReqMeta) -> bool:
         """Return True if the producer-side KV lease is at/near expiry.
@@ -1938,6 +2396,9 @@ class NixlConnectorWorker:
             )
             self.xfer_stats.record_kv_expired_req()
             self._handle_failed_transfer(req_id, None)
+            return
+        if meta.oscar_mla is not None or meta.remote.oscar_mla is not None:
+            self._read_oscar_mla_for_req(req_id, meta)
             return
         remote_ranks = self.transfer_topo.target_remote_ranks(engine_id)
         remote_info = self.transfer_topo.get_engine_info(engine_id)
@@ -2018,6 +2479,95 @@ class NixlConnectorWorker:
                 for rank_to_notify, agent in remote_agents.items():
                     if rank_to_notify != remote_rank:
                         self.nixl_wrapper.send_notif(agent, notif_msg=notif_id)
+
+    def _read_oscar_mla_for_req(self, req_id: str, meta: ReqMeta) -> None:
+        """Pull all request-owned OSCAR pools and expose them atomically."""
+        assert meta.remote is not None and self.transfer_topo is not None
+        if meta.oscar_mla is None or meta.remote.oscar_mla is None:
+            self._log_failure(
+                failure_type="oscar_mla_metadata_missing",
+                req_id=req_id,
+                meta=meta,
+            )
+            self._handle_failed_transfer(req_id, None)
+            return
+        engine_id = meta.remote.engine_id
+        remote_agent = self._remote_oscar_mla_agent_meta.get(engine_id)
+        local_agent = self._oscar_mla_agent_meta
+        if local_agent is None or remote_agent is None:
+            self._handle_failed_transfer(req_id, None)
+            return
+
+        remote_ranks = self.transfer_topo.target_remote_ranks(engine_id)
+        if len(remote_ranks) != 1:
+            self._log_failure(
+                failure_type="oscar_mla_topology_mismatch",
+                req_id=req_id,
+                meta=meta,
+                remote_ranks=remote_ranks,
+            )
+            self._handle_failed_transfer(req_id, None)
+            return
+        remote_rank = remote_ranks[0]
+        notif_id = (
+            f"OSCAR:{meta.remote.request_id}:"
+            f"{meta.remote.oscar_mla.generation}:{self.world_size}"
+        ).encode()
+
+        # Decode-local full prefix hit: no bytes need to be pulled, but the
+        # producer lease must still be acknowledged with its generation.
+        if not meta.local_block_ids:
+            agent_name = self._remote_agents[engine_id][remote_rank]
+            self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
+            return
+
+        try:
+            remote_request = meta.remote.oscar_mla
+            if remote_request.logical_length == meta.oscar_mla.logical_length + 1:
+                remote_request = project_oscar_mla_request_prefix(
+                    remote_agent,
+                    remote_request,
+                    meta.oscar_mla.logical_length,
+                )
+            local_ids, remote_ids = build_oscar_mla_descriptor_pairs(
+                local_agent,
+                meta.oscar_mla,
+                remote_agent,
+                remote_request,
+            )
+            byte_breakdown = local_agent.transfer_byte_breakdown(meta.oscar_mla)
+            self._oscar_mla_recv_traces[req_id] = (
+                time.perf_counter(),
+                byte_breakdown,
+                len(local_ids),
+            )
+            logger.info(
+                "OSCAR_PD_TRANSFER_START request_id=%s rank=%d bytes=%d "
+                "descriptors=%d byte_breakdown=%s",
+                req_id,
+                self.tp_rank,
+                sum(byte_breakdown.values()),
+                len(local_ids),
+                byte_breakdown,
+            )
+            handle = self.nixl_wrapper.make_prepped_xfer(
+                "READ",
+                self.src_xfer_handles_by_block_size[self.block_size],
+                local_ids,
+                self.dst_xfer_side_handles[engine_id][remote_rank],
+                remote_ids,
+                notif_msg=notif_id,
+            )
+            self.nixl_wrapper.transfer(handle)
+            self._recving_transfers[req_id].append(handle)
+        except Exception as error:
+            self._log_failure(
+                failure_type="oscar_mla_transfer_setup_failed",
+                req_id=req_id,
+                error=error,
+                meta=meta,
+            )
+            self._handle_failed_transfer(req_id, None)
 
     def _read_blocks(
         self,

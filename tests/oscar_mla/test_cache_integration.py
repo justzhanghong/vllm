@@ -14,10 +14,12 @@ from vllm.model_executor.layers.quantization.oscar_mla.cache import (
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
     generate_scheduler_kv_cache_config,
     get_kv_cache_config_from_groups,
     get_kv_cache_configs,
     get_max_concurrency_for_kv_cache_config,
+    make_block_hash_with_group_id,
 )
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import OscarMLAKVCacheManager
@@ -444,6 +446,83 @@ def test_scheduler_and_worker_restore_prefix_cache_hit_from_physical_blocks() ->
         device=torch.device("cpu"),
     )
     assert next_batch.num_restore_rows == 0
+
+
+def test_scheduler_manager_prefix_eviction_drops_stale_oscar_ownership() -> None:
+    block_pool = BlockPool(
+        num_gpu_blocks=6,
+        enable_caching=True,
+        hash_block_size=16,
+    )
+    manager = OscarMLAKVCacheManager(
+        _spec(),
+        block_pool=block_pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        max_num_seqs=1,
+        history_pages=6,
+    )
+    cached_blocks = block_pool.get_new_blocks(4)
+    raw_hashes = [BlockHash(bytes([index + 1]) * 32) for index in range(4)]
+    for block, raw_hash in zip(cached_blocks, raw_hashes):
+        cache_key = make_block_hash_with_group_id(raw_hash, 0)
+        block.block_hash = cache_key
+        block_pool.cached_block_hash_to_block.insert(cache_key, block)
+    block_pool.free_blocks(reversed(cached_blocks))
+
+    manager.allocate_new_computed_blocks("hit", cached_blocks, 64, 0)
+    manager.allocate_new_blocks("hit", 64, 64)
+    hit_generation = manager.metadata("hit").generation
+    manager.free("hit")
+
+    # Consume the complete free queue so the cached block is necessarily
+    # evicted and reused. Its hash and request-local HP-row ownership must not
+    # survive that reuse.
+    reused = block_pool.get_new_blocks(block_pool.get_num_free_blocks())
+    assert all(block in reused for block in cached_blocks)
+    assert all(block.block_hash is None for block in cached_blocks)
+    assert all(
+        block_pool.get_cached_block(raw_hash, [0]) is None
+        for raw_hash in raw_hashes
+    )
+    assert "hit" not in manager.tri_pool.requests
+    manager.tri_pool.assert_consistent()
+
+    block_pool.free_blocks(reversed(reused))
+    manager.allocate_new_computed_blocks("miss", [], 0, 0)
+    manager.allocate_new_blocks("miss", 64, 64)
+    miss = manager.metadata("miss")
+    assert miss.num_cached_tokens == 0
+    assert miss.num_external_tokens == 0
+    assert miss.generation != hit_generation
+    manager.tri_pool.assert_consistent()
+
+
+def test_scheduler_manager_reserves_external_oscar_mla_tokens() -> None:
+    block_pool = BlockPool(
+        num_gpu_blocks=48,
+        enable_caching=False,
+        hash_block_size=16,
+    )
+    manager = OscarMLAKVCacheManager(
+        _spec(),
+        block_pool=block_pool,
+        enable_caching=False,
+        kv_cache_group_id=0,
+        max_num_seqs=1,
+        history_pages=48,
+    )
+    manager.allocate_new_computed_blocks("remote", [], 0, 320)
+    external_blocks = list(manager.req_to_blocks["remote"])
+    manager.allocate_new_blocks("remote", 337, 337)
+
+    metadata = manager.metadata("remote")
+    assert metadata.num_cached_tokens == 0
+    assert metadata.num_external_tokens == 320
+    assert metadata.block_ids[:20] == tuple(
+        block.block_id for block in external_blocks
+    )
+    assert metadata.history_pages == metadata.block_ids[4:6]
 
 
 def test_scheduler_manager_separates_mtp5_lookahead_from_oscar_length() -> None:

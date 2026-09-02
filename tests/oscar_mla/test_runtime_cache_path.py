@@ -141,6 +141,25 @@ def _layer() -> SimpleNamespace:
     )
 
 
+def test_zero_length_graph_profile_returns_empty_attention() -> None:
+    impl = _impl()
+    impl.kv_cache_dtype = "oscar_mla_int2"
+    impl.topk_indices_buffer = torch.empty((4, 2048), dtype=torch.int32)
+    metadata = _metadata(query_start=0, seq_len=0, num_tokens=4, demote=False)
+    q_nope = torch.ones((4, 2, 512), dtype=torch.bfloat16)
+    q_pe = torch.ones((4, 2, 64), dtype=torch.bfloat16)
+
+    output, lse = impl.forward_mqa(
+        (q_nope, q_pe),
+        _cache(raw_size=1),
+        metadata,
+        _layer(),
+    )
+
+    assert torch.equal(output, torch.zeros_like(q_nope))
+    assert lse is None
+
+
 def test_runtime_call_counts_aggregate_all_oscar_layers() -> None:
     first = SimpleNamespace(
         kv_cache_dtype="oscar_mla_int2",

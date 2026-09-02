@@ -1858,7 +1858,13 @@ class VllmConfig:
         if self.parallel_config.enable_dbo:
             unsupported.append("dual batch overlap")
         if self.kv_transfer_config is not None:
-            unsupported.append("KV transfer")
+            kv_transfer = self.kv_transfer_config
+            if kv_transfer.kv_connector != "NixlConnector":
+                unsupported.append("KV transfer connectors other than NixlConnector")
+            if kv_transfer.kv_load_failure_policy != "fail":
+                unsupported.append("KV transfer recompute failure policy")
+            if kv_transfer.kv_buffer_device != "cuda":
+                unsupported.append("non-CUDA KV transfer buffers")
         if self.cache_config.kv_offloading_size is not None:
             unsupported.append("KV offloading")
         if unsupported:

@@ -11,6 +11,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.oscar_mla import (
+    OscarMLAAgentMetadata,
+    OscarMLARequestMetadata,
+)
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -32,8 +36,9 @@ GET_META_MSG = b"get_meta_msg"
 # Version History:
 #   1: Initial version with compatibility checking
 #   2: Add remote_request_id to kv_transfer_params
+#   3: Add OSCAR MLA native multi-pool metadata
 #
-NIXL_CONNECTOR_VERSION: int = 2
+NIXL_CONNECTOR_VERSION: int = 3
 
 
 @dataclass
@@ -48,6 +53,7 @@ class NixlAgentMetadata:
     block_size: int
     ssm_sizes: tuple[int, int]
     attn_backend_name: str
+    oscar_mla: OscarMLAAgentMetadata | None = None
 
 
 @dataclass
@@ -139,6 +145,7 @@ class RemoteMeta:
     engine_id: str
     request_id: str
     blocks_expiry_time: float | None = None
+    oscar_mla: OscarMLARequestMetadata | None = None
 
 
 @dataclass
@@ -148,6 +155,7 @@ class ReqMeta:
     local_physical_block_ids: BlockIds
     tp_size: int
     remote: RemoteMeta | None = None
+    oscar_mla: OscarMLARequestMetadata | None = None
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):
@@ -155,6 +163,10 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         self.reqs_to_recv: dict[ReqId, ReqMeta] = {}
         self.reqs_to_save: dict[ReqId, ReqMeta] = {}
         self.reqs_to_send: dict[ReqId, float] = {}
+        self.oscar_mla_send_generations: dict[ReqId, int] = {}
+        self.oscar_mla_send_ownership: dict[
+            ReqId, OscarMLARequestMetadata
+        ] = {}
         self.reqs_in_batch: set[ReqId] = set()
         self.reqs_not_processed: set[ReqId] = set()
 
@@ -162,12 +174,14 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         self,
         local_block_ids: BlockIds,
         kv_transfer_params: dict[str, Any],
+        oscar_mla: OscarMLARequestMetadata | None = None,
     ) -> ReqMeta:
         return ReqMeta(
             local_block_ids=local_block_ids,
             local_physical_block_ids=local_block_ids,
             # P workers don't need to receive tp_size from proxy here.
             tp_size=kv_transfer_params.get("tp_size", 1),
+            oscar_mla=oscar_mla,
         )
 
     def add_new_req_to_save(
@@ -185,8 +199,9 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         request_id: ReqId,
         local_block_ids: BlockIds,
         kv_transfer_params: dict[str, Any],
+        oscar_mla: OscarMLARequestMetadata | None = None,
     ):
-        req = self._add_new_req(local_block_ids, kv_transfer_params)
+        req = self._add_new_req(local_block_ids, kv_transfer_params, oscar_mla)
         req.remote = RemoteMeta(
             block_ids=kv_transfer_params["remote_block_ids"],
             engine_id=kv_transfer_params["remote_engine_id"],
@@ -194,5 +209,10 @@ class NixlConnectorMetadata(KVConnectorMetadata):
             host=kv_transfer_params["remote_host"],
             port=kv_transfer_params["remote_port"],
             blocks_expiry_time=kv_transfer_params.get("remote_blocks_expiry_time"),
+            oscar_mla=OscarMLARequestMetadata.from_wire(
+                kv_transfer_params["remote_oscar_mla"]
+            )
+            if "remote_oscar_mla" in kv_transfer_params
+            else None,
         )
         self.reqs_to_recv[request_id] = req

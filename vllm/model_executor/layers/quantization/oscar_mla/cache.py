@@ -427,6 +427,7 @@ class RequestOwnership:
     partial_history_slots: int = 0
     block_ids: tuple[int, ...] = ()
     num_cached_tokens: int = 0
+    num_external_tokens: int = 0
 
     @property
     def history_pages(self) -> tuple[int, ...]:
@@ -459,6 +460,7 @@ class WorkerCacheMetadata:
     history_tokens: int
     block_ids: tuple[int, ...] = ()
     num_cached_tokens: int = 0
+    num_external_tokens: int = 0
 
 
 class MLATriPoolAllocator:
@@ -518,6 +520,7 @@ class MLATriPoolAllocator:
         *,
         block_ids: tuple[int, ...],
         num_cached_tokens: int | None = None,
+        num_external_tokens: int | None = None,
     ) -> LengthUpdate:
         request = self.requests[request_id]
         if new_length < request.logical_length:
@@ -557,6 +560,10 @@ class MLATriPoolAllocator:
             if not 0 <= num_cached_tokens <= new_length:
                 raise ValueError("invalid OSCAR MLA cached-token count")
             request.num_cached_tokens = num_cached_tokens
+        if num_external_tokens is not None:
+            if not 0 <= num_external_tokens <= new_length:
+                raise ValueError("invalid OSCAR MLA external-token count")
+            request.num_external_tokens = num_external_tokens
         request.cache_version += 1
         return LengthUpdate(
             previous_length=previous_length,
@@ -594,6 +601,7 @@ class MLATriPoolAllocator:
             history_tokens=request.history_tokens,
             block_ids=request.block_ids,
             num_cached_tokens=request.num_cached_tokens,
+            num_external_tokens=request.num_external_tokens,
         )
 
     def prefix_slot(self, request_id: str, token_position: int) -> int:

@@ -1170,6 +1170,24 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
             topk_width = attn_metadata.topk_tokens
             if not is_decode:
                 topk_width = min(topk_width, oscar_max_seq_len)
+            if topk_width == 0:
+                # CUDA graph memory profiling can issue padded target-model
+                # queries before any KV exists. Native MLA treats this as an
+                # empty attention result; avoid sending an empty selected-token
+                # matrix into the OSCAR kernels, whose production contract
+                # correctly requires at least one selected position.
+                output = torch.zeros_like(q_nope)
+                lse = (
+                    torch.full(
+                        q_nope.shape[:2],
+                        -torch.inf,
+                        dtype=torch.float32,
+                        device=q_nope.device,
+                    )
+                    if self.need_to_return_lse_for_decode
+                    else None
+                )
+                return output, lse
             use_selected_incremental_materialization = (
                 is_incremental_mtp_target
                 and attn_metadata.full_topk_start <= 0

@@ -30,6 +30,27 @@ class LayerRuntimeParameters:
     rotations_sha256: str
 
 
+@dataclass(frozen=True)
+class RuntimeArtifactIdentity:
+    manifest_sha256: str
+    rotations_sha256: str
+
+
+def load_runtime_artifact_identity() -> RuntimeArtifactIdentity:
+    """Return the identity of the same verified artifact used by attention."""
+    artifact_path = os.getenv(_ARTIFACT_ENV)
+    expectation_path = os.getenv(_EXPECTATION_ENV)
+    if not artifact_path or not expectation_path:
+        raise ValueError(
+            f"oscar_mla_int2 requires {_ARTIFACT_ENV} and {_EXPECTATION_ENV}"
+        )
+    loaded = _load_runtime_artifact(artifact_path, expectation_path)
+    return RuntimeArtifactIdentity(
+        manifest_sha256=loaded.manifest_sha256,
+        rotations_sha256=loaded.rotations_sha256,
+    )
+
+
 def load_layer_runtime_parameters(
     layer_name: str,
     *,

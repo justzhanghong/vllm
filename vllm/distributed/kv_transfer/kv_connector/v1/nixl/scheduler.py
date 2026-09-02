@@ -25,6 +25,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlHandshakePayload,
     ReqId,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.oscar_mla import (
+    OscarMLARequestMetadata,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -83,6 +86,9 @@ class NixlConnectorScheduler:
             isinstance(g.kv_cache_spec, MambaSpec)
             for g in kv_cache_config.kv_cache_groups
         )
+        self._is_oscar_mla = (
+            vllm_config.cache_config.cache_dtype == "oscar_mla_int2"
+        )
 
         logger.info("Initializing NIXL Scheduler %s", engine_id)
         if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
@@ -103,6 +109,9 @@ class NixlConnectorScheduler:
         # Reqs to remove from processed set because they're not to send after
         # remote prefill or aborted.
         self._reqs_not_processed: set[ReqId] = set()
+        self._oscar_mla_ownership: dict[ReqId, OscarMLARequestMetadata] = {}
+        self._oscar_mla_send_generations: dict[ReqId, int] = {}
+        self._oscar_mla_send_ownership: dict[ReqId, OscarMLARequestMetadata] = {}
 
         # Gather Sliding Window sizes for each kv cache group (if any) in number of
         # blocks per KV cache group. This is used to clip the local attention window.
@@ -291,6 +300,12 @@ class NixlConnectorScheduler:
             # Remote prefill: get all prompt blocks from remote.
             token_ids = request.prompt_token_ids or []
             actual = self._mamba_prefill_token_count(len(token_ids))
+            if self._is_oscar_mla and actual > 0:
+                # As with a full local prefix-cache hit, Decode must replay the
+                # final prompt token to produce logits. Keeping that token out
+                # of external ownership also keeps OSCAR's request-local
+                # logical length aligned with request.num_computed_tokens.
+                actual -= 1
             count = actual - num_computed_tokens
             if count > 0:
                 return count, True
@@ -404,6 +419,18 @@ class NixlConnectorScheduler:
     ) -> KVConnectorMetadata:
         meta = NixlConnectorMetadata()
 
+        for req_id, ownership in scheduler_output.oscar_mla_cache_metadata.items():
+            self._oscar_mla_ownership[req_id] = OscarMLARequestMetadata(
+                generation=ownership.generation,
+                cache_version=ownership.cache_version,
+                logical_length=ownership.logical_length,
+                hp_row=ownership.hp_row,
+                block_ids=ownership.block_ids,
+                history_pages=ownership.history_pages,
+                partial_history_slots=ownership.partial_history_slots,
+                history_tokens=ownership.history_tokens,
+            ).trim_speculative_tail_blocks(self.block_size)
+
         # Loop through scheduled reqs and convert to ReqMeta.
         for req_id, (req, block_ids) in self._reqs_need_recv.items():
             assert req.kv_transfer_params is not None
@@ -411,12 +438,16 @@ class NixlConnectorScheduler:
                 request_id=req_id,
                 local_block_ids=block_ids,
                 kv_transfer_params=req.kv_transfer_params,
+                oscar_mla=self._oscar_mla_ownership.get(req_id),
             )
+            self._oscar_mla_ownership.pop(req_id, None)
 
         if self.use_host_buffer:
             self._build_save_meta(meta, scheduler_output)
 
         meta.reqs_to_send = self._reqs_need_send
+        meta.oscar_mla_send_generations = self._oscar_mla_send_generations
+        meta.oscar_mla_send_ownership = self._oscar_mla_send_ownership
         meta.reqs_in_batch = self._reqs_in_batch
         meta.reqs_not_processed = self._reqs_not_processed
 
@@ -425,6 +456,8 @@ class NixlConnectorScheduler:
         self._reqs_in_batch = set()
         self._reqs_not_processed = set()
         self._reqs_need_send = {}
+        self._oscar_mla_send_generations = {}
+        self._oscar_mla_send_ownership = {}
 
         return meta
 
@@ -448,6 +481,7 @@ class NixlConnectorScheduler:
             params,
         )
         if not params:
+            self._oscar_mla_ownership.pop(request.request_id, None)
             return False, None
 
         if params.get("do_remote_prefill"):
@@ -462,6 +496,7 @@ class NixlConnectorScheduler:
             return False, None
 
         if not params.get("do_remote_decode"):
+            self._oscar_mla_ownership.pop(request.request_id, None)
             return False, None
         if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
             # Also include the case of a P/D Prefill request with immediate
@@ -469,6 +504,7 @@ class NixlConnectorScheduler:
             self._reqs_not_processed.add(request.request_id)
             # Clear _reqs_need_save if a request is aborted as partial prefill.
             self._reqs_need_save.pop(request.request_id, None)
+            self._oscar_mla_ownership.pop(request.request_id, None)
             return False, None
 
         # TODO: check whether block_ids actually ever be 0. If not we could
@@ -510,6 +546,21 @@ class NixlConnectorScheduler:
             except Exception:
                 pass
 
+        remote_oscar_mla = self._oscar_mla_ownership.pop(request.request_id, None)
+        if (
+            self.vllm_config.cache_config.cache_dtype == "oscar_mla_int2"
+            and delay_free_blocks
+            and remote_oscar_mla is None
+        ):
+            raise RuntimeError(
+                "OSCAR MLA producer ownership was not captured before export"
+            )
+        if remote_oscar_mla is not None and delay_free_blocks:
+            self._oscar_mla_send_generations[request.request_id] = (
+                remote_oscar_mla.generation
+            )
+            self._oscar_mla_send_ownership[request.request_id] = remote_oscar_mla
+
         return delay_free_blocks, dict(
             do_remote_prefill=True,
             do_remote_decode=False,
@@ -520,4 +571,9 @@ class NixlConnectorScheduler:
             remote_port=self.side_channel_port,
             tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
             remote_blocks_expiry_time=blocks_expiry_time,
+            **(
+                {"remote_oscar_mla": remote_oscar_mla.to_wire()}
+                if remote_oscar_mla is not None
+                else {}
+            ),
         )

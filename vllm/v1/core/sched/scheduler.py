@@ -148,7 +148,10 @@ class Scheduler(SchedulerInterface):
                 self.scheduler_config.async_scheduling
                 or self.parallel_config.pipeline_parallel_size > 1
             )
-            if multiple_inflight_batches and self.vllm_config.kv_transfer_config.is_kv_consumer:
+            if (
+                multiple_inflight_batches
+                and self.vllm_config.kv_transfer_config.is_kv_consumer
+            ):
                 self.defer_block_free = True
                 logger.info("P/D async deferred KV block freeing enabled (#45357)")
 
@@ -461,6 +464,7 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
+        oscar_mla_async_req_ids: list[str] = []
         token_budget = self.max_num_scheduled_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
@@ -951,6 +955,11 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.pop_request()
                 if load_kv_async:
+                    # The request is deliberately not added to
+                    # num_scheduled_tokens until its external KV is ready, but
+                    # OSCAR still needs its newly reserved block/HP-row
+                    # ownership in this step's connector metadata.
+                    oscar_mla_async_req_ids.append(request.request_id)
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
@@ -1096,7 +1105,7 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
             oscar_mla_cache_metadata=self.kv_cache_manager.get_oscar_mla_metadata(
-                list(num_scheduled_tokens)
+                [*num_scheduled_tokens, *oscar_mla_async_req_ids]
             ),
             oscar_hp_row_ids=self.kv_cache_manager.get_oscar_hp_row_ids(
                 list(num_scheduled_tokens)
@@ -2059,7 +2068,10 @@ class Scheduler(SchedulerInterface):
 
     def _free_request_blocks(self, request: Request) -> None:
         """Release blocks only after every scheduled writer has completed."""
-        if not self.defer_block_free or request.last_sched_seq <= self.processed_step_seq:
+        if (
+            not self.defer_block_free
+            or request.last_sched_seq <= self.processed_step_seq
+        ):
             self.kv_cache_manager.free(request)
             return
         blocks = self.kv_cache_manager.pop_blocks_for_free(request)

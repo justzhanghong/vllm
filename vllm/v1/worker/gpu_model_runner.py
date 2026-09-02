@@ -5070,6 +5070,13 @@ class GPUModelRunner(
 
             phase_start = time.perf_counter()
             log_mtp_execute_event("determine_padding_enter")
+            force_eager_oscar_restore = (
+                self.cache_config.cache_dtype == "oscar_mla_int2"
+                and any(
+                    metadata.num_cached_tokens > 0
+                    for metadata in scheduler_output.oscar_mla_cache_metadata.values()
+                )
+            )
             (
                 cudagraph_mode,
                 batch_desc,
@@ -5083,6 +5090,7 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                force_eager=force_eager_oscar_restore,
             )
             log_mtp_execute_event("determine_padding_done")
             log_mtp_execute_timing("determine_padding", phase_start)

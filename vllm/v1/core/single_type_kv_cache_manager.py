@@ -756,7 +756,7 @@ class OscarMLAKVCacheManager(FullAttentionManager):
             unused_bytes=0,
         )
         self.tri_pool = MLATriPoolAllocator(plan)
-        self._pending_cached_tokens: dict[str, int] = {}
+        self._pending_cached_tokens: dict[str, tuple[int, int]] = {}
 
     def get_num_blocks_to_allocate(
         self,
@@ -783,8 +783,6 @@ class OscarMLAKVCacheManager(FullAttentionManager):
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
     ) -> None:
-        if num_external_computed_tokens:
-            raise ValueError("OSCAR MLA does not support external KV cache hits")
         super().allocate_new_computed_blocks(
             request_id,
             new_computed_blocks,
@@ -792,7 +790,10 @@ class OscarMLAKVCacheManager(FullAttentionManager):
             num_external_computed_tokens,
         )
         if request_id not in self.tri_pool.requests:
-            self._pending_cached_tokens[request_id] = num_local_computed_tokens
+            self._pending_cached_tokens[request_id] = (
+                num_local_computed_tokens,
+                num_external_computed_tokens,
+            )
 
     def allocate_new_blocks(
         self,
@@ -812,16 +813,17 @@ class OscarMLAKVCacheManager(FullAttentionManager):
             block_ids = tuple(
                 block.block_id for block in self.req_to_blocks[request_id]
             )
-            cached_tokens = (
-                self._pending_cached_tokens.get(request_id, 0)
+            cached_tokens, external_tokens = (
+                self._pending_cached_tokens.get(request_id, (0, 0))
                 if is_new_request
-                else None
+                else (None, None)
             )
             self.tri_pool.update_length(
                 request_id,
                 num_tokens_main_model,
                 block_ids=block_ids,
                 num_cached_tokens=cached_tokens,
+                num_external_tokens=external_tokens,
             )
             if is_new_request:
                 self._pending_cached_tokens.pop(request_id, None)
