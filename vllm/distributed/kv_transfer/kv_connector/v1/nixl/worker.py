@@ -652,7 +652,7 @@ class NixlConnectorWorker:
                 )
                 if (
                     req_meta := self._recving_metadata.get(req_id)
-                ) and not self._is_hma_required:
+                ) and not self._is_hma_required and req_meta.local_block_ids:
                     self._invalid_block_ids.update(req_meta.local_block_ids[0])
                 self._failed_recv_reqs.add(req_id)
 
@@ -2269,7 +2269,7 @@ class NixlConnectorWorker:
                 transfers[req_id] = in_progress
         return done_req_ids
 
-    def _handle_failed_transfer(self, req_id: str, handle: int):
+    def _handle_failed_transfer(self, req_id: str, handle: int | None):
         """
         Handle a failed transfer by marking all (logical) blocks as invalid and
         recording the failure.
@@ -2280,7 +2280,11 @@ class NixlConnectorWorker:
         """
         # Use .get() here as the metadata cleanup is handled by get_finished()
         # TODO (NickLucche) handle failed transfer for HMA.
-        if (meta := self._recving_metadata.get(req_id)) and not self._is_hma_required:
+        if (
+            (meta := self._recving_metadata.get(req_id))
+            and not self._is_hma_required
+            and meta.local_block_ids
+        ):
             self._invalid_block_ids.update(meta.local_block_ids[0])
         if handle is not None:
             self.nixl_wrapper.release_xfer_handle(handle)
@@ -2711,7 +2715,7 @@ class NixlConnectorWorker:
             )
             if (
                 meta := self._recving_metadata.get(request_id)
-            ) and not self._is_hma_required:
+            ) and not self._is_hma_required and meta.local_block_ids:
                 self._invalid_block_ids.update(meta.local_block_ids[0])
             self.xfer_stats.record_failed_transfer()
             if handle is not None:

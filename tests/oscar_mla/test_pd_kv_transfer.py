@@ -336,3 +336,28 @@ def test_worker_ignores_stale_and_duplicate_generation_ack():
     assert worker._get_new_notifs() == {"req-0"}
     assert "req-0" not in worker._reqs_to_send
     assert "req-0" not in worker._oscar_mla_send_generations
+
+
+def test_worker_failed_oscar_transfer_handles_empty_standard_blocks():
+    class FakeTransferStats:
+        def __init__(self):
+            self.failed = 0
+
+        def record_failed_transfer(self):
+            self.failed += 1
+
+    worker = object.__new__(NixlConnectorWorker)
+    worker._recving_metadata = {
+        "req-0": SimpleNamespace(local_block_ids=[]),
+    }
+    worker._is_hma_required = False
+    worker._invalid_block_ids = set()
+    worker._oscar_mla_recv_traces = {}
+    worker._failed_recv_reqs = set()
+    worker.xfer_stats = FakeTransferStats()
+
+    worker._handle_failed_transfer("req-0", None)
+
+    assert worker._invalid_block_ids == set()
+    assert worker._failed_recv_reqs == {"req-0"}
+    assert worker.xfer_stats.failed == 1
