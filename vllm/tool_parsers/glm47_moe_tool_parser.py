@@ -34,8 +34,8 @@ class Glm47MoeModelToolParser(Glm4MoeModelToolParser):
         self.func_detail_regex = re.compile(
             r"<tool_call>\s*(\S+?)\s*(<arg_key>.*)?</tool_call>", re.DOTALL
         )
-        # 6th hotfix: tolerate a missing opening <arg_value> tag.
         self.func_arg_regex = re.compile(
+            # 6th hotfix: tolerate a missing opening <arg_value> tag.
             r"<arg_key>(.*?)</arg_key>\s*(?:<arg_value>)?(.*?)</arg_value>",
             re.DOTALL,
         )

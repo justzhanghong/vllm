@@ -74,8 +74,8 @@ class Glm4MoeModelToolParser(ToolParser):
         self.func_detail_regex = re.compile(
             r"<tool_call>([^\n]*)\n(.*)</tool_call>", re.DOTALL
         )
-        # 6th hotfix: tolerate a missing opening <arg_value> tag.
         self.func_arg_regex = re.compile(
+            # 6th hotfix: tolerate a missing opening <arg_value> tag.
             r"<arg_key>(.*?)</arg_key>\s*(?:<arg_value>)?(.*?)</arg_value>",
             re.DOTALL,
         )
@@ -136,7 +136,7 @@ class Glm4MoeModelToolParser(ToolParser):
         unquoted partial value (for example ``{"status": in_progress``); when
         the complete value is later converted to valid JSON, the append-only
         diff cannot insert the missing opening quote and Claude receives a
-        malformed tool input such as ``{"status": in_progresss"}``.
+        malformed tool input such as ``{"status": in_progress"}``.
         """
         if not isinstance(schema, dict):
             return False
@@ -148,11 +148,12 @@ class Glm4MoeModelToolParser(ToolParser):
             return True
 
         enum_values = schema.get("enum")
-        if isinstance(enum_values, list) and any(
-            isinstance(v, str) for v in enum_values
+        if (
+            isinstance(enum_values, list)
+            and any(isinstance(v, str) for v in enum_values)
+            and all(isinstance(v, str) or v is None for v in enum_values)
         ):
-            if all(isinstance(v, str) or v is None for v in enum_values):
-                return True
+            return True
 
         if isinstance(schema.get("const"), str):
             return True
@@ -160,8 +161,7 @@ class Glm4MoeModelToolParser(ToolParser):
         for key in ("anyOf", "oneOf", "allOf"):
             variants = schema.get(key)
             if isinstance(variants, list) and any(
-                Glm4MoeModelToolParser._schema_is_string_like(v)
-                for v in variants
+                Glm4MoeModelToolParser._schema_is_string_like(v) for v in variants
             ):
                 return True
 
@@ -180,9 +180,8 @@ class Glm4MoeModelToolParser(ToolParser):
                 continue
             if tool.function.parameters is None:
                 return False
-            arg_schema = (
-                tool.function.parameters.get("properties", {})
-                .get(arg_name, {})
+            arg_schema = tool.function.parameters.get("properties", {}).get(
+                arg_name, {}
             )
             return Glm4MoeModelToolParser._schema_is_string_like(arg_schema)
         logger.debug("No tool named '%s'.", tool_name)

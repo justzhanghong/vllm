@@ -14,7 +14,6 @@ from vllm.config import VllmConfig, get_current_vllm_config, get_layers_from_vll
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
@@ -548,6 +547,18 @@ class TransferTopology:
 
     def get_engine_info(self, remote_engine_id: EngineId) -> EngineTransferInfo:
         return self._engines[remote_engine_id]
+
+    def unregister_remote_engine(self, remote_engine_id: EngineId) -> bool:
+        """Forget all topology metadata for a failed remote engine.
+
+        NIXL agent re-creation alone is insufficient: register_remote_engine()
+        intentionally returns an existing entry.  Recovery must therefore
+        invalidate these derived transfer maps before the next handshake.
+        """
+        existed = self._engines.pop(remote_engine_id, None) is not None
+        self._fa_source_sets.pop(remote_engine_id, None)
+        self._fa_source_indices.pop(remote_engine_id, None)
+        return existed
 
     # ============================================================
     # Layout properties

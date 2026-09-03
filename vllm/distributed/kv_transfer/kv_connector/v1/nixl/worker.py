@@ -40,6 +40,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     TransferHandle,
     compute_nixl_compatibility_hash,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.recovery import (
+    SharedRecoveryBarrier,
+    retain_remote_engine_state,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
     NixlKVConnectorStats,
 )
@@ -289,10 +293,47 @@ class NixlConnectorWorker:
         # Set of requests that have been part of a batch, regardless of status.
         self._reqs_to_process: set[ReqId] = set()
 
-        # invalid blocks from failed NIXL operations
-        self._invalid_block_ids: set[int] = set()
+        # Invalid blocks from failed NIXL operations. Handshake completion can
+        # publish failures on its executor thread while the engine thread drains
+        # them. Match vLLM 0.28.0's queue handoff: swapping a shared set can lose
+        # a callback update between the read and replacement operations.
+        self._invalid_block_ids: queue.Queue[set[int]] = queue.Queue()
         # requests that skipped transfer (handshake or transfer failures)
-        self._failed_recv_reqs: set[ReqId] = set()
+        self._failed_recv_reqs: queue.Queue[ReqId] = queue.Queue()
+        # Remember engines touched by a transfer failure.  Hot recovery must
+        # never destroy their native NIXL/UCX endpoint: vLLM 0.28 only marks the
+        # affected blocks for recompute and reserves native agent removal for
+        # stale-engine TTL cleanup.  The shared barrier below temporarily stops
+        # new READs while every D worker drains, after which metadata is fetched
+        # and validated again while all native handles remain registered.
+        self._failed_remote_engines: set[EngineId] = set()
+        # Engines retained after a transfer/setup failure and waiting for the
+        # next request to force a metadata-revalidation handshake.
+        self._reconnect_pending: set[EngineId] = set()
+        # A multi-rank handshake may register some native agents before a later
+        # rank fails. Keep those unpublished names and merge them into the
+        # retained map after cluster quiescence; never roll them back while the
+        # producer is live.
+        self._failed_handshake_agents: dict[EngineId, dict[int, str]] = defaultdict(
+            dict
+        )
+        # A process-local drain is insufficient in PP8xTP2. All 16 D workers
+        # must be quiescent before recovery is committed, but even a fully
+        # quiesced hot path preserves the native endpoint (task 95321 proved
+        # cluster-wide D quiescence alone cannot protect producer UCX cleanup).
+        recovery_root = os.environ.get("VLLM_NIXL_RECOVERY_COORD_DIR", "")
+        self._recovery_barrier = (
+            SharedRecoveryBarrier(
+                recovery_root,
+                f"pp{self.pp_rank}-tp{self.tp_rank}",
+                self.vllm_config.parallel_config.pipeline_parallel_size
+                * self.world_size,
+            )
+            if self.kv_transfer_config.kv_role == "kv_consumer" and recovery_root
+            else None
+        )
+        self._recovery_cleaned_incidents: set[tuple[EngineId, str]] = set()
+        self._recovery_missing_coord_logged = False
 
         # Handshake metadata of this worker for NIXL transfers.
         self.xfer_handshake_metadata: NixlHandshakePayload | None = None
@@ -388,97 +429,130 @@ class NixlConnectorWorker:
         remote_rank_to_agent_name = {}
         path = make_zmq_path("tcp", host, port)
 
-        with zmq_ctx(zmq.REQ, path) as sock:
-            for remote_rank in p_remote_ranks:
-                remote_metadata_rank = self.pp_rank * remote_tp_size + remote_rank
-                logger.debug(
-                    "Querying metadata on path: %s at remote pp/tp rank %s/%s "
-                    "(metadata rank %s)",
-                    path,
-                    self.pp_rank,
-                    remote_rank,
-                    remote_metadata_rank,
-                )
-
-                start_time = time.perf_counter()
-                # Send query for the request.
-                msg = msgspec.msgpack.encode((GET_META_MSG, remote_metadata_rank))
-                # Set receive timeout to 5 seconds to avoid hanging on dead server
-                sock.setsockopt(zmq.RCVTIMEO, 5000)  # milliseconds
-                sock.send(msg)
-                handshake_bytes = sock.recv()
-
-                # Decode handshake payload to get compatibility hash
-                handshake_decoder = msgspec.msgpack.Decoder(NixlHandshakePayload)
-                try:
-                    handshake_payload = handshake_decoder.decode(handshake_bytes)
-                except (msgspec.DecodeError, msgspec.ValidationError) as e:
-                    raise RuntimeError(
-                        f"Failed to decode NixlHandshakePayload. This likely indicates "
-                        f"an incompatibility between connector version. Error: {e}"
-                    ) from e
-
-                got_metadata_time = time.perf_counter()
-                logger.debug(
-                    "NIXL handshake: get metadata took: %s",
-                    got_metadata_time - start_time,
-                )
-
-                # Check compatibility hash BEFORE decoding agent metadata
-                assert self.compat_hash is not None
-                if (
-                    self.enforce_compat_hash
-                    and handshake_payload.compatibility_hash != self.compat_hash
-                ):
-                    raise RuntimeError(
-                        f"NIXL compatibility hash mismatch. "
-                        f"Local: {self.compat_hash}, "
-                        f"Remote: {handshake_payload.compatibility_hash}. "
-                        f"Prefill and decode instances have incompatible "
-                        f"configurations. This may be due to: different vLLM versions,"
-                        f" models, dtypes, KV cache layouts, attention backends, etc. "
-                        f"Both instances must use identical configurations."
-                        f"Disable this check using "
-                        f'--kv-transfer-config \'{{"kv_connector_extra_config": '
-                        f'{{"enforce_handshake_compat": false}}}}\''
+        try:
+            with zmq_ctx(zmq.REQ, path) as sock:
+                for remote_rank in p_remote_ranks:
+                    remote_metadata_rank = self.pp_rank * remote_tp_size + remote_rank
+                    logger.debug(
+                        "Querying metadata on path: %s at remote pp/tp rank %s/%s "
+                        "(metadata rank %s)",
+                        path,
+                        self.pp_rank,
+                        remote_rank,
+                        remote_metadata_rank,
                     )
 
-                logger.info(
-                    "NIXL compatibility check passed (hash: %s)",
-                    handshake_payload.compatibility_hash,
-                )
+                    start_time = time.perf_counter()
+                    # Send query for the request.
+                    msg = msgspec.msgpack.encode((GET_META_MSG, remote_metadata_rank))
+                    # Set receive timeout to 5 seconds to avoid hanging on dead server
+                    sock.setsockopt(zmq.RCVTIMEO, 5000)  # milliseconds
+                    sock.send(msg)
+                    handshake_bytes = sock.recv()
 
-                # Decode agent metadata
-                metadata_decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
-                try:
-                    metadata = metadata_decoder.decode(
-                        handshake_payload.agent_metadata_bytes
+                    # Decode handshake payload to get compatibility hash
+                    handshake_decoder = msgspec.msgpack.Decoder(NixlHandshakePayload)
+                    try:
+                        handshake_payload = handshake_decoder.decode(handshake_bytes)
+                    except (msgspec.DecodeError, msgspec.ValidationError) as e:
+                        raise RuntimeError(
+                            "Failed to decode NixlHandshakePayload. This likely "
+                            "indicates "
+                            f"an incompatibility between connector version. Error: {e}"
+                        ) from e
+
+                    got_metadata_time = time.perf_counter()
+                    logger.debug(
+                        "NIXL handshake: get metadata took: %s",
+                        got_metadata_time - start_time,
                     )
-                except (msgspec.DecodeError, msgspec.ValidationError) as e:
-                    # This should not happen if hash matched
-                    raise RuntimeError(
-                        f"Failed to decode NixlAgentMetadata. Error: {e}"
-                    ) from e
 
-                # Ensure engine id matches.
-                if metadata.engine_id != expected_engine_id:
-                    raise RuntimeError(
-                        f"Remote NIXL agent engine ID mismatch. "
-                        f"Expected {expected_engine_id},"
-                        f"received {metadata.engine_id}."
+                    # Check compatibility hash BEFORE decoding agent metadata
+                    assert self.compat_hash is not None
+                    if (
+                        self.enforce_compat_hash
+                        and handshake_payload.compatibility_hash != self.compat_hash
+                    ):
+                        raise RuntimeError(
+                            f"NIXL compatibility hash mismatch. "
+                            f"Local: {self.compat_hash}, "
+                            f"Remote: {handshake_payload.compatibility_hash}. "
+                            f"Prefill and decode instances have incompatible "
+                            "configurations. This may be due to: different vLLM "
+                            "versions, models, dtypes, KV cache layouts, attention "
+                            "backends, etc. Both instances must use identical "
+                            "configurations. Disable this check using "
+                            f'--kv-transfer-config \'{{"kv_connector_extra_config": '
+                            f'{{"enforce_handshake_compat": false}}}}\''
+                        )
+
+                    logger.info(
+                        "NIXL compatibility check passed (hash: %s)",
+                        handshake_payload.compatibility_hash,
                     )
 
-                # Register Remote agent.
-                remote_agent_name = self.add_remote_agent(
-                    metadata, remote_rank, remote_tp_size
+                    # Decode agent metadata
+                    metadata_decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
+                    try:
+                        metadata = metadata_decoder.decode(
+                            handshake_payload.agent_metadata_bytes
+                        )
+                    except (msgspec.DecodeError, msgspec.ValidationError) as e:
+                        # This should not happen if hash matched
+                        raise RuntimeError(
+                            f"Failed to decode NixlAgentMetadata. Error: {e}"
+                        ) from e
+
+                    # Ensure engine id matches.
+                    if metadata.engine_id != expected_engine_id:
+                        raise RuntimeError(
+                            f"Remote NIXL agent engine ID mismatch. "
+                            f"Expected {expected_engine_id},"
+                            f"received {metadata.engine_id}."
+                        )
+
+                    # Register Remote agent.
+                    remote_agent_name = self.add_remote_agent(
+                        metadata, remote_rank, remote_tp_size
+                    )
+                    setup_agent_time = time.perf_counter()
+                    logger.debug(
+                        "NIXL handshake: add agent took: %s",
+                        setup_agent_time - got_metadata_time,
+                    )
+                    remote_rank_to_agent_name[remote_rank] = remote_agent_name
+            if expected_engine_id in self._reconnect_pending:
+                logger.warning(
+                    "NIXL_REMOTE_ENGINE_REVALIDATION_OK local_engine=%s "
+                    "remote_engine=%s remote_agents=%s "
+                    "native_agent_reused=true metadata_refetched=true",
+                    self.engine_id,
+                    expected_engine_id,
+                    len(set(remote_rank_to_agent_name.values())),
                 )
-                setup_agent_time = time.perf_counter()
-                logger.debug(
-                    "NIXL handshake: add agent took: %s",
-                    setup_agent_time - got_metadata_time,
+                self._reconnect_pending.discard(expected_engine_id)
+            return remote_rank_to_agent_name
+        except Exception:
+            # add_remote_agent mutates descriptor/base-address state before the
+            # full multi-rank handshake is published in _remote_agents. Native
+            # rollback is destructive at the producer UCX endpoint, so retain
+            # partial agent names and route revalidation through the PPxTP barrier.
+            with self._handshake_lock:
+                self._failed_handshake_agents[expected_engine_id].update(
+                    remote_rank_to_agent_name
                 )
-                remote_rank_to_agent_name[remote_rank] = remote_agent_name
-        return remote_rank_to_agent_name
+                self._failed_remote_engines.add(expected_engine_id)
+                if self._recovery_barrier is not None:
+                    self._recovery_barrier.declare(expected_engine_id)
+            logger.warning(
+                "NIXL_HANDSHAKE_ROLLBACK native_state_preserved=true "
+                "deferred_cluster_revalidation=true local_engine=%s "
+                "remote_engine=%s partial_remote_agents=%s",
+                self.engine_id,
+                expected_engine_id,
+                len(set(remote_rank_to_agent_name.values())),
+            )
+            raise
 
     def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """
@@ -589,6 +663,18 @@ class NixlConnectorWorker:
     def _background_nixl_handshake(
         self, req_id: str, remote_engine_id: EngineId, meta: ReqMeta
     ):
+        # Re-check under _handshake_lock. A sibling worker can publish a shared
+        # incident after start_load_kv's first check but before this method is
+        # entered. Never start or join a handshake inside that recovery window.
+        if self._recovery_blocks_new_reads(remote_engine_id):
+            logger.warning(
+                "NIXL_RECOVERY_READ_BYPASSED request_id=%s remote_engine=%s "
+                "action=local_recompute phase=handshake",
+                req_id,
+                remote_engine_id,
+            )
+            self._handle_failed_transfer(req_id, None)
+            return
         # Do NIXL handshake in background and add to _ready_requests when done.
         fut = self._handshake_futures.get(remote_engine_id)
         if fut is None:
@@ -617,12 +703,29 @@ class NixlConnectorWorker:
 
             fut.add_done_callback(done_callback)
 
-        # check handshake success before proceeding with request
+        # Check handshake success before proceeding with the request. This
+        # callback takes the same lock as the recovery commit: if a failure
+        # incident appeared while the handshake ran, the result belongs to the
+        # old generation and must be recomputed rather than queued for a READ.
         def request_ready(f: Future[Any], entry=(req_id, meta)):
             try:
                 # check if handshake succeeded
                 f.result()
-                self._ready_requests.put(entry)
+                with self._handshake_lock:
+                    if (
+                        remote_engine_id in self._reconnect_pending
+                        or self._recovery_blocks_new_reads(remote_engine_id)
+                    ):
+                        logger.warning(
+                            "NIXL_RECOVERY_READ_BYPASSED request_id=%s "
+                            "remote_engine=%s action=local_recompute "
+                            "phase=handshake_callback",
+                            req_id,
+                            remote_engine_id,
+                        )
+                        self._handle_failed_transfer(req_id, None)
+                    else:
+                        self._ready_requests.put(entry)
             except Exception as e:
                 # handshake failed - mark blocks as invalid
                 self._log_failure(
@@ -634,8 +737,8 @@ class NixlConnectorWorker:
                 if (
                     req_meta := self._recving_metadata.get(req_id)
                 ) and not self._is_hma_required:
-                    self._invalid_block_ids.update(req_meta.local_block_ids[0])
-                self._failed_recv_reqs.add(req_id)
+                    self._invalid_block_ids.put(set(req_meta.local_block_ids[0]))
+                self._failed_recv_reqs.put(req_id)
 
         fut.add_done_callback(request_ready)
 
@@ -1666,9 +1769,15 @@ class NixlConnectorWorker:
         done_sending = self._get_new_notifs()
         done_recving = self._pop_done_transfers(self._recving_transfers)
 
-        # add requests that skipped transfer to done_recving
-        done_recving.update(self._failed_recv_reqs)
-        self._failed_recv_reqs.clear()
+        # vLLM 0.28.0: handshake callbacks and the engine thread exchange
+        # failures through Queue, then failed requests skip KV post-processing.
+        failed_recv_reqs: set[ReqId] = set()
+        while not self._failed_recv_reqs.empty():
+            try:
+                failed_recv_reqs.add(self._failed_recv_reqs.get_nowait())
+            except queue.Empty:
+                break
+        done_recving.update(failed_recv_reqs)
 
         if len(done_sending) > 0 or len(done_recving) > 0:
             logger.debug(
@@ -1685,6 +1794,13 @@ class NixlConnectorWorker:
             # clean up metadata for completed requests
             meta = self._recving_metadata.pop(req_id, None)
             assert meta is not None, f"{req_id} not found in recving_metadata list"
+            # vLLM 0.28.0 explicitly avoids copying/post-processing partially
+            # transferred KV. The scheduler will recompute invalid blocks.
+            if req_id in failed_recv_reqs:
+                logger.warning(
+                    "Skipping KV post-processing for failed request %s", req_id
+                )
+                continue
             assert meta.remote is not None
             if self.use_host_buffer:
                 self.sync_recved_kv_to_device(req_id, meta)
@@ -1715,8 +1831,14 @@ class NixlConnectorWorker:
         for block_ids in block_ids_for_heterogeneous_attn_post_process:
             self.post_process_device_kv_on_receive_heterogeneous_attn(block_ids)
 
-        # The producer deadline can cross processes and hosts; compare it in
-        # the same wall-clock domain used when the deadline was created.
+        # Advance the shared failure circuit breaker only after current handles
+        # have left PROC. Native endpoint state is retained; the next request
+        # performs a metadata-revalidation handshake before another READ.
+        self._recover_failed_remote_engines()
+
+        # Handle timeout to avoid stranding blocks on remote.  The absolute
+        # deadline was created by EngineCore and may be consumed on another
+        # physical host, so compare it with the same wall-clock domain.
         now = time.time()
         while self._reqs_to_send:
             req_id, expires = next(iter(self._reqs_to_send.items()))
@@ -1803,7 +1925,15 @@ class NixlConnectorWorker:
             in_progress = []
             for handle in handles:
                 try:
+                    # Never release or invalidate a live native operation.
+                    # Fault injection turns a completed transfer into a
+                    # post-transfer logical failure, which safely exercises the
+                    # real invalidation/retention/revalidation state machine.
                     xfer_state = self.nixl_wrapper.check_xfer_state(handle)
+                    if xfer_state == "DONE" and self._consume_debug_transfer_failure(
+                        req_id
+                    ):
+                        xfer_state = "DEBUG_INJECTED_FAILURE"
                     if xfer_state == "DONE":
                         # Get telemetry from NIXL
                         res = self.nixl_wrapper.get_xfer_telemetry(handle)
@@ -1837,6 +1967,176 @@ class NixlConnectorWorker:
                 transfers[req_id] = in_progress
         return done_req_ids
 
+    def _mark_remote_engine_failed(self, req_id: str) -> None:
+        meta = self._recving_metadata.get(req_id)
+        if meta is not None and meta.remote is not None:
+            engine_id = meta.remote.engine_id
+            self._failed_remote_engines.add(engine_id)
+            if self._recovery_barrier is not None:
+                self._recovery_barrier.declare(engine_id)
+
+    def _consume_debug_transfer_failure(self, req_id: str) -> bool:
+        """Consume one per-worker fault marker in an explicitly debug deployment.
+
+        The production default is inert.  A marker template may contain
+        ``{engine_id}``, ``{pp_rank}``, and ``{tp_rank}``; unlink is the atomic
+        one-shot claim.  This exercises the real post-transfer failure and
+        reconnect state machine without killing a rank or corrupting memory.
+        """
+        template = os.environ.get("VLLM_NIXL_FAULT_INJECT_FILE", "")
+        if not template or os.environ.get("GLM53_RUN_MODE") != "debug":
+            return False
+        marker = template.format(
+            engine_id=self.engine_id,
+            pp_rank=int(self.pp_rank),
+            tp_rank=int(self.tp_rank),
+        )
+        try:
+            os.unlink(marker)
+        except FileNotFoundError:
+            return False
+        except OSError as e:
+            logger.warning("NIXL fault marker could not be consumed %s: %s", marker, e)
+            return False
+        logger.warning(
+            "NIXL_DEBUG_FAULT_INJECTED request_id=%s engine_id=%s "
+            "pp_rank=%s tp_rank=%s marker=%s",
+            req_id,
+            self.engine_id,
+            self.pp_rank,
+            self.tp_rank,
+            marker,
+        )
+        return True
+
+    def _retain_remote_engine_state(
+        self,
+        engine_id: EngineId,
+        extra_remote_agents: dict[int, str] | None = None,
+    ) -> dict[str, Any]:
+        return retain_remote_engine_state(
+            self, engine_id, extra_remote_agents=extra_remote_agents, logger=logger
+        )
+
+    def _recover_failed_remote_engines(self) -> None:
+        """Fence a failed engine, drain every D worker, and retain native state.
+
+        Task 95321 proved that ``remove_remote_agent`` can crash the still-live
+        producer in UCX endpoint-failure cleanup even after all 16 decode workers
+        acknowledge quiescence.  Match vLLM 0.28's hot-failure policy instead:
+        recompute failed blocks, preserve agents/descriptors/topology, and force a
+        metadata revalidation before the next READ.
+        """
+        barrier = self._recovery_barrier
+        if barrier is None:
+            if self._failed_remote_engines and not self._recovery_missing_coord_logged:
+                logger.error(
+                    "NIXL_RECOVERY_DISABLED hot recovery suppressed; "
+                    "VLLM_NIXL_RECOVERY_COORD_DIR is not set"
+                )
+                self._recovery_missing_coord_logged = True
+            return
+
+        # A marker from one worker is a circuit breaker for all sibling D
+        # workers. Every worker must join even if its own READ completed.
+        self._failed_remote_engines.update(barrier.active_engines())
+        if not self._failed_remote_engines:
+            return
+
+        # Wait until this worker has no native work or metadata operation. New
+        # reads observe the active incident and are sent to local recompute.
+        if (
+            self._recving_transfers
+            or self._handshake_futures
+            or not self._ready_requests.empty()
+        ):
+            return
+
+        for engine_id in list(self._failed_remote_engines):
+            incident_id = barrier.incident_id(engine_id)
+            if incident_id is None:
+                # A sibling completed this generation. Stale local state must
+                # not redeclare it; only a new observed failure starts another.
+                self._failed_remote_engines.discard(engine_id)
+                continue
+            incident = (engine_id, incident_id)
+            quiesced, all_quiescent = barrier.acknowledge_quiescent(
+                engine_id, incident_id
+            )
+            if not all_quiescent:
+                continue
+            if incident not in self._recovery_cleaned_incidents:
+                with self._handshake_lock:
+                    # Re-check under the lock so no handshake can cross the
+                    # quiescent commit. This path deliberately contains no
+                    # native agent, dlist, or topology teardown.
+                    if (
+                        self._recving_transfers
+                        or self._handshake_futures
+                        or not self._ready_requests.empty()
+                    ):
+                        continue
+                    extra_agents = self._failed_handshake_agents.pop(engine_id, {})
+                    retained = self._retain_remote_engine_state(
+                        engine_id, extra_remote_agents=extra_agents
+                    )
+                    self._recovery_cleaned_incidents.add(incident)
+                    self._reconnect_pending.add(engine_id)
+                    logger.warning(
+                        "NIXL_REMOTE_ENGINE_RETAINED remote_engine=%s "
+                        "incident=%s quiesced_workers=%s remote_agents=%s "
+                        "dlist_handles=%s base_addresses=%s block_metadata=%s "
+                        "physical_ratio=%s native_agent_preserved=true "
+                        "dlist_preserved=true topology_preserved=true "
+                        "native_remove_calls=0 "
+                        "next_request=metadata-revalidation",
+                        engine_id,
+                        incident_id,
+                        quiesced,
+                        retained["remote_agents"],
+                        retained["dlist_handles"],
+                        retained["base_addresses"],
+                        retained["block_metadata"],
+                        retained["physical_ratio"],
+                    )
+            retained_workers, complete = barrier.mark_cleaned(engine_id, incident_id)
+            if complete:
+                logger.warning(
+                    "NIXL_RECOVERY_BARRIER_COMPLETE remote_engine=%s "
+                    "incident=%s retained_workers=%s native_remove_calls=0",
+                    engine_id,
+                    incident_id,
+                    retained_workers,
+                )
+            self._failed_remote_engines.discard(engine_id)
+
+    def _recovery_blocks_new_reads(self, engine_id: EngineId) -> bool:
+        barrier = self._recovery_barrier
+        if barrier is None:
+            return engine_id in self._failed_remote_engines
+        # Discover failures raised by sibling PP/TP workers before consulting
+        # cached remote-agent state. This closes the start_load/commit race.
+        self._failed_remote_engines.update(barrier.active_engines())
+        # Block globally even during the tiny mkdir-to-metadata publication
+        # window, when the incident's engine id is not readable yet.
+        return bool(self._failed_remote_engines) or barrier.any_active()
+
+    def _start_read_or_recompute(self, req_id: str, meta: ReqMeta) -> None:
+        assert meta.remote is not None
+        if (
+            meta.remote.engine_id in self._reconnect_pending
+            or self._recovery_blocks_new_reads(meta.remote.engine_id)
+        ):
+            logger.warning(
+                "NIXL_RECOVERY_READ_BYPASSED request_id=%s remote_engine=%s "
+                "action=local_recompute",
+                req_id,
+                meta.remote.engine_id,
+            )
+            self._handle_failed_transfer(req_id, None)
+            return
+        self._read_blocks_for_req(req_id, meta)
+
     def _handle_failed_transfer(self, req_id: str, handle: int):
         """
         Handle a failed transfer by marking all (logical) blocks as invalid and
@@ -1849,11 +2149,11 @@ class NixlConnectorWorker:
         # Use .get() here as the metadata cleanup is handled by get_finished()
         # TODO (NickLucche) handle failed transfer for HMA.
         if (meta := self._recving_metadata.get(req_id)) and not self._is_hma_required:
-            self._invalid_block_ids.update(meta.local_block_ids[0])
+            self._invalid_block_ids.put(set(meta.local_block_ids[0]))
         if handle is not None:
             self.nixl_wrapper.release_xfer_handle(handle)
         self.xfer_stats.record_failed_transfer()
-        self._failed_recv_reqs.add(req_id)
+        self._failed_recv_reqs.put(req_id)
 
     def start_load_kv(self, metadata: NixlConnectorMetadata):
         """
@@ -1876,21 +2176,41 @@ class NixlConnectorWorker:
                 len(meta.local_physical_block_ids),
                 len(meta.remote.block_ids),
             )
-            # always store metadata for failure recovery
+            # Always store metadata before a bypass so the normal failure path
+            # can invalidate the local allocation. Consult the shared circuit
+            # breaker before cached-agent lookup: workers complete the shared
+            # retention barrier at slightly different times and none may start
+            # metadata revalidation while the incident is still active.
             self._recving_metadata[req_id] = meta
+            if self._recovery_blocks_new_reads(remote_engine_id):
+                logger.warning(
+                    "NIXL_RECOVERY_READ_BYPASSED request_id=%s remote_engine=%s "
+                    "action=local_recompute phase=start_load",
+                    req_id,
+                    remote_engine_id,
+                )
+                self._handle_failed_transfer(req_id, None)
+                continue
+            if remote_engine_id in self._reconnect_pending:
+                # The native agent is intentionally still cached. Force a fresh
+                # metadata fetch/compatibility check before reusing it for READ.
+                with self._handshake_lock:
+                    if remote_engine_id in self._reconnect_pending:
+                        self._background_nixl_handshake(req_id, remote_engine_id, meta)
+                        continue
             if remote_engine_id not in self._remote_agents:
-                # Initiate handshake with remote engine to exchange metadata.
+                # First connection: exchange metadata and register the agent.
                 with self._handshake_lock:
                     if remote_engine_id not in self._remote_agents:
                         self._background_nixl_handshake(req_id, remote_engine_id, meta)
                         continue
 
-            # Handshake already completed, start async read xfer.
-            self._read_blocks_for_req(req_id, meta)
+            # Handshake/revalidation completed, start async read xfer.
+            self._start_read_or_recompute(req_id, meta)
 
         # Start transfers for requests whose handshakes have now finished.
         while not self._ready_requests.empty():
-            self._read_blocks_for_req(*self._ready_requests.get_nowait())
+            self._start_read_or_recompute(*self._ready_requests.get_nowait())
 
         # Keep around the requests that have been part of a batch. This is
         # needed because async scheduling pushes the misalignment between the
@@ -2150,7 +2470,9 @@ class NixlConnectorWorker:
             # Use handle to check completion in future step().
             self._recving_transfers[request_id].append(handle)
         except Exception as e:
-            # mark all (logical) blocks for this request as invalid
+            # Mark this request's logical blocks invalid and enter the shared
+            # retention barrier after outstanding handles drain.
+            self._mark_remote_engine_failed(request_id)
             self._log_failure(
                 failure_type="transfer_setup_failed",
                 req_id=request_id,
@@ -2162,11 +2484,11 @@ class NixlConnectorWorker:
             if (
                 meta := self._recving_metadata.get(request_id)
             ) and not self._is_hma_required:
-                self._invalid_block_ids.update(meta.local_block_ids[0])
+                self._invalid_block_ids.put(set(meta.local_block_ids[0]))
             self.xfer_stats.record_failed_transfer()
             if handle is not None:
                 self.nixl_wrapper.release_xfer_handle(handle)
-            self._failed_recv_reqs.add(request_id)
+            self._failed_recv_reqs.put(request_id)
 
     def get_mapped_blocks(
         self, block_ids: np.ndarray, block_size_ratio: int
@@ -2364,8 +2686,14 @@ class NixlConnectorWorker:
         This is called by the scheduler to identify blocks that need
         to be retried after a NIXL transfer failure.
         """
-        result = self._invalid_block_ids
-        self._invalid_block_ids = set()
+        # Queue.get_nowait() is atomic with concurrent callback producers.
+        # empty() is only an optimization; queue.Empty closes the consumer race.
+        result: set[int] = set()
+        while not self._invalid_block_ids.empty():
+            try:
+                result.update(self._invalid_block_ids.get_nowait())
+            except queue.Empty:
+                break
         return result
 
     def __del__(self):
@@ -2394,6 +2722,10 @@ class NixlConnectorWorker:
         self.dst_xfer_side_handles.clear()
         for remote_agents in self._remote_agents.values():
             for agent_name in remote_agents.values():
+                logger.info(
+                    "NIXL_NATIVE_REMOTE_AGENT_REMOVE reason=shutdown agent=%s",
+                    agent_name,
+                )
                 self.nixl_wrapper.remove_remote_agent(agent_name)
         self._remote_agents.clear()
         for desc in self._registered_descs:
