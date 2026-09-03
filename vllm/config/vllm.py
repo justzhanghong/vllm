@@ -1861,8 +1861,6 @@ class VllmConfig:
             kv_transfer = self.kv_transfer_config
             if kv_transfer.kv_connector != "NixlConnector":
                 unsupported.append("KV transfer connectors other than NixlConnector")
-            if kv_transfer.kv_load_failure_policy != "fail":
-                unsupported.append("KV transfer recompute failure policy")
             if kv_transfer.kv_buffer_device != "cuda":
                 unsupported.append("non-CUDA KV transfer buffers")
         if self.cache_config.kv_offloading_size is not None:

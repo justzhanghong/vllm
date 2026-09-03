@@ -210,6 +210,26 @@ def test_oscar_runtime_accepts_nixl_fail_closed_transfer() -> None:
     VllmConfig._validate_oscar_mla_runtime(config)
 
 
+def test_oscar_runtime_accepts_nixl_recompute_transfer() -> None:
+    config = SimpleNamespace(
+        speculative_config=None,
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+            enable_dbo=False,
+        ),
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="NixlConnector",
+            kv_load_failure_policy="recompute",
+            kv_buffer_device="cuda",
+        ),
+        cache_config=SimpleNamespace(kv_offloading_size=None),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+    )
+
+    VllmConfig._validate_oscar_mla_runtime(config)
+
+
 def test_oscar_runtime_rejects_non_mtp_speculative_method() -> None:
     config = SimpleNamespace(
         speculative_config=SimpleNamespace(
@@ -271,16 +291,6 @@ def test_oscar_runtime_rejects_non_mtp_speculative_method() -> None:
                 )
             },
             "other than NixlConnector",
-        ),
-        (
-            {
-                "kv_transfer_config": SimpleNamespace(
-                    kv_connector="NixlConnector",
-                    kv_load_failure_policy="recompute",
-                    kv_buffer_device="cuda",
-                )
-            },
-            "recompute failure policy",
         ),
         (
             {
