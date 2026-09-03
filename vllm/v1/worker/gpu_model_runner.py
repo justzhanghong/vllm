@@ -7837,6 +7837,22 @@ class GPUModelRunner(
             and os.environ.get("VLLM_OSCAR_MTP_DRAFT_FULL_CUDAGRAPH", "0") == "1"
         )
 
+    def _get_draft_dummy_num_tokens(self, num_tokens: int, is_profile: bool) -> int:
+        if (
+            not is_profile
+            or getattr(getattr(self, "drafter", None), "method", None) != "mtp"
+        ):
+            return num_tokens
+
+        # MTP proposes one token per active request on each draft step. The
+        # dispatcher is not initialized during the first memory profile, so
+        # use the already-resolved configuration bound needed by later CUDA
+        # Graph warmups instead of querying the dispatcher's empty key set.
+        largest_capture = (
+            self.compilation_config.max_cudagraph_capture_size or self.max_num_reqs
+        )
+        return min(num_tokens, max(self.max_num_reqs, largest_capture))
+
     @torch.inference_mode()
     def _dummy_run(
         self,
@@ -8200,8 +8216,12 @@ class GPUModelRunner(
                 ):
                     use_cudagraphs = False
 
-                self.drafter.dummy_run(
+                draft_dummy_num_tokens = self._get_draft_dummy_num_tokens(
                     num_tokens,
+                    is_profile,
+                )
+                self.drafter.dummy_run(
+                    draft_dummy_num_tokens,
                     use_cudagraphs=use_cudagraphs,
                     is_graph_capturing=is_graph_capturing,
                     slot_mappings=slot_mappings,

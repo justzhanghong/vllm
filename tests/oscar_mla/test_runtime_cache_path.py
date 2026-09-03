@@ -2249,6 +2249,27 @@ def test_mtp_draft_full_cudagraph_capture_is_disabled_by_default(
     assert dispatch_calls == [(8, True, False)]
 
 
+def test_mtp_profile_dummy_covers_configured_capture_bound() -> None:
+    runner = cast(
+        GPUModelRunner,
+        SimpleNamespace(
+            drafter=SimpleNamespace(method="mtp"),
+            max_num_reqs=32,
+            compilation_config=SimpleNamespace(
+                max_cudagraph_capture_size=256,
+            ),
+        ),
+    )
+
+    get_num_tokens = GPUModelRunner._get_draft_dummy_num_tokens
+    assert get_num_tokens(runner, 8192, True) == 256
+    assert get_num_tokens(runner, 128, True) == 128
+    assert get_num_tokens(runner, 8192, False) == 8192
+
+    runner.drafter.method = "ngram"
+    assert get_num_tokens(runner, 8192, True) == 8192
+
+
 def test_mtp_draft_full_cudagraph_remembers_capture_bound_oscar_metadata() -> None:
     proposer = cast(SpecDecodeBaseProposer, SimpleNamespace())
     captured_oscar = SimpleNamespace(hp_rows=torch.tensor([4], dtype=torch.int32))
