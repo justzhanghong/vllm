@@ -754,8 +754,10 @@ class NixlConnectorWorker:
                     meta=meta,
                 )
                 if (
-                    req_meta := self._recving_metadata.get(req_id)
-                ) and not self._is_hma_required and req_meta.local_block_ids:
+                    (req_meta := self._recving_metadata.get(req_id))
+                    and not self._is_hma_required
+                    and req_meta.local_block_ids
+                ):
                     self._invalid_block_ids.put(set(req_meta.local_block_ids[0]))
                 self._failed_recv_reqs.put(req_id)
 
@@ -2375,6 +2377,7 @@ class NixlConnectorWorker:
                         in_progress.append(handle)
                         continue
                     else:
+                        self._mark_remote_engine_failed(req_id)
                         self._log_failure(
                             failure_type="transfer_failed",
                             msg="Marking blocks as invalid",
@@ -2383,6 +2386,7 @@ class NixlConnectorWorker:
                         )
                         self._handle_failed_transfer(req_id, handle)
                 except Exception as e:
+                    self._mark_remote_engine_failed(req_id)
                     self._log_failure(
                         failure_type="transfer_exception",
                         msg="Marking blocks as invalid",
@@ -3036,8 +3040,10 @@ class NixlConnectorWorker:
                 remote_rank=remote_rank,
             )
             if (
-                meta := self._recving_metadata.get(request_id)
-            ) and not self._is_hma_required and meta.local_block_ids:
+                (meta := self._recving_metadata.get(request_id))
+                and not self._is_hma_required
+                and meta.local_block_ids
+            ):
                 self._invalid_block_ids.put(set(meta.local_block_ids[0]))
             self.xfer_stats.record_failed_transfer()
             if handle is not None:
